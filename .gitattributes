@@ -1,0 +1,29 @@
+# 源码仓库：所有文件一律按原始字节存取，禁止任何行尾规范化
+#
+# 为什么用 * -text 而不是 *.js text eol=lf：
+# 本仓库历史里存的是 CRLF（Windows 主线开发），一旦声明 eol=lf，git 会在每次
+# add/checkout 时改写行尾 → 全仓库出现上万行伪 diff，而真正的内容改动被淹没。
+# 声明 -text 后 git 完全不再碰行尾，写入什么就存什么、检出什么就还原什么，
+# 从此不会再出现 "LF will be replaced by CRLF" 警告，也不会因为 autocrlf 设置
+# 不同而在两台机器之间来回改写。
+* -text
+
+# 会话日志 / 附件 / 工作区资料必须字节保真（多帧 zstd，被改写一个字节就 corrupt）
+conversations/sessions/**/*.zstd binary
+conversations/attachments/** binary
+conversations/session_projcache/*.json binary
+workspace/** binary
+
+# 二进制资产
+*.zstd binary
+*.zip binary
+*.7z binary
+*.tgz binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary

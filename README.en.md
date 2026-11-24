@@ -1,0 +1,738 @@
+# dsh-config-sync-plugin
+[中文](README.md) | English
+
+A DSH plugin: it adds a **"Config Sync"** row to the sidebar (opening a full-page health-check panel), plus a summary row under **Settings → General**. It only **inspects and prepares commands** — the sync actions never run inside the app (except the automatic sync that relaunches the client).
+
+![panel](docs/panel.en.png)
+
+> The screenshot is from 0.3.14; the section layout is unchanged. Every card is now "read-only + Edit" - see "Consistent interaction" below.
+
+The UI is bilingual: it follows the client language (`zh-*` → Chinese, anything else → English), with no settings toggle. Only the generated `.cmd` scripts keep Chinese text, because they are local shell helpers.
+
+> `README.md` (Chinese) is the trimmed, current reference; this English file mirrors the older per-version notes and keeps the same facts.
+
+---
+
+## Install
+
+The package name is **`dsh-config-sync-plugin`** (the `dsh-config-sync` name on npm belongs to a different project). Three ways:
+
+| Way | Command / entry | Notes |
+|---|---|---|
+| npm | `npm i dsh-config-sync-plugin` | Use it as a dependency, or add `"dsh-config-sync-plugin": "^0.3.89"` to the profile's `package.json` and run `pnpm i`. The name matches the `cordis.patch.yml` insert name and the install folder `dsh-config-sync-plugin-<ver>` |
+| Marketplace | client → Plugins → Discover → “Config Sync” | Installs from the git commit registered in `market-index.json` |
+| Offline tgz | `releases\dsh-config-sync-plugin-<ver>.tgz` | GitHub Release asset for air-gapped machines; the panel's Update button downloads the same file |
+
+After installing, the plugin lives in `<client root>\dsh-config-sync-plugin-<ver>`; leaving `appRoot` empty makes the plugin derive the client root from its own location.
+
+## From scratch: bring up the second machine
+
+Two commands per machine: the source machine pushes once, the target machine pulls once. The order below is what the isolated end-to-end run actually walked through on 2026-11-14 (two fake clients + a local bare repo, main machine untouched).
+
+```
+Source A                          Remote (Gitee / GitHub / …)       Target B
+──────────────────────────────    ────────────────────────────    ─────────────────────────────
+1 install the plugin                                               1 install the SAME client version
+2 set local repo + remote URL                                      2 launch it once so profiles\desktop exists
+3 first push = "initial push"   ──►  skeleton + configs  ──►        3 install the plugin, set the same repo/remote
+   (writes the 6 runtime scripts)                                  4 first pull (it overwrites local configs)
+                                                                   5 start the client: workspaces + sessions are there
+```
+
+### Prerequisites (each one was actually hit)
+
+| Item | Requirement | When missing |
+|---|---|---|
+| Client version | Same on both machines (checked via `profile\host-contract.json`) | `version mismatch` in the pull log; only `-AllowVersionDrift` forces it |
+| Target `.dsh` | The client must have run at least once, so `profiles\<profile>` exists | `[X] target profile does not exist (DSH never installed here?)` → pull aborts |
+| Node / Electron runner | Ships with the client (`<AppRoot>\node.exe` or `DeepSeek Harness.exe`) | `no usable built-in runtime`, session cwd is not rewritten → **the session list stays empty** |
+| Repo skeleton | Written automatically by the source machine's initial push | A repo with only `settings\` and no `apply.ps1` cannot run on B; redo the initial push |
+| git | Installed on both (in PATH or a common location) | `git.exe not found` |
+
+### Source A: first push (initial push)
+
+Set **Local repo** (an empty folder or an existing repo) and **Cloud repo** (the remote URL), then press the initial-push button (it reads "initial push" when both sides are empty).
+
+It runs: `git init` → add `origin` → **copy the plugin's 6 runtime scripts (`apply.ps1`, `capture.ps1`, `sync.ps1`, `restore.ps1`, `post-exit.ps1`, `dsh-sync-common.ps1`) plus `tools\fix-session-cwd.mjs` into the repo root** → write `profile\host-contract.json` → `capture` → commit → `push -u origin main`.
+
+Command-line equivalent:
+
+```powershell
+pwsh -File runtime\sync.ps1 push -RepoRoot <repo> -DshHome <~\.dsh> -AppRoot <client root> `
+  -WorkspaceHome <workspace root> -ProfileName desktop -SkipInstall -Force
+```
+
+Real output of the isolated first push (15 files, commit `3fa3780`): the 6 scripts + `tools/fix-session-cwd.mjs`, `profile/{package.json,cordis.patch.yml,host-contract.json}`, `settings/dsh-workspaces.json`, `workspace/workspace-registry.json`, `workspace/default-workspace/notes.md`, `conversations/session-index.json`, `conversations/session_projcache/s1.json`.
+
+### Target B: first pull
+
+1. Install the **same** client version and **launch it once** (only to create `profiles\desktop`; you can quit right away).
+2. Install the plugin, set **Local repo** (an empty folder is fine) and **Cloud repo** (same URL).
+3. Press pull. It first reports "local is N commits ahead / N uncommitted" and asks for confirmation (it overwrites local configs).
+4. After it finishes, check three things: workspaces are listed, opening an old session lands in the right workspace, plugin dependencies are complete.
+
+```powershell
+pwsh -File runtime\sync.ps1 pull -RepoRoot <repo> -DshHome <~\.dsh> -AppRoot <client root> `
+  -WorkspaceHome <workspace root> -ProfileName desktop -SkipInstall -Force
+```
+
+`-SkipInstall` skips `pnpm install` (required offline / in isolation); `-Force` bypasses the "DSH is running" guard (on a real machine quit the client properly instead).
+
+Real output of the isolated pull (`pull_rc=0`):
+
+```
+[OK] host versions match (app = 0.2.2)
+[OK] workspace "default-workspace" restored → <B>\app\workspace\SquadLink (1 file, byte-exact)
+[OK] workspace registry merged by id → <B>\home\storages\workspace.json (1 workspace)
+[OK] session projcache cwd aligned to this machine: fixed 1
+[OK] session data restored: 1 written, 1 backed up
+[OK] all 0 plugin dependencies in place
+```
+
+### The five things that trip up a from-scratch run
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `-AppRoot mismatch, switched to D:\DeepSeekHarness` | `Resolve-DshAppRoot` only accepts a folder containing `resources\app.asar` or `resources\app\package.json`; a fake/portable client falls back to the registry install | make sure the folder passed to `-AppRoot` has one of those |
+| `[X] stopped (nothing captured, nothing committed)` | `DeepSeek Harness.exe` is running, so `cordis.patch.yml` may be half-written | quit fully (tray included), or use `-Force` |
+| `target profile does not exist` | the target `.dsh` was never initialised by the client | install the same client version and launch it once |
+| `no usable built-in runtime` | no `node.exe` / client binary under `<AppRoot>` | install the full client, otherwise session cwd is not rewritten and the session list is empty |
+| workspace files arrived but custom keys in `~\.dsh\settings.json` did not | plugin configs are a **whitelist** (13 files), `settings.json` is never copied whole | check whether the config belongs to that whitelist |
+
+
+## Contents
+
+| Path | Purpose |
+|---|---|
+| `index.js` | Host half: `/config-sync/status`, `/prepare`, `/settings`, `/auto`, `/update` routes |
+| `client.js` | Browser half: sidebar row, panel, settings summary row |
+| `cordis.patch.yml` | Bundle patch layer (`id: config-sync`) |
+| `runtime/` | The six post-exit PowerShell scripts plus `fix-session-cwd.mjs`, shipped with the package so scripts can be generated right after install without cloning the config repo first |
+| `tools/` | Self-test `selftest.mjs`, client structure check `clientcheck.mjs` |
+| `version.json` / `releases/` | Self-update manifest and package |
+
+## Where the entries hang
+
+| Entry | slot | Notes |
+|---|---|---|
+| Sidebar row | `sidebar.panellist` (`id: config-sync`) | Same column as "Plugins / Automation / Skills / Memory", double-arrow icon |
+| Opened panel | `main` (`key: config-sync`) | The host binds both by id/key, so the two registers must be done in one **nested inject** (injecting only `main` makes the `sidebar.panellist` register a no-op) |
+| Settings summary row | `settings.general.item` | One four-state chip row plus an expandable body (repo, remote, key) |
+
+Click-to-switch on the sidebar row is handled by the host; the contract is copied from `dshmarket` / `dsh-mnemon`.
+
+## What the panel shows
+
+The layout is "one status row + one metric strip + section cards", read top to bottom (since 0.3.14, see `docs/panel.en.png`):
+
+**Title row**: `Config Sync　local [In sync / To push / To pull / Problem]　cloud [In sync / Out of sync / To pull]`, with a "Re-check" button on the right. Both badges share one palette — green = in sync, orange = to push / to pull, red = problem; the local one only talks about this machine (config completeness, missing dependencies, uncommitted/unpushed state), while the cloud one is **fully automatic**: checked when the panel opens and re-checked every 2 minutes, **no button**.
+
+**Meta row**: `app version / Electron version · branch @ short HEAD`. It replaces the paragraph of intro text that used to sit under the title.
+
+**Metric strip**: five cells at a glance — `App / contract` (turns orange when they disagree), `bundle` (red when something is unresolvable), `Dependencies` (red when something is missing), `Snapshots` (count) and `Last sync` (time, with `(+N)` for files written after it). A "to-do" card appears below only when there is something to fix.
+
+**Sections**: Overview (strip + to-do) → Local paths (since 0.3.30: cross-machine root confirmation and the pending list; since 0.3.34 a read-only view with an Edit button; since 0.3.37 **the whole section stays hidden** and only expands from the "Local paths" button in the title row (which turns amber with a count when something needs review)) → Sync conflicts (only when there really are some) → Sync targets (Local / Cloud repo) → Automation & plugin update → After exit → Restore backup → Sync content → Feedback (since 0.3.31). Two columns on wide screens, and each card keeps text to "one value line + one grey hint line" instead of long prose.
+
+**Consistent interaction**: Local paths / Local repo / Cloud repo / Auto sync / Plugin update / Sync content all start **read-only** and unlock on Edit; Save commits, Cancel drops the draft. Only cards that were never configured (no repo, no remote) stay in edit mode with no Cancel - without those values nothing can be pushed, pulled or generated. The Local paths card is also forced into edit mode when no root was detected at all.
+
+**"To push" is not just git**: even with a clean `git status`, new sessions/materials may still sit in `~\.dsh` uncaptured. So `sync.ps1` writes `~\.dsh\config-sync-state.json` (`lastSyncAt`/`mode`/`head`) after a successful push/pull, and `status` returns an extra `local` block: it stats `sessions`, `skills`, `.agent-presets`, `mnemon`, the five profile files and registered workspace directories, counting anything whose **mtime is later than `lastSyncAt`** into `local.pending`, which turns the badge orange "To push". mtime only — no content reads, no capture; capped at 20,000 files / 1.5 s; copies and "save as" count too, and a false positive only costs one extra hint.
+
+**"To pull" = the local repo is still empty while the cloud has content** (since 0.3.26, cloud dimension since 0.3.35): on a new machine, pointing the repo path at an empty folder is the normal "waiting for the first pull" state, **not an error** — the badge is orange "To pull" instead of red "Problem", and the to-do line says Pull brings the repo content down into that path.
+
+**"To initialize" = both the local repo and the cloud are empty** (since 0.3.35): the badge is orange "To initialize" and Push becomes **Initialize push** — Pull stays disabled because there is nothing to pull.
+
+**Last auto-sync result**: if `~\.dsh\auto-sync-result.json` is within 15 minutes, a 5-second toast pops **as soon as the client starts** (`apply()` checks `status` 1.5 s after mount, appends its own overlay to the body, so it shows without opening the panel; success/failure + reason + log path on failure). The line inside the panel shares the same predicate and the same localStorage key, so one result pops only once.
+
+## Local repo / cloud repo (both configurable, read-only by default, forced when unset)
+
+- Repo test: the directory has both `apply.ps1` and `profile\package.json` (plus `sync.ps1` to actually push/pull).
+- Priority: local settings file → plugin config `repoPath` → `DSH_CONFIG_REPO` → auto-detected common locations. **An empty folder configured explicitly counts as a valid answer** and is not displaced by another auto-detected repo.
+- Four phases (`repo.phase` in `status`): `ok` a real repo, `empty` an empty folder waiting for the first pull, `missing` the folder does not exist, `unusable` it holds other things and does not look like a repo. `repo.pushAllowed` / `repo.pullAllowed` derive from it, and the panel buttons and host routes share that one source of truth.
+- **An empty folder allows pull only when the cloud has content (since 0.3.26, cloud dimension since 0.3.35)**: when the path points at an empty folder and the cloud already has branches, the panel enables Pull (plus Restore) and greys out Push with a "pull first" hint; the host rejects `prepare(push)` and `auto(push-now)` with 400; "Generate …" degrades to pull + restore.
+- **An empty folder plus an empty cloud allows push only, and that push *is* Initialize push (since 0.3.35; it actually finishes since 0.3.42)**: the button reads "Initialize push" and Pull is greyed out (nothing to pull). `status` gains `repo.remoteHeads` (branch count, `null` = undeterminable), `repo.remoteEmpty` and a three-way `repo.mode` (`ok` / `await-pull` / `await-init`). `sync.ps1 push` then runs: `git init` → add `origin` → **write the repo skeleton** (copies `apply.ps1` / `capture.ps1` / `sync.ps1` / `restore.ps1` / `post-exit.ps1` / `dsh-sync-common.ps1` from the plugin runtime into the repo root, plus `tools\fix-session-cwd.mjs`) → write `profile\host-contract.json` (this machine's client version) → `capture` → commit → `push -u origin main`. The skeleton has to come along, otherwise the remote becomes a half repo (settings but no execution bodies) that the next machine cannot run.
+- **0.3.42 fixes the two traps that stopped Initialize push halfway**: (1) `capture.ps1`'s outside-root path report was missing a `$` — `(v.Replace(...)` made PowerShell look for a command named `v.Replace`, which only fires when the config has a custom root, and the whole push died with `无法将"v.Replace"项识别为 cmdlet`; (2) `sync.ps1` treated "the repo folder is not empty" as "you typed the wrong path", but during an Initialize push `capture` has just written 16 config items into that folder — so it blocked itself with its own output and exited. The test is now "the folder holds this plugin's own scripts (`dsh-sync-common.ps1` / `sync.ps1` / `capture.ps1`, any one of them) → it is a sync repo"; only a genuinely wrong path (Desktop, Downloads) is rejected.
+- "Does the cloud have content" is computed live with `git ls-remote --heads <remote>` (15 s timeout): **if it cannot be determined (offline / auth failure) the old rule applies and only Pull is enabled** — no push on a blind reading. If the cloud already has branches while the local folder is still empty, `push` is refused with a "pull first" message, because pushing would graft this machine's state onto a history already in use.
+- Only this plugin's own `同步-*.cmd` files and hidden entries (`.git` etc.) count as "empty"; a folder holding other files yet not looking like a repo is `unusable`, the panel asks you to reset the path, and saving the setting is refused too.
+- Cloud: the remote URL comes from `git remote get-url origin` first, falling back to the settings file; the SSH key stores only a **path** and may be empty to let `.ssh\config` decide.
+- **Never configured = forced setup**: the card stays in edit mode with no "Cancel", a red line at the top, the generate buttons disabled, and the host's `prepare` returns 400 (restore is unaffected when only the remote is missing).
+- Save order: validate (URLs accept only `git@host:path` / `ssh://` / `https://`; a key that is filled in must exist) → write settings → `set-url` if `origin` exists, `remote add` if not → on git failure roll the settings file back, so the panel never shows A while git uses B.
+- A configured path that later goes away (moved/renamed): `status` returns `repo.exists=false` with `phase='missing'`, and the panel returns to "must be set again" — it will **not** silently switch to another detected repo.
+- Stored in `~\.dsh\dsh-config-sync.json`: per machine, never in the repo.
+
+## Supported cloud hosts (spelled out since 0.3.27)
+
+The plugin does not pick a git host: the remote URL is only validated for its *form*, and `fetch` / `push` / `pull` / `ls-remote` are handed straight to git. Gitee, GitHub, GitLab and self-hosted Gitea/Forgejo all take the same path.
+
+| Item | Detail |
+|---|---|
+| URL forms | `git@host:owner/repo.git`, `ssh://git@host:port/owner/repo.git`, `https://host/owner/repo.git` |
+| Default branch | `main` is tried first; if the remote has no `main`, the first remote branch is used (`master` on older repos), and tracking is set up after the pull |
+| Auth | SSH: fill in the key path (empty lets `.ssh\config` or Git defaults decide), and generated scripts use `GIT_SSH_COMMAND` with `StrictHostKeyChecking=accept-new`; HTTPS: use the account/token in Git Credential Manager — the plugin stores no passwords |
+| Failure hint | On a failed fetch/pull the self-check host is read from the real `origin` URL (since 0.3.27) instead of a hard-coded `git@gitee.com`; an https URL gets the `ls-remote` check, not `ssh -T` |
+| File size cap | Three tiers: over 100 MB is skipped at capture time; ≥95 MB is unstaged before committing and recorded; 50–95 MB only warns |
+
+Two notes for private repos: ① SSH is the simplest; ② the plugin's **own update manifest** points at the author's public repo by default — if you repoint it at your own private repo, only Gitee raw links are currently rewritten to the API + token form, so anonymous raw reads of a private GitHub/GitLab repo will fail. That is a known limitation.
+
+## When some files never make it into the repo
+
+Anything left out is reported in three places, so nobody has to read the log:
+
+| Where | What you see |
+|---|---|
+| Post-exit progress window | A `N file(s) not synced` block printed **before** the "sync finished" banner: grouped by kind, up to 5 rows per group (kind, relative path, size, reason), with "…and N more, full list: <path>" |
+| Config-sync panel | A permanent warning box at the bottom of the "last auto sync" card: per-kind counts, up to 30 rows, plus "they are still on this machine, just not in the repo; the next sync re-checks them" |
+| Machine-readable | `~\.dsh\sync-notices.json` (`at/mode/total/byKind/items`, four fixed `byKind` keys) and the `notices` field of `auto-sync-result.json` |
+
+Four `kind` values: `too-large` (over the single-file cap: skipped at capture >100 MB, unstaged before commit ≥95 MB, or not restored on pull), `history` (an oversized file already sits in local history, so the remote rejects the whole push), `skipped` (rule-based skip such as model weights or `*.whl`, or a locked file), `failed` (per-file write failure, session-header/projcache rewrite failure, or remote rejection).
+
+### Two prechecks before pushing
+
+1. **Index precheck**: after `git add -A`, every staged file is stat'ed; anything ≥95 MB is taken out with `git reset -- <path>`, added to `.git\info\exclude` so a later add skips it, recorded as a notice, and the rest of the commit pushes as usual — one huge file no longer blocks a whole sync. 50–95 MB only warns.
+2. **History precheck**: `git ls-tree -r -l HEAD` is scanned; a ≥95 MB hit is reported up front as "the remote will reject the whole push (this is not a network problem)" with two ways out: ① point the panel at a fresh empty repo via "Initialize push" (config sync needs no old history), or ② rewrite history with `git filter-repo` and force-push. **Report only — history is never rewritten automatically.**
+
+### Why a push failed
+
+The raw `git push` output is no longer collapsed into "network/auth failure"; it is classified by signature: `File <path> is X MB; this exceeds ... limit` → file too large (paths and sizes listed); `exceeds ... quota` / `repository size` → repo quota; `[remote rejected]` / `pre-receive hook declined` → remote rejection; `Could not read from remote` / `Permission denied` / `publickey` / `Host key verification` / `Could not resolve host` / `timed out` → network or auth.
+
+### The non-ASCII path trap (0.3.48)
+
+`git` keeps `core.quotepath=true` by default, so non-ASCII paths come back octal-escaped and wrapped in quotes (`"workspace/DSH\347\240\264\347\224\262/..."`). The 0.3.47 index precheck read that straight from `& $git ... diff --cached --name-only`, so `Test-Path -LiteralPath` hit the `"` and threw `路径中具有非法字符` (illegal characters in path) — the whole sync died before committing.
+
+Fix: every path-consuming git query now goes through `Read-GitLines` (`-c core.quotepath=false` + cmd byte redirect + UTF-8 read), and each per-file `stat` sits inside `try/catch` so one bad name only skips the size check instead of killing the run. Measured on the real repo: 918 staged paths, 0 quoted and 0 stat failures; the history precheck parsed all 3222 `ls-tree -r -l` lines into path plus size.
+
+Measured (2026-11-14, isolated repo + local bare remote + fake `pre-receive` hook): a 96 MB file was unstaged while the rest pushed fine and `sync-notices.json` recorded `too-large=1`; after the same file went into history the precheck reported `history=1`; a hook replaying GitHub's message (`File big.bin is 96.00 MB; this exceeds ...`) was classified as "1 file over the cap", not as a network problem; the window summary and the panel block read the same file.
+
+## Workspaces and sessions follow the machine too (projcache cwd fixed in 0.3.44)
+
+Whether a workspace and its sessions work on a new machine depends on three paths being rewritten to this machine's value:
+
+| Where | What it stores | What happens on another machine |
+|---|---|---|
+| `workspace\workspace-registry.json` | each workspace's location, already written as a `{{APP_ROOT}}/xxx` placeholder | expanded to this machine's path on pull, so the workspace opens in the right folder |
+| `conversations\sessions\--ws-<id>--\...\session.v4.jsonl.zstd` | the `cwd` in the first frame of the session log | the first frame is rewritten from "where is this workspace on this machine" (only that frame - the rest of the file is untouched) |
+| `conversations\session_projcache\<sessionId>.json` | `record.identity.cwd` | **since 0.3.44** rewritten by looking the session's workspace up through the registry's `sessionIds`; this step used to be missing, so a workspace listed fine but its history still pointed at the other machine's folder |
+
+So "the original machine's location becomes this machine's location" is inferred like this: the registry tells you the workspace's title/slot and its shape under `{{APP_ROOT}}`, which expands to an absolute path here; sessions claim the same workspace through `sessionIds` and follow that location - never by guessing a drive letter. If it cannot be inferred (the registered path is a bare old drive path, or there is no matching entry), nothing is rewritten: the panel reports it instead of writing a guessed path.
+
+The report produced on push is split into two groups: `scope: config` for paths inside config files, `scope: data` for records under `workspace\` and `conversations\` that still point at the other machine. The panel lists them separately ("Paths inside config files" / "Paths in workspace / session records"), and both can be accepted row by row.
+
+### Hidden/archived workspaces no longer reappear on the other machine (0.3.75)
+
+Workspaces and sessions you hide/archive from the config-sync panel used to show up again on machine B after a pull. Cause: DSH stores that state separately in `<DshHome>\dsh-session-manager\workspace-archives.v1.json` (`archived:true` plus the related `sessionIds`), which was never part of the sync set; the workspace registry is merged by ID (union), so a locally hidden record gets merged back in.
+
+Since 0.3.75 this file is part of the `settings` sync: a push writes it to the repo as `settings\workspace-archives.json`, and a pull restores it to the same path on B. When B starts, DSH reads `archived:true` workspaces and filters them out of the workspace list; their sessions move to the archived group and stop showing. This is whole-file replace semantics — machine A is authoritative. Hiding is not deletion: the workspace/session files remain and can be restored by un-hiding in DSH.
+
+### New "Workspace visibility" card in the panel (0.3.76)
+
+A new **Workspace visibility** section brings both native DSH hiding mechanisms into one card:
+
+| Action | Effect | Backing file |
+|---|---|---|
+| Visible | Workspace shown normally, all sessions visible | Drop the archive record; remove sessions from `archivedSessionIds` |
+| Hide sessions | Workspace stays in the list, its sessions go to Archived | Sessions written to `global.archivedSessionIds` in `<DshHome>\storages\workspace.json` |
+| Archive workspace | Workspace disappears from the list, sessions kept | `<DshHome>\dsh-session-manager\workspace-archives.v1.json` gets `archived:true` and its sessions hidden too |
+
+Each workspace switches between the three states independently; expanding it lets you hide/show a single session without touching others (a session toggle changes only that one `archivedSessionIds` entry, never the workspace archive record). Changes do not call the session-manager Web API (it needs a DSH connection-owner credential the plugin route does not have) — they go through the host `workspaceRegistry`, which persists and pushes the session-list update, so toggles apply immediately (see 0.3.82). Since 0.3.75 the archive file is synced, so these states travel with push/pull too.
+
+### Panel: session names, Edit button, click-to-expand and quick jump (0.3.77)
+
+Five interaction refinements on top of the 0.3.76 "Workspace visibility" card:
+
+1. **Session names**: each expanded session shows a readable title (from the `session/title` event, falling back to the first user message text); hover for the full session ID. Titles are cached and rebuilt from the local logs on each machine.
+2. **Edit button**: the state dropdown and per-session Hide/Show buttons stay hidden until you click Edit on that workspace; click Done to leave edit mode, so states cannot be changed by accident. (From 0.3.84 there is a single Edit button for the whole card — see below.)
+3. **Click to expand**: click anywhere on a workspace row to expand/collapse its sessions; no separate expand button.
+4. **Card position**: the Workspace visibility card moved just above Feedback, as the last configuration step.
+5. **Sticky title + quick jump**: the panel title bar is sticky, with shortcut tabs below it (Overview / Workspaces / Targets / Automation / Scripts / Restore / Content / Plugin data / Feedback); clicking one smoothly scrolls to that section.
+
+Title reading and state changes stay self-contained in this plugin and do not call the session-manager Web API.
+
+### Quick-jump order matches the cards; scrolling no longer hides behind the title (0.3.78)
+
+Two display fixes on top of 0.3.77:
+
+1. **Jump order matches section order**: the quick-jump tabs now follow the exact render order of the sections (Overview / Sync conflicts [when present] / Local paths [when expanded] / Targets / Automation & updates / Scripts / Restore / Content / Plugin data / Workspace visibility / Feedback). The two conditional sections (conflicts, local paths) appear in the tabs only when their cards are shown.
+2. **Scroll lands below the title**: the sticky title bar now uses an opaque background (same fill as panel cards), so content no longer shows through it; jumping to a tab sets the scroll offset from the title bar's actual height, so the target section lands fully below the title instead of being covered.
+
+### Plugin update falls back to two npm sources (0.3.89)
+
+The "Plugin update" card now shows an **npm download URL** line with the actual fallback addresses (domestic mirror `registry.npmmirror.com` + official `registry.npmjs.org`). When the GitHub release download is unreachable (common in mainland China), the update package automatically falls back to npm. It is still verified against the authoritative sha256 in `version.json` — switching source never relaxes verification. The two sources back each other up: the mirror can briefly 404 during its first-sync window, and the official source takes over. The npm tarball is byte-identical to the GitHub release tgz (same sha256).
+
+### Clicking × to close DSH now checks once for auto pull/push immediately (0.3.93)
+
+With "Pull on startup" or "Push on exit" enabled, the only queues used to be the 8-second startup check and the 2-minute re-check. If you made changes between two re-checks and then clicked the top-right × to close DSH, no watcher was waiting for the exit at that moment, so nothing ran after closing. A quit hook now covers it: when the last visible window closes (the × click), the plugin checks once and queues the watcher **before** the client exits; once the DSH processes are gone the watcher runs the pull/push immediately.
+
+1. **Check once on exit**: when no visible windows remain, call `triggerAutoSyncOnClose(config)`, which reads the `autoPull`/`autoPush` switches; an in-flight watcher is reused rather than relaunched; with an empty local repo only autoPull can queue (first clone).
+2. **Same criteria as the re-check**: pull takes priority (behind > 0 → queue pull, no confirmation dialog on the close path); push queues when any of "commits ahead / uncommitted changes / local data newer than last sync" hits; `autoRestart` semantics unified to `!== false` (relaunch by default).
+3. **Queue before quit**: the queue must be awaited **before** `app.quit()` — the plugin dies with the main process, so checking after quit is too late. With both switches off / nothing to sync the function returns quickly and does not slow down closing; a successful queue logs "queued pull/push before exit …: runs right after DSH exits".
+
+### Remote "uncommitted" now includes local pending changes + Refresh really fetches (0.3.92)
+
+Root cause found by measurement for "remote info still not updating": the git-level behind/ahead really is 0 (local HEAD matches the gitee cloud), while what the user means by "not updated" is the runtime-generated changes on this machine not yet captured into the repo. Two substantive fixes:
+
+1. **"Uncommitted" = git work-tree changes + local pending**: the status `repo` object gains `pending` (local session/config changes not yet synced) and `uncommitted` (`dirty + pending`). Both "Remote" Kv rows in the panel use `uncommitted` for the uncommitted figure and append "(N pending on this machine)" when there are pending items. New local sessions/config changes show up immediately without waiting for DSH exit + capture.
+2. **"Refresh" button actually fetches**: the summary-row "Refresh" button previously only re-read status (no git fetch, so behind/ahead stayed the same). It now runs `refreshRemoteNow`: first `/config-sync/auto {action:'check'}` to trigger `git fetch` and refresh remote refs, then refresh the snapshot. The 30-second auto-refresh while expanded shares the same chain.
+
+### Settings → General → Config Sync: live remote info + Pull/Push now buttons (0.3.91)
+
+Two adjustments to the "Settings → General → Config Sync" summary row:
+
+1. **Remote info no longer stale**: expanding the row first requests the `check` action on `/config-sync/auto` (triggering `git fetch` to refresh `@{upstream}`) and then refreshes status, so "behind X · ahead Y · uncommitted Z" shows the latest cloud figures instead of stale ones; it refreshes every 30 seconds while expanded and stops when collapsed. Root cause: the behind/ahead counts from `@{upstream}` only update after a fetch — a plain status read never triggers one.
+2. **Buttons replaced with Pull/Push now**: the four "Generate scripts / push only / pull only / restore only" buttons are replaced by two — **Pull now (closes DSH)** and **Push now (closes DSH)** — sharing the same `pull-now` / `push-now` queue as the main panel's Automation card: clicking queues the action, which runs after DSH exits. Buttons are gated by backend permissions (`pullAllowed` / `pushAllowed`) with hints (empty repo → push first; empty cloud → pull first), and queued/result states give Chinese feedback. The script-generation entry remains on the main panel and is no longer duplicated in the summary row.
+
+### To-do and jump-tab display cleanup (0.3.90)
+
+Four display adjustments to the panel:
+
+1. **Jump tabs highlight the current position**: the quick-jump tabs now auto-highlight the topmost visible section in the scroll region (primary fill + primary text), so "where am I" is obvious at a glance; clicking a tab also lights it up immediately.
+2. **"Local data" label removed from To-do**: the old subheading-like "Local data / 本机数据" row is gone; the To-do card presents its stats and details directly without the redundant title.
+3. **To-do expands to concrete names**: each group (Conversations / Local profile / Skills …) is one row; click it to reveal the concrete names — sessions show the session title (or `<sessionId> (session)` when unavailable), and the local profile shows file names like `package.json`, `cordis.patch.yml`; each group is de-duplicated and capped at 50 items. The To-do card title row has an Expand / Collapse toggle, expanded by default so details are visible on entry.
+4. **Overview description synced**: changed to "Versions, dependencies, snapshots and to-do at a glance".
+
+### Local data moved into To-do, grouped by sync content, sessions shown by name (0.3.86)
+
+The "Local data" row in the "Local repo" card moved into "Overview → To-do", with its presentation reorganised:
+
+1. **Location**: the old "Local data" line at the bottom of the "Local repo" card is gone. The To-do card now shows even when nothing else is wrong — it starts with local data (last sync time / pending count / mode) and then the existing to-do suggestions. "How much is still unsynced" and "what to do about it" sit together.
+2. **Grouped by sync content**: pending files are counted by the same twelve groups as "Sync content" — Conversations / Skills / Plugin data / Memory data / Local profile / Global prompts / Agent presets / Plugin settings & workflows / Workspace files / Extra paths, etc. Each group is a chip with a count, sorted by count descending; no more bare single total.
+3. **Sessions shown by name**: in the "Recently changed" sample, session files show the projected session title (matching the DSH panel, e.g. "列出工作区下的文件夹") instead of a `session-xxx/session.v4.jsonl.zstd` directory id; non-session items with no title still show their parent directory / file name.
+
+### Workspace visibility card: one Edit button for the whole card, sessions paired with their toggles (0.3.84 / 0.3.85)
+
+The edit interaction of the "Workspace visibility" card was rebuilt:
+
+1. **A single Edit button for the entire card** (0.3.84): previously every workspace row carried its own Edit/Done button, and once there were several rows the buttons no longer lined up with the sessions. Now there is one button on the right of the header row — "Edit" when idle, switching to "Done" (primary colour, same position) once you are editing — and it unlocks every workspace tri-state plus every session toggle at once; clicking again leaves edit mode. The per-row button is gone.
+2. **Session/button pairing made concrete** (0.3.84): each session gets its own row with a divider between rows; in edit mode the whole row gets a background and rounded corners, framing "this session" together with "its button". The toggle sits at the end of that row with a fixed width, so a wrap never puts it next to a different session. The word and colour distinguish Hide (red) from Show (green), the `title` carries the session name, and hidden sessions get a struck-through, dimmed name (the separate "Hidden" label was dropped).
+3. **No tinted explanation banner** (0.3.85): edit mode no longer inserts a yellow-bordered hint row above the list; whether you are editing is read from the header button alone.
+
+### Workspace visibility card: blank sessions and idle-review parents are collapsed too (0.3.83)
+
+On top of 0.3.82's "collapse agent child sessions by default", two more kinds of noise are folded away:
+
+1. **Blank sessions**: entries that were created but never used — no message, no turn (empty `origin` in the session header, and the log only holds permission / sandbox / approval / session-end-seed events, no `turn/start` and no `user/message`).
+2. **Mnemon idle-review parents**: `mnemon-review-owner-v1-*`, which carry only a `subagent/catalog` event — the actual content lives in the `mnemon-review-v1-*` child session they point at.
+
+Both naturally satisfy the same "blank" test, so one rule folds them away; no name matching is needed. A "Show blank" checkbox in the header row brings them back, and the footer reports how many blank and how many agent sessions were collapsed. On this machine the default view drops from 99 entries to 10.
+
+### Workspace visibility card: agent sessions collapsed by default + instant hide/show (0.3.82)
+
+Two changes to the "Workspace visibility" card:
+
+1. **Agent (subagent) sessions are collapsed by default**: the card lists only your own sessions. A "Show agents" checkbox in the header row reveals agent child sessions and reports how many were folded away. 80 of the 99 registered sessions on this machine were agent sessions (mnemon reviews and delegated tasks each leave one behind), flooding the list so you could not find your own.
+2. **Hide/show takes effect immediately**: toggling the workspace tri-state or a single session used to only rewrite the on-disk state file, leaving the host's in-memory `archivedSessionIds` stale — a client restart or session-list refresh was required. It now goes through the host `workspaceRegistry` (`archiveSession` / `unarchiveSession`), which persists and pushes the session-list update, so toggles apply the moment you click. If the host service is unavailable it falls back to the previous file-based write and the card hint says which path was used.
+
+Reading the owning workspace and the session title stays self-contained; the session-manager Web API is not used.
+
+### Workspace visibility card session names now match the DSH panel (0.3.81)
+
+Fixes session names in the "Workspace visibility" card differing from the DSH session panel.
+
+DSH session titles evolve: a fallback title (truncated first message) is created first, then a provider title is generated by the model. The card previously stopped at the first fallback; it now picks the latest title by priority — provider > fallback > untagged title > first user message — matching the DSH panel exactly.
+### Fix cross-machine sync downgrading the installed plugin and rolling back pulls (0.3.80)
+
+Fixes an issue where pulling on another machine replaced a newer locally installed plugin with an older archive from the config repo, turning the link into 0.0.0, failing bundle resolution, and rolling the pull back.
+
+| Problem | Fix |
+|---|---|
+| An older archive was still deployed because versions merely differed | Version comparison is now semantic upgrade-only: the archive is deployed only when its version is higher than the installed one |
+| Archive top-level folder mismatched the file name (e.g. a 0.3.70 package wrapping a 0.3.56 folder), producing nested folders and a broken link | capture now validates the archive top-level folder and version after packing; bad archives are deleted with a warning instead of being synced |
+| Stale plugin keys caused repeated plugin-missing notices | Removed invalid legacy keys from localPluginMap and cleared stale notices |
+
+The corrupted archive in the config repo was also repacked with correct 0.3.79 content.
+
+### The panel is now a fixed header plus an independently scrolling body (0.3.79)
+
+0.3.78 still kept the sticky header inside the same scroll container, so two cases leaked through: with a shorter panel, or with a header that wraps onto more lines, content brushed past the header's divider and even showed up in the padding above it; and the jump offset was computed from the header height, so it shifted whenever conditional sections appeared or disappeared.
+
+0.3.79 splits the panel in two: the header (title, badges, meta line and section tabs) now sits **outside** the scroll area, pinned at the top of the panel; below it a separate `overflow-y:auto` region holds the notices and every section card. Three direct results:
+
+1. **Structurally impossible to leak through**: the scrolling region starts 20px under the header divider, so however far you scroll, content stays inside it — never in the header area or above it.
+2. **Jump targets are fixed**: a section tab now just scrolls to the top of the scrolling region plus 8px, with no header-height math, so header wrapping and conditional sections no longer move the landing point.
+3. **No more header jitter**: the header does not scroll at all, so the shadow, translucent background and padding patches are gone; a single divider line is all that is left.
+
+The change touches only the panel itself (`S.page` / `pageInner` are used nowhere else); the sidebar row and the settings summary row are unaffected.
+
+
+## New sessions land in the default workspace (since 0.3.28)
+
+A finished sync brings DSH back up, and the client opens a fresh session on startup. Where that session lands is decided by `global.defaultWorkspaceId` in `<DshHome>\storages\workspace.json` — and DSH writes that value only during **first-time initialization**, so after a few syncs it can be left pointing at whatever workspace was used last.
+
+Since 0.3.28, `post-exit.ps1` corrects that value **after the client has fully exited and before it is relaunched**. The timing is not cosmetic: the client owns that registry and writes it back on exit, so anything written earlier is lost.
+
+| Item | Detail |
+|---|---|
+| Default behaviour | Auto-detect the workspace titled `default-workspace` (or whose path ends with `\deepseek-harness\default-workspace`) and point `defaultWorkspaceId` at it |
+| Targeting another one | Set `defaultWorkspace` in `~\.dsh\dsh-config-sync.json` to a workspace ID or an absolute path |
+| Turn it off | Set the same field to `off` (or `none`) |
+| Safety | Only written when the value actually differs; the original is backed up as `workspace.json.bak-<timestamp>` first; the result is read back and checked (value plus workspace count); a path matching no workspace is skipped, never guessed |
+| Side effect | A default workspace you switched by hand gets pulled back to `default-workspace` on the next sync — set `off` if you don't want that |
+| Undo | Copy `workspace.json.bak-<timestamp>` back over `workspace.json` |
+
+## The scripts generated in one click
+
+"Generate push / pull / restore" can write all three at once, or one of them; when the local repo is still empty it generates pull + restore only. File names, buttons and the script text are Chinese by design.
+
+| Script | What it does | Safety valve |
+|---|---|---|
+| `同步-推送.cmd` | capture this machine's config after exit and push it | first checks whether `DeepSeek Harness.exe` is still running; refuses outright when the local repo is an empty folder |
+| `同步-拉取.cmd` | pull from the remote after exit and apply locally | same; **states how many commits ahead / uncommitted items first, and requires `y`** — it overwrites local config with the repo version |
+| `同步-还原.cmd` | roll the profile back to the snapshot taken before a given apply | same; **runs `-DryRun` to print the plan first, writes only after `y`** |
+| `同步-还原-<snapshot name>.cmd` | the same, but rolling back to **that specific snapshot** (generated by a row in the "Restore backup" card) | same; the file name carries the snapshot name, so several can coexist without overwriting each other |
+
+All three bake in this machine's parameters (repo, AppRoot, `.dsh` location) and can be double-clicked. Pull and restore accept `--yes` to skip confirmation (for automation/remote control); with no confirmation they say plainly "no confirmation (y) received, exited: nothing changed on this machine" instead of exiting silently.
+
+- **Commit note**: optional when generating the push script; passed as `-Message "..."` to `sync.ps1`, and **the timestamp is appended at run time**. Empty means the default `sync: capture <time> @ <machine>`.
+- **Which restore snapshot**: if a snapshot exists at generation time it is written into `-BackupDir` explicitly (with time and total count); if not (fresh machine, plugin just installed) it is **left out** and `restore.ps1` picks the newest at run time — otherwise the script would stick to "there was no snapshot when it was generated". If the newest one turns out to be an empty snapshot, it walks back to the first one containing `package.json` and says so. Clicking a row in the "Restore backup" card uses the same generator and simply writes that snapshot's absolute path as `-BackupDir`, with the snapshot name in the file name.
+
+## Sync conflicts (since 0.3.17; both copies backed up since 0.3.18)
+
+When a pull is blocked by local files (the same path exists locally with different content), git aborts the whole batch. The old behaviour — "on failure, `reset --hard` and restore the latest snapshot" — actually knocked the **already fast-forwarded** HEAD back to the old commit, so the repo stayed permanently a few commits behind and every retry failed. 0.3.17 stops resetting:
+
+1. `sync.ps1 pull` runs `git fetch`, checks whether a fast-forward is possible, then intersects `git diff --name-only HEAD origin/x` with (local untracked ∪ local modified). On a hit it **backs up both sides** of every file and writes the list to `~\.dsh\sync-conflicts.json` (kind, both sizes, binary flag, 1500-char preview each side, whether each copy was saved), then `exit 6`. The repo and the local config are left untouched; HEAD is not rolled back.
+   The backup folder is named to say what it is: `~\.dsh\backups\conflict-<time>-拉取冲突-Pull-conflict\`, containing
+   - `本机-Local\<relative path>` — the local version (exactly what was in the working tree);
+   - `云端-Cloud\<relative path>` — the cloud version (`git show origin/x:<path>`; written byte-exact through `git cat-file blob` + a redirection, so `.zstd`/`.tgz` binaries are never re-encoded);
+   - `说明-README.txt` — bilingual (Chinese/English): created time, repo, HEAD before the pull, remote ref and sha, item count, what each folder holds, and both ways to restore;
+   - `清单-Conflicts.json` — a snapshot of the list, so you can check later which options were offered and which side was picked.
+
+   If a copy's written size does not match the source, the script warns, marks that side as not saved, and the panel greys out the matching button — no "thought it was backed up" surprises.
+2. `runtime\post-exit.ps1` treats exit code 6 as "pull pending" and skips the rollback branch.
+3. After the client restarts, a "Sync conflicts" card appears under the metrics (hidden when there is no list):
+   - one row per file, **click the row itself** to expand/collapse both previews (no separate "details" button);
+   - "Keep local / Use cloud" per row, plus "All local / All cloud" at the bottom;
+   - when expanded, two buttons: "Restore local copy" and "Restore cloud copy" — **either copy can be written back to the working tree independently, they never overwrite each other, and neither touches git history**; a copy that failed to save greys out its button and says why;
+   - "Save" writes the choices into the list, "Discard" deletes the list (the next pull recomputes it).
+4. Save, then click "Pull now": `sync.ps1` reads the same list, deletes the working-tree copy for every `cloud` item (and also for `local` items, so git can fast-forward), fast-forwards, then writes the `local` items back from the backup — they become a normal local change that the next push carries. The list is then removed.
+
+Granularity is only "keep local / use cloud per item" plus "restore one item from the backup"; there is no in-preview editing or manual merge. Conflicts are almost always "the other machine changed the same config file", where picking one side is enough — for a real merge, edit the file and push.
+
+API: `GET/POST /config-sync/conflict` (GET reads the list, each item carrying `localSaved`/`cloudSaved`; POST `{items:[{path,choice}]}` saves choices, `{action:'restore',path,side:'local'|'cloud'}` restores one file (local by default), `{action:'reset'}` discards the list). A restore writes into the `repo` recorded in the list, so changing `repoPath` later cannot point it at the wrong repo. `status` now returns `conflicts: {exists,total,pending,at,backupDir}`.
+
+## Restore backup (since 0.3.13; "Restore now" + point-in-time since 0.3.25)
+
+The panel has a "Restore backup" card (placed after "After exit" and before "Sync content"): the top row is the **backup folder** (default `~\.dsh\backups`, where `apply.ps1` takes a snapshot before every pull/apply), and below it every **snapshot in that folder** is listed — name, time (plus a relative time such as "3 min ago"), how many plugins it holds, and whether it can be restored.
+
+- **No sizes in the list (since 0.3.41)**: each snapshot is a whole profile (thousands of files). Older builds re-walked every snapshot on every panel refresh — 92 snapshots / 48k files measured 7.7 s, pushing `/config-sync/status` to 11 s; a single front-end fetch could not survive that and showed "read failed" until you clicked "Recheck" by hand. The list now shows name / time / plugin count / restorability only; sizes belong in Explorer. The same change also: caches the remote probe for 5 minutes, caps each probe at 2.5 s, warms it up when the plugin loads, and gives the front-end status call a 15 s timeout plus 3 automatic retries (the message says "retried 3 times"). Measured status went from 8.0 s to 0.35 s (median over 20 calls).
+
+- **Since 0.3.25 this is the same pipeline as "Pull now"**: clicking "Restore now" on a row first asks the host for a **diff preview** — which plugins installed after that snapshot will be removed, which files created after it will be moved out, which files will be overwritten / written back, and which plugins will be re-installed — and only "Confirm restore" queues it: the client closes normally, `post-exit.ps1` opens a visible progress window running `restore.ps1 -RollbackToPoint`, the result is written to `auto-sync-result.json`, and the client restarts automatically. No more quitting the client yourself, double-clicking a `.cmd` and typing `y`.
+- **Point-in-time means rolling back to that moment**, not just copying the snapshot files back: files created after the snapshot move into `backups\manual-<timestamp>\rollback\files`; plugins installed afterwards lose only their junction link (never deleting through it into the real directory) or have their real directory moved into `rollback\plugins`; every item is recorded in `rollback\rollback-manifest.json` — all restorable, nothing physically deleted. The current config is saved first as `manual-<timestamp>` as well.
+- **What counts as "a plugin installed after the snapshot"**: the `dependencies` of the restored `package.json`. Direct children of `node_modules` (including `@scope/pkg`, but not `.bin` / `.pnpm`) that are not in it get removed, and `pnpm install` afterwards adds back whatever the snapshot had.
+- **The folder is editable**: click "Edit", type an absolute path (e.g. `D:\DSH-backups`) and save; the card then scans that folder. "Use default" clears it back to `~\.dsh\backups`. Stored as `backupRoot` in `~\.dsh\dsh-config-sync.json` — empty means the default, and it stays on this machine, never in the repo.
+- **Three kinds of backups, three restore paths (since 0.3.49)**: the backup folder is shared by several producers, so the panel classifies each folder by its content and every class gets a working button:
+  - **Config snapshot** (`config-*` / `manual-*`, top-level `package.json` with `name: dsh-profile-*`) → "Restore now", a point-in-time rollback.
+  - **Plugin backup** (`plugin-<version>-*`, containing `runtime\` / `client.js`, or just one `dsh-config-sync-<version>\` layer) → "Roll back plugin": the current plugin is copied to `plugin-<current version>-<timestamp>` first, then written back with a merging copy (`Copy-Tree` walks level by level, so you never get `runtime\runtime` — a real bug measured while building 0.3.49).
+  - **Session backup** (`session-corrupt-*`, top level is all `--<path-encoded>--` folders) → "Restore sessions": the folders are written back into `~\.dsh\sessions`, with any existing folder of the same name copied to `backups\session-<timestamp>` first.
+  - **Anything unrecognised** (conflict comparisons, hand-copied folders) → "How to restore": shows the backup path, what is inside, and the three usual targets, so no row is a dead end.
+- **Classification cannot rely on `package.json` alone**: a profile's `package.json` **also** carries a `dsh` field (`dsh.profile.bundles`), so judging plugins by `dsh` misclassifies whole config snapshots (all 8 `config-*` and 2 `manual-*` snapshots did). The order is now: `name: dsh-profile-*` or `dsh.profile` → config; `name: dsh-config-sync` → plugin; then top-level contents and the folder-name prefix as fallbacks. Empty folders (half-finished installs) are marked "Empty backup" with no button.
+- **Only usable snapshots are offered**: a config snapshot without `profile\package.json` (the empty one `apply` leaves on a brand-new machine) is marked "Empty backup" and greyed out; `restore-backup` / `restore-preview` / `restore-now` share `resolveSnapshotDir`, and an unrecognised type is rejected with a pointer to the manual route.
+- **Only this folder's snapshots are accepted**: the path from the panel must be a real snapshot under the backup root (escaping it, relative paths, quotes or newlines are rejected), so changing the folder never widens the scope to arbitrary directories.
+- **The old path still works**: "generate restore script only" in the "After exit" card still writes `<repo>\restore-<snapshot name>.cmd` (dry-run preview, `y` confirmation, `manual-<timestamp>` safety copy) for offline / remote / manual use; `restore.ps1 -BackupDir` is unchanged, and `-RollbackToPoint` is added automatically by the panel pipeline.
+
+## Plugin configs travel with the sync + cross-machine paths (since 0.3.30)
+
+A new machine ending up with "no config" is mostly not a failed pull — **those configs were never in the repo**. 0.3.30 grows the settings group from 4 files to 13:
+
+| Repo path | Local source | What it is |
+|---|---|---|
+| `settings\our-free-model.json` | `~\our-free-model\settings.json` | Free-model relay settings (runtime fields normalised, so every round is not "changed") |
+| `settings\comfyui-workflows.json` | `~\data\dsh-comfyui\workflows.json` | ComfyUI workflow library |
+| `settings\dsh-pet-main-config.jsonc` | `~\dsh-pet\main-config.jsonc` | Desktop pet config |
+| `settings\dsh-market-state.json` | `.dsh-market\state.json` under the profile | Plugin market state |
+| `settings\dsh-pet-memory.json` | `~\dsh-pet\memory.json` | Pet memory |
+| `settings\our-free-model-picks.json` | `~\our-free-model\picks.json` | Picks / favourites |
+| `settings\dsh-im-interface-language.json` | `~\integrations\dsh-im\interface-language.json` | dsh-im UI language |
+| `settings\dsh-qq-config.json` | `~\integrations\dsh-qq\config.json` | QQ integration config |
+| `settings\dsh-qq-workspaces.json` | `~\integrations\dsh-qq\workspaces.json` | QQ integration workspaces |
+| `settings\redteam-preset-declare.json` | `~\redteam\preset-declare.json` | Redteam preset declarations |
+| `settings\task-board-ledger.json` | `~\task-board\ledger-v2.json` | Task-board ledger |
+| `settings\task-board-scheduler.json` | `~\task-board\scheduler-v2.json` | Task-board scheduler |
+| `settings\dsh-workspaces.json` | `~\storages\workspace.json` | **DSH workspace registry** (the usual reason workspaces vanish on a new machine) |
+
+**Still excluded**: credentials and runtime state — `channel-pack` (contains `token-ledger.json`), `workbuddy-vault`, `dsh-purge`, `stats` / `feed` / `catalog` / `availability`, `integrations\dsh-qq\bots\<bot>\state.json`, session caches.
+
+### Configs that carry absolute paths: placeholders + a one-time confirmation
+
+Two machines rarely share drive letters (one has `D:\DeepSeekHarness`, the other does not), so such configs cannot be copied verbatim:
+
+| Placeholder | Meaning |
+|---|---|
+| `{{APP_ROOT}}` | Client install root (the folder holding `DeepSeekHarness`) |
+| `{{DSH_HOME}}` | `.dsh` folder (usually `%USERPROFILE%\.dsh`) |
+| `{{WORKSPACE_HOME}}` | Workspace root |
+| `{{ROOT:<key>}}` | A folder you pick (ComfyUI models, proxy binary path, ...), the value is yours to decide in the panel |
+
+- Before writing to the repo, `capture.ps1` normalises local roots into placeholders. All four spellings of a path are recognised (raw backslashes / JSON doubled / forward slashes / JSON escaped slash), and longer roots are replaced first so `{{WORKSPACE_HOME}}` never gets swallowed by `{{APP_ROOT}}`.
+- The repo always stores **forward slashes** (`{{APP_ROOT}}/mnemon`), so JSON needs no backslash escaping.
+- Before landing, `apply.ps1` expands placeholders back into local paths.
+
+### Path confirmation: you pick after a pull, never asked twice
+
+- The first sync writes `<dshHome>\config-sync-roots.json` with detected roots. **Local only, never committed.**
+- When a root is missing on this machine, `apply.ps1` **skips that file instead of writing it** and records it in `<dshHome>\config-sync-pending-paths.json` (which token, which file, what folder to pick).
+- The panel's "Local paths" card lists those items; fill in the paths, save, then pull once more.
+- Confirmed values win over detection and are not asked again. **Not writing beats writing garbage** — a literal `{{ROOT:xxx}}` inside a config is read by plugins as a real path, and that error is far harder to trace than a skipped file.
+
+### Two health checks: stray paths after a push, overwritten edits before a pull (since 0.3.36; receiver-only since 0.3.43)
+
+**After a push** (`capture.ps1` tail): it walks the repo's **config files** (`settings\*.json`, `profile\*.json`, `skills\`, `presets\`, `prompt\`, top-level json - `conversations\` / `workspace\` / `mnemon\` / `storages-record\` are session and runtime data that is not meant to match across machines, so they are skipped), pulls out every absolute path that falls **outside all confirmed roots** (e.g. `F:\workspace-new` while every root on this machine is under `D:\`) and records them in `<dshHome>\config-sync-absolute-paths.json`, together with the `machine` that wrote it and the root values at that moment. The console prints a warning. **It never blocks the commit** - the path may well be right, it just cannot travel to another machine.
+
+**Since 0.3.43 that list only means something on the receiving machine**: it is written during a push, and paths this machine pushed obviously exist here, so showing them locally only looks like a fault (in a real run 40+ of 50 entries were `conversations\session_projcache` noise). The panel now compares the report's `machine` against this machine:
+- **Written by this machine** → not shown, and not counted as a warning (`status.localPaths.absolute` is 0).
+- **Written by another machine** (this machine is receiving, before or after a pull) → it says "this config was pushed from `<machine>`" and gives **a suggested folder per entry**: first a prefix mapping using the remote machine's root values from the report (`F:\DSH\SquadLink` → this machine's `<APP_ROOT>\SquadLink`, original case preserved); with no root to map, it looks for a same-named folder under this machine's roots, the user profile, the Desktop and each fixed drive; if nothing matches it says so instead of guessing.
+- Every row has **Accept**: one click records that folder as a custom root (`{{ROOT:<key>}}`), so from the next push on those paths become placeholders that each machine expands to its own value; accepted rows show "Accepted". The old wording ("add it as a custom root and push once") left that work to you.
+- Regex false positives are filtered too: `s://1v3.apiipu.com/...` used to be read as a path on drive `s:`; anything containing `://` is now skipped.
+
+**Before a pull** (`apply.ps1`, ahead of writing settings): laying configs down is a whole-file `WriteAllText`, so editing a path and pulling before pushing silently overwrites your edit (the backup exists under `<dshHome>\backups\config-<stamp>\settings\`, but nobody digs through that). So the overwrite is now detected first: the local file is normalised the same way capture writes it (roots → placeholders, CRLF flattened to LF, and `catalogSyncedAt` / `reloadedAt` / `reloadCount` in `our-free-model.json` zeroed), compared against the repo copy, and every difference is recorded in `<dshHome>\config-sync-overwrite.json`. The panel then says "N config files were overwritten by the repo version (your local edits were backed up first)", with the backup path per item. To keep your edits: **push first, then pull** - never the other way round.
+
+### How the Local paths card works (since 0.3.34: read-only + Edit; since 0.3.37: hidden by default)
+
+- **It stays off the page**: the card and its whole section title are not rendered - on a normal machine the paths are not meant to be edited. There is exactly one entry point: the **Local paths** button in the page title row, which expands the section and turns into "Hide local paths".
+- **All three count as warnings**: paths still to confirm, absolute paths in the repo outside every root, and configs the last pull overwrote - `status.localPaths.alert` is their sum, and that button turns amber reading "Local paths · N alert(s)"; click it for details.
+- **Read-only by default**: the three roots (`{{APP_ROOT}}` / `{{DSH_HOME}}` / `{{WORKSPACE_HOME}}`) show their current value in a monospace line with the placeholder as a grey hint underneath; custom folders (`{{ROOT:<key>}}`) render the same way.
+- Click **Edit** (top right) to turn them into inputs, which brings up Save and Cancel; a successful save returns to the read-only view - the same pattern as Local repo and Sync content.
+- In edit mode three extras appear: a **Detected** button next to each root (fills in the auto-detected folder - this is how you undo a wrong value), a **Remove** button next to each custom folder, and an **Add folder** row (key + path, key limited to letters, digits, `_ . -`) for roots that live elsewhere on this machine.
+- The chip in the card head is orange "N to confirm" while something is pending, green "Confirmed" when everything resolves; **Reload** is always available and re-reading detected values never overwrites what you confirmed.
+- If not a single root was detected, the card stays in edit mode - fill them in before saving.
+- Values here **win over everything**: a saved root outranks the value the script detected on its command line (`Get-SyncRoots` prefers roots.json and only fills the gaps). A wrong value therefore does not "fail to apply" - it applies, expanding placeholders into a dead folder.
+
+## Feedback goes to GitHub Issues (since 0.3.31, token-free reading since 0.3.32)
+
+The Feedback card at the bottom of the panel. **GitHub Issues are the single source of truth** - no more json files in the config repo:
+
+1. Title + details → `POST /repos/QcWyGm/dsh-config-sync-plugin/issues` with label `feedback`; an environment block (plugin version, machine, time, platform, install root, config repo path) is appended to the body so nobody has to ask later;
+2. The list reads the Issues directly (`GET /issues?state=all&labels=feedback`): open and closed both show, and the title is a link to the GitHub page;
+3. Resolve → `PATCH issue {state:'closed'}`. It is still the same thread on GitHub, so the discussion can continue there, and reopening is one click;
+4. The top row of the card is the connection state, in one of three forms: `signed in as xxx (submit and close)` / `token is not the owner (read and submit only)` / `anonymous read (submit via browser)`.
+
+**Reading needs no token** (0.3.32): this repo is public and the Issue list is readable anonymously (verified HTTP 200, 60 requests/hour per IP). So it reads with the token when one exists (your account, 5000/hour) and falls back to an anonymous read when the token is expired or absent - a fresh machine shows existing feedback on the very first panel open, with no token setup first.
+
+**Submitting without a token** (0.3.32): the panel prefills title, body and environment block into GitHub's new-issue page (`https://github.com/<repo>/issues/new?title=&body=&labels=feedback`); if GitHub is signed in on your browser, one Submit button finishes it, no token involved. This path is only used when no token exists; with a token the API path still applies, which is what makes queueing and refushing possible.
+
+**Only the repo owner can close** (0.3.32): before changing state the server checks `GET /user`; a token whose `login` differs from the repo owner gets a 403, and the "Resolve" button is disabled and reads "Owner only". So a foreign token cannot close issues even if it is pasted into the panel - the restriction lives on the server, not just in the UI.
+
+**No token typing needed**: by default it is taken once from the local git credential (`git credential fill` - it is already there if you have pushed from this machine) and stored in `<dshHome>\config-sync-gh.json` (local only, **never committed**). Only when that fails do you paste one, which is verified against `/repos/{repo}` immediately and not saved if it fails. Repo and label can be changed in the same row.
+
+**Offline reports are not lost**: when creating an Issue fails, the report goes into `<dshHome>\config-sync-feedback-outbox.json`; the panel shows how many are pending and Flush creates them one by one when the network returns, dropping each one that succeeds. It is a sending queue, not a second copy - once sent, the queue empties.
+
+**Filter and search** (0.3.33): a row above the list with `Open / Closed / All` (each carrying a live count - the server fetches everything once and derives open/closed/total), plus a search box that filters as you type. It matches issue number, title, author and body, including the machine/version inside the environment block. All filtering is local: switching state or typing never calls the API, so it does not consume the anonymous quota. A grey line reports "N of M shown (keyword x)" live, and an empty result under the current filter says so instead of going blank.
+
+## Uninstall leftovers cleaned automatically (since 0.3.29)
+
+Uninstalling a plugin is the host's job: it removes the install directory, the `package.json` dependency and the `cordis.patch.yml` block. It does **not** remove the junction under `profile\node_modules` - measured on `dsh-image-search`, whose target `D:\DeepSeekHarness\dsh-image-search-0.1.0` was gone while the link still pointed at it. Broken links like that are invisible to pnpm too (with a flat layout it only reinstalls from the lockfile, and the link was not created by pnpm), and syncing never cleaned them either, so they survive until the next reinstall.
+
+So `apply.ps1` sweeps them on every landing (section 9.6) and only removes links where **all three** hold:
+
+| Test | Meaning |
+|---|---|
+| it is a link | `LinkType` is Junction / SymbolicLink; plain directories are never touched |
+| none of its targets exist | if any target is still there, the link is treated as legitimate and kept |
+| it is absent from `package.json` dependencies | every `link:` plugin in use is skipped |
+
+Removal uses `Directory.Delete`, so only the link itself goes and nothing is deleted through it; the log prints one line per removal, `已清理孤儿链接（卸载残留）：xxx → 目标不存在 yyy`.
+
+**Plugin backups are tidied too**: every round of "rename the old directory into a backup first" piles up `<dir>.bak-<timestamp>`. A backup whose version equals the live one is pure waste (it is the copy that was just replaced), so it is deleted; different versions keep only the newest; if the live directory is gone the backup is kept as the only rollback point.
+
+**One misjudgement fixed as well**: before 0.3.29 the deploy test compared mtime, and `git checkout/fetch` stamps the archive with the current time, so every sync round concluded "new version" and renamed the directory into a backup and re-extracted it again (that is how `dsh-purge-1.1.92` and `.bak-timestamp` ended up side by side). It now compares the version inside the archive `package.json` against the deployed one; when the version cannot be read it falls back to mtime with a 10-second margin.
+## Sync scope (per-group and per-item checkboxes, since 0.3.8)
+
+The panel has a "Sync content" card (placed at the very bottom of the page): the twelve groups that sync to the cloud are listed individually and **checked by default**. Clicking a row expands that group's items and clicking it again collapses them (there is no separate "Details" button); both the group and each item can be unchecked — unchecked content is **no longer captured on push and no longer restored on pull**; tick it again and syncing resumes (push and pull share the same file).
+
+- **It opens read-only**: every checkbox is greyed out and only reflects the current selection. Click "Edit" to unlock them, then "Save" to write the file (or "Cancel" to drop the change and re-read the saved state). This prevents a stray click from silently changing what gets synced.
+
+| Group | Cloud folder | Items (excludable individually) |
+|---|---|---|
+| Local profile | `profile/` | package.json / lockfile / cordis (group switch only — these files interlock) |
+| Prompts | `prompt/` | `AGENTS.md`, `prompt-inject.md` |
+| Skills | `skills/` | one entry per skill folder |
+| Presets | `presets/` | one entry per preset |
+| Skill-market ledger | `storages-record/` | `skill-market-installed.json`, `skill-market-panel.json` |
+| Plugin configs | `settings/` | 13 config files (see the table in "Plugin configs travel with the sync"), each excludable |
+| Mnemon | `mnemon/` | the whole folder (single entry) |
+| Local plugins | `local-plugins/` | one entry per linked plugin |
+| Plugin data | `plugin-data/` | one entry per top-level plugin folder (auto-enumerated, see below) |
+| Extra paths | `extra/` | absolute paths you add yourself (see below) |
+| Workspaces | `workspace/` | one entry per registered workspace (`workspace-registry.json` only lists checked ones) |
+| Conversations | `conversations/` | one entry per workspace |
+
+- Choices live in `~\.dsh\config-sync-scope.json`, **on this machine only and never committed** (each machine ticks its own); the file stores only what differs from the default, so deleting it means "everything checked".
+- Skipping applies to **both directions**: `capture.ps1` stops capturing (nothing new lands in the repo) and `apply.ps1` stops restoring (your machine is untouched). `-PruneSkills` also stops treating "a skill you unchecked" as an extra to delete.
+- The card carries one more switch, "Also delete the cloud copy when unchecked", **off by default**: while off, unchecking just means "this machine stops caring" and the cloud copy stays, so re-ticking resumes immediately; when on, unchecking really deletes the matching folder/sub-path from the repo on the next push (the other machine can no longer pull it) and **that deletion cannot be undone**.
+- Items you cannot tick (the five profile files, mnemon) are deliberately group-level switches: the lockfile specifiers must match package.json, and excluding one alone breaks installation.
+- **The "Local profile" group is required and cannot be unchecked** (the panel shows "required" and greys the checkbox out). It is not an optional extra but a precondition of `apply.ps1`: when `profile\package.json` or `profile\cordis.patch.yml` is missing from the repo, a pull stops with `[X] 仓库内容不完整`; and `profile\host-contract.json` in the same group is the version-consistency check between the two machines — lose it and configs are laid down across mismatched client versions, which can leave the app unable to start. Editing `config-sync-scope.json` to `false` does not help either: `capture.ps1`, `apply.ps1` and the panel all treat it as on (`Test-SyncGroupEnabled` pins it).
+
+## Plugin data & extra paths (0.3.51)
+
+Third-party plugins usually keep their own config and data in their own top-level folder (`~\.dsh\<plugin>\`). These two groups carry them along:
+
+- **Plugin data (`plugin-data/`)**: `<DshHome>`'s top-level folders are enumerated automatically — one folder, one slot — stored as `plugin-data\<slot>\...` plus `plugin-data\manifest.json` (`slots[{id,src,files,bytes}]`).
+  - Skipped by default: `profiles`, `skills`, `.agent-presets`, `storages`, `sessions`, `attachments`, `logs`, `backups`, `update-staging`, `electron`, `dsh-runtimes`, `dsh-market`, `.dsh-plugin-market`, `dsh-session-manager`, `im`, `node_modules` and hidden folders — they either already have a dedicated group or are cache/runtime.
+  - Each slot scans at most 8 levels deep and 4000 files (so no plugin can drag a whole repository in).
+- **Extra paths (`extra/`)**: absolute paths you add in the panel, folder or single file; stored as `extra\<id>\...` or `extra\<id><ext>` plus `extra\manifest.json`.
+- **Text is placeholder-normalised, binary stays byte-exact**: text files get `{{APP_ROOT}}` / `{{DSH_HOME}}` / `{{WORKSPACE_HOME}}` / `{{ROOT:x}}` written into the repo (CRLF→LF along the way) and are expanded on the other machine by `Expand-TokenText`; binaries (`.db`/`.node`/`.exe`/images, or any file containing NUL bytes) are copied byte for byte.
+- **Write-back always keeps a copy first**: apply merges file by file and backs up the overwritten target file into `backups\config-<timestamp>\plugin-data-<slot>` or `extra-<id>`.
+
+### Rules file: `~\.dsh\config-sync-extra.json` (this machine only, never committed)
+
+The "Plugin data & extra paths" card edits this file directly:
+
+| Field | Meaning |
+|---|---|
+| `pluginData.enabled` | group switch for plugin data (linked with the row in "Sync content") |
+| `pluginData.maxFileBytes` | per-file limit, **hard-capped at 104857600 (100MB, GitHub's single-file limit)**; larger values are clamped |
+| `pluginData.exclude` | exclusion list, wildcards one per line, **replaced wholesale** (emptying it really excludes nothing) |
+| `pluginData.skipDirs` | top-level folders skipped during enumeration, also replaced wholesale |
+| `extra.enabled` / `extra.paths[]` | extra-paths switch and list (`{id,src,label}`, `src` must be absolute) |
+
+Default exclusions (50 entries, edit freely): `*.db` / `*.db-*` / `*.sqlite*` / `*.db-shm` / `*.db-wal`, `*.node` / `*.exe` / `*.dll` / `*.asar` / `*.pak` / `*.bin` / `*.img` / `*.iso`, archives `*.zip|7z|rar|tar|gz|tgz`, media `*.mp4|mkv|avi`, `*.log` / `*.log.*`, `*.tmp` / `*.bak` / `*.bak-*` / `*.old` / `*.orig` / `*.swp`, `api-key` / `*.pem|key|p12|pfx|crt`, `*cache*` / `*token*` / `*secret*` / `*credential*` / `*password*` / `*vault*`, `node_modules` / `.git` / `.cache` / `__pycache__` / `.venv`.
+
+- **Why cache/token/database files are excluded by default**: `*cache*` and `*token*` files change on every run and would put a diff in every push; `.db` files are often locked by the plugin itself and restore badly across machines.
+- **Extra paths are safest under a standard root**: anything under `~\.dsh\`, the client folder or the workspace root is normalised into a placeholder; elsewhere (say `D:\tmp\xxx`) it can only be laid down at the same absolute path, and a machine without it skips the item with a `[!]` notice.
+- If a path still contains an unconfigured placeholder after expansion, apply skips that slot with a `[!]` notice instead of writing `{{DSH_HOME}}` into a plugin's config.
+
+## Auto sync / auto push (two switches, both off by default)
+
+| Switch | Behaviour |
+|---|---|
+| Pull on startup | 8 s after start, a read-only `git fetch` comparison; behind > 0 → system confirmation dialog (Yes/No) → "Yes" **exits the whole client family right away** (measured: processes gone within 5 s) → a visible window runs the pull → relaunches automatically. Clicking × to close also checks once and queues (0.3.93; no confirmation dialog on the close path — behind > 0 queues the pull) |
+| Push on exit | **queued when any of three sources hit**: local commits ahead, uncommitted changes, local data newer than the last sync (new sessions etc). Re-checked every 2 minutes after start, and checked once more when × closes the window (0.3.93), no duplicate watcher while queued; pushes only after DSH fully exits, then relaunches |
+
+- The work is done by `runtime\post-exit.ps1 -Phase wait`, which the plugin launches as a **hidden** process to watch for the client exiting; only after it really exits does it start a **visible** `-Phase run` window titled "DSH 配置同步 · 拉取/推送". **No window while queued** — otherwise an empty window would sit in the way from boot to shutdown.
+- When the repo is not in place yet (empty folder included) the startup check simply skips and does **not** record a failure — an empty folder is only waiting for the first pull.
+- **Launch pitfalls hit here**: `detached: true` PowerShell exits immediately on Windows (not one log line), so a short-lived PowerShell starts a separate process with `Start-Process -PassThru`; `spawn()` failures are asynchronous (only an `error` event), so the launcher's exit code is awaited and a missing pid fails honestly, logged to `~\.dsh\logs\auto-sync-launch.log`.
+- **Waiting for exit cannot rely on pid**: the plugin runs in a child process, so `process.pid` is not the client's main process — pid checks produce "client still running, waiter thinks it exited" and pull mid-run. It matches by process name instead; "closed but processes linger" (measured: 7 processes with `hwnd=0` alive for over a minute) also counts: alive past 60 s with no visible window for 16 s → kill the leftovers, then sync (`auto-sync-wait.log` records it).
+- **One sync at a time**: `~\.dsh\auto-sync.lock` records the pid. A startup push and a user-confirmed pull once ran together and rewrote config in parallel; now the later one reads the lock — same kind is reused, a different kind (manual wins) first ends the waiting process that has not started yet, then re-queues.
+- **Exit uses the whole process family**: `taskkill /PID <main>` (without `/F`) does nothing for the Electron main process (`This process can only be terminated forcefully`), so it uses `/IM "DeepSeek Harness.exe"` and adds `/F` 3.5 s later.
+- **Clear environment variables before relaunching**: clients started through the plugin chain "quit right after start" three times in a row while the same script in a clean shell succeeded — the difference was the inherited `ELECTRON_RUN_AS_NODE` (plus `ELECTRON_NO_ATTACH_CONSOLE`/`NODE_OPTIONS`/`NODE_PATH`); clearing them worked first try. After start it also counts processes and retries up to 3 times, 8 s each.
+- **Pull failure rolls back**: `git reset --hard` to the original commit → run `restore.ps1` with the `backups\config-<timestamp>` created just before this apply wrote to disk → the rollback result is logged either way, and an incomplete rollback says "open the log and check".
+- **Both pull and push relaunch**: success uses the new config, failure the rolled-back one. A successful relaunch refreshes `lastSyncAt` in `config-sync-state.json`, so files just written by apply are not misread as "to push" by the next startup check.
+- **How the progress window ends**: after a pull or push finishes the window **stays open** instead of closing itself 3 seconds later (that used to flash the result past you, failure reason included). It keeps "sync finished / log path" on screen and exits only when you press a key or click the ×. The client was already relaunched by `explorer.exe` **before** this, so it shares no parent/console job with the window — leaving the window open or closing it kills nothing. `update` (the install-after-exit path) keeps its window too, with a "plugin update finished" banner; only `relaunch` still closes itself after 3 s, since there is no result to read.
+- Exit codes: `0` done, `2` wait timeout, `3` sync.ps1 missing, `4` relaunch failed, `5` sync failed (pull already tried to roll back).
+- "Cancel queue" only drops the plugin's queue record; an already launched external waiter still waits for your exit — end it manually to stop it (the pid is in `auto-sync-wait.log` / the launch log).
+
+## Plugin update (since 0.2.0)
+
+The **Plugin update** card shows the local version, the cloud version and one status line; the manifest and package live in this public repo (`version.json` + `releases/dsh-config-sync-plugin-<version>.tgz` — only a few hundred bytes are read, the package is not; cached 30 minutes, checked on mount and every 30 minutes after).
+
+| Status | Meaning |
+|---|---|
+| Green "Up to date" | local version ≥ manifest version |
+| Orange "New version x.y.z" | the manifest is higher, with a one-line note and a "Download x.y.z" button |
+| Orange "Downloaded, install pending" | the package is already in `~\.dsh\update-staging\` (the plugin directory is untouched) — click "Restart & install" to apply |
+| Orange "Installed, restart pending" | only on the legacy path (installed while running but not yet restarted) — click "Restart DSH" to apply |
+| Red "Check failed" | manifest unreadable (network / repo missing / 404), with "Check for updates" to force a re-check and the per-source failure reason listed |
+
+- **The manifest has several sources, tried in order**: the built-in candidates are `gh-proxy.com` → `ghfast.top` → GitHub raw; the first two are live proxies (a fresh manifest comes back within a second, and the tgz downloads through the same prefix). `raw.githubusercontent.com` is frequently unreachable from mainland networks, and the host's `fetch` is Node's built-in one that **ignores system proxies** — so the request gets aborted on timeout (that is exactly the `This operation was aborted` line on the card). The package download follows the same order (the source that served the manifest first, then the rest): a reachable manifest does not guarantee the package is reachable on the same domain. 30-second timeout per request.
+- **Do not use jsDelivr as a manifest source**: it caches branch aliases like `@main` for a long time and was still serving the previous `version.json` after a release (`purge.jsdelivr.net` did not refresh it either), so "new version available" would show up hours late — more misleading than a failed check. Versioned package files are unaffected by that cache, but the manifest is.
+- **Token**: this repo is public, so no token is needed. If `updateManifestUrl` points at a private Gitee mirror instead, fill in a Gitee personal token and both the manifest and the package switch to the API raw endpoint (`/api/v5/repos/<owner>/<repo>/raw/<path>?ref=main&access_token=…`), passing the branch as `ref` rather than in the path. A URL you fill in is used **alone**, with no mirrors mixed in. The token lives only in the local settings file, never in the repo; saving empty means "keep the stored token", and there is a separate "Clear stored token" button. A relative `tgz` resolves against **the manifest actually read**, so switching addresses cannot build the wrong domain.
+- The update is split into two steps (since 0.3.7): **download and install are separate**. "Download x.y.z" only saves the tgz into `~\.dsh\update-staging\dsh-config-sync-plugin-<version>.tgz` and verifies its sha256 — the host never touches the plugin directory, so DSH does not resync its plugin tree and the Config Sync page you are looking at never jumps away. The button then becomes "Restart & install": that one exits DSH (`spawnWatcher(-Mode update -UpdateTgz <local package> -UpdateSha256 …)`), and the post-exit script backs up the old directory (`~\.dsh\backups\plugin-<old version>-<time>`), installs, and relaunches the new version (`runtime\post-exit.ps1`, rolling back from the backup on failure). Installation happens after exit, so exactly one restart is needed.
+- Why the old path was dropped: 0.3.4–0.3.6 installed **while DSH kept running**, overwriting the plugin directory. In practice that made the host tear down the current panel — the page vanished mid-update and users had to click back before they could press restart. The logs line up: `11:41:55 覆盖安装` → `11:42:10 已启动 relaunch`, with a visible 15-second gap in between. `POST {action:'install-live'}` stays available for CLI/scripts but the panel no longer uses it; `POST {action:'apply'}` (exit first, then download and install) remains too.
+
+## Using this repo as a market index source
+
+The root `market-index.json` is a ready-to-use DSH market index (`format: 1`, `source.type: git` with a 40-character commit; installing fetches the package from this repo, no build). Index URL:
+
+```
+https://raw.githubusercontent.com/QcWyGm/dsh-config-sync-plugin/main/market-index.json
+```
+
+In DSH go to **Plugins → Discover → Index sources**, paste the URL above, and "Config Sync" shows up in the list; installing pulls this repo at that commit.
+
+- **Prerequisite**: this is an index source for the **official Discover page** (`@deepseek-ai/dsh-plugin-market`), which needs the official `@deepseek-ai/dsh-experimental-plugin-market-bundle` enabled in the profile. Without it, neither the Discover page nor the index-source entry exists.
+- **Not found in dshmarket is expected**: the third-party market plugin dshmarket lists only its own curated catalog (`awesome-dsh-plugin.com/plugins.json`, or the `dsh-plugin-catalog` npm package in China). Its source has no path for user-supplied indexes (`lib/registry.js` reads that single catalog per region on every call, `lib/sources.js` only parses entries of that catalog), and its installs are restricted to sources listed there — anything else is rejected. So a self-hosted index, however valid, never shows up in dshmarket's search. To appear there, open a PR against [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) (its README says plainly: don't PR plugin entries against the market repo).
+- **Fetching the index from China**: `raw.githubusercontent.com` comes and goes; prefix it with `https://gh-proxy.com/` or `https://ghfast.top/`, or use jsDelivr's `https://cdn.jsdelivr.net/gh/QcWyGm/dsh-config-sync-plugin@main/market-index.json` — but jsDelivr caches branch aliases like `@main`, so a new release may take hours to appear there.
+- **Just want it on your own machine**: no market needed — `dsh plugin add` with the tgz from the install section above is the shortest path.
+
+Release flow: change code → `pwsh -File tools\pack-plugin.ps1` to pack `releases/dsh-config-sync-plugin-<version>.tgz` (it collects files from `package.json`'s `files` and writes the sha256 back into `version.json`) → bump `version` (and `notes`) in `version.json` → replace `version` and `commit` of the entry in `market-index.json` → push. The index only references a commit, so older versions stay installable. Run `node tools\selftest.mjs <repo path>` and `node tools\clientcheck.mjs` before releasing.
+
+## Interfaces and paths
+
+| Interface | Notes |
+|---|---|
+| `GET /config-sync/status` | health-check JSON (including `repo.source` / `repo.configured` / `repo.phase` / `repo.empty` / `repo.remoteHeads` / `repo.remoteFiles` / `repo.pushAllowed` / `repo.pullAllowed`, `remote.configured`, `remote.backupRoot` / `remote.backupRootCustom`, `backup.{root,defaultRoot,custom,count,latest,latestFiles,snapshots:[{name,dir,at,files,bytes,usable,plugins,bundles}]}`, `local.{lastSyncAt,pending,sample}`, `auto.lastResult`) |
+| `POST /config-sync/prepare` | `{action:'push'\|'pull'\|'restore'\|'restore-backup'\|'all', message?, backupDir?}`, generates the matching `.cmd`; `all` returns `built: [...]` (when the local repo is empty the cloud file count decides: both empty → `['push','restore']`, cloud has files → `['pull','restore']`, the other one goes into `skipped`); on an empty folder `push` is allowed only when the cloud holds 0 files (that run is the initialize push) and `pull` only when the cloud actually has files; `restore-backup` requires `backupDir` (a real snapshot under the backup root that contains `profile\package.json`) |
+| `POST /config-sync/settings` | `{repoPath?, remoteUrl?, sshKey?, autoPull?, autoPush?, autoRestart?, backupRoot?, clearBackupRoot?}`: validate → write settings → (touch git only when the URL changed); failure rolls back and returns 400; an empty `backupRoot` / `clearBackupRoot` resets it to the default `~\.dsh\backups`; an empty folder is accepted, only "holds other files yet not a repo" is refused |
+| `POST /config-sync/auto` | `{action:'check'\|'pull-now'\|'push-now'\|'restore-preview'\|'restore-now'\|'cancel', backupDir?, closeNow?, restart?}`; `check` is a read-only fetch comparison (short-circuits with `pendingPull: true` when the local repo is empty instead of failing), `pull-now`/`push-now`/`restore-now` close the client without `/F` (a normal exit, so config is saved), `push-now` returns 400 on an empty folder; `restore-preview` only computes the diff (`pluginsRemove` / `pluginsInstall` / `willRemove` / `willOverwrite` / `willWrite`), while `restore-now` queues the "restore to that point after exit" run; `auto.pending` in `status` carries `reason` (why it queued) |
+| `GET/POST /config-sync/update` | `{action:'check'\|'prepare'\|'install-restart'\|'install-live'\|'restart'\|'apply'}`: `check` re-reads the manifest (mirrors tried in order); `prepare` only downloads into `~\.dsh\update-staging\`; `install-restart` hands that local package to the post-exit installer and closes DSH; `install-live` / `apply` / `restart` remain for CLI and compatibility |
+| `GET/POST /config-sync/scope` | GET returns the twelve-group scope (`{id,title,desc,enabled,items:[{id,label,enabled,excludable}]}` per group, plus `deleteCloud` and the local file `path`); POST `{deleteCloud?, groups:{id:{enabled?,excluded?}}}` stores only what differs from the default (fully-checked groups are not written) and drops exclusions that no longer exist || `GET/POST /config-sync/extra-config` | reads/writes the plugin-data rules (`{config:{pluginData:{enabled,maxFileBytes,exclude,skipDirs},extra:{enabled,paths[]}}}`; ids de-duplicated, paths must be absolute, the size cap is clamped to 100MB; GET also returns `defaults` for the "Restore defaults" button) |
+
+Cross-origin requests get 403. The client only `fetch`es these routes, imports no `@deepseek-ai/dsh-client-*`, and styles with `--dsw-alias-*` tokens only. Every request carries `accept-language`, which the host turns into Chinese or English text (`node:async_hooks` `AsyncLocalStorage`, one language per request).
+
+Paths: the repo follows the priority above; the client root prefers `config.appRoot` and otherwise derives from the plugin's own location (`<AppRoot>\dsh-config-sync-plugin-0.1.0`), so moving machines needs no edit; `.dsh` is `config.dshHome` → `%DSH_HOME%` → `~\.dsh`. The sync state file `~\.dsh\config-sync-state.json` is written by `sync.ps1`; the plugin only reads it. Local-only files: `config-sync-roots.json` (confirmed roots), `config-sync-pending-paths.json` (files skipped for a missing root), `config-sync-absolute-paths.json` (0.3.36: stray roots-outside paths found after a push) and `config-sync-overwrite.json` (0.3.36: which local configs a pull overwrote, with backup paths), `config-sync-scope.json` (per-group checkboxes) and `config-sync-extra.json` (0.3.51: plugin-data rules and extra paths).
+
+**Boundary**: `capture` has to read `cordis.patch.yml` while DSH holds that file, so it would capture a half-written state; and after `apply` writes, DSH writes over it again on exit. Hence the fixed boundary: decide what to run and write the command now, double-click after DSH exits. The full explanation of the sync mechanism, directory layout, moving to another machine and troubleshooting lives in the config repo's root `README.md`; this document covers the plugin itself.
+
+## Pitfalls already closed in the generator
+
+All of them surfaced only by **actually running on a new machine**:
+
+| Pitfall | Handling |
+|---|---|
+| cmd's `echo` swallows `< > \| & ^ %`, so `echo ... config-<timestamp>` became a redirect and printed nothing | every dynamic line goes through `echoSafe()`: `%`→`%%`, special characters prefixed with `^` |
+| after `chcp 65001`, `set /p` cannot read redirected input: automation feeding `y` left `GO` empty, "finished" printed while nothing happened, exit code still 0 | `--yes` skips confirmation + an explicit receipt when there is none |
+| a fresh machine has no upstream, `git pull --ff-only` says *There is no tracking information…*, PowerShell 5.1 wraps it as NativeCommandError and the script carried on | `sync.ps1` probes upstream first; since 0.3.54 a pull is `fetch` + `merge --ff-only origin/<branch>` (one network round trip), and a missing upstream is fixed with `set-upstream-to`; push uses `-u` |
+| `GIT_SSH_COMMAND` without the ssh.exe program → `/usr/bin/sh: - : invalid option` | four branches: use `core.sshCommand` if set; write a full command when `ssh.exe` is found; **unset the variable** when only a key exists; hand it to `.ssh\config` when there is no key |
+| with an asar build, AppRoot lookups by path all miss and every bundle is reported missing | `isAppRoot` accepts `app\package.json` **or** `app.asar`; version and bundle existence are read straight out of the asar (PowerShell 5.1 `ConvertFrom-Json` caps at 2 MB, a 5.7 MB header has to be read by entry offset), and anything undecidable is reported as "unknown" |
+| plugin directory already present skips deployment, so a newer tgz leaves old code running | `apply.ps1` compares the tgz with the newest deployed file and, when newer, renames to `.bak-<timestamp>` and redeploys |
+| "push on exit" was enabled yet nothing happened (no log, no result file) | two causes stacked: ① the queue predicate only looked at `ahead > 0`, which stays 0 until new sessions are captured → count all three sources + re-check every 2 minutes; ② `spawn` faked success (`detached` PowerShell exiting immediately / failures only on the `error` event) → start a separate process with `Start-Process`, await the launcher's exit code, and write `auto-sync-launch.log` |
+| an empty folder was treated as "the repo is broken": red text plus an enabled push button that would always fail | since 0.3.26 `repo.phase` splits it into four states; an empty folder allows pull only, blocked at three layers: `prepare(push)`, `push-now`, and `sync.ps1 push` |
+| "does the cloud have anything to pull" was answered by branch count → a remote whose `main` still exists but whose tree was emptied still read as "has content, pull only": pulling produced an empty folder, the state never changed and the initialize-push entry never appeared (a dead loop; verified on Gitee: 98 commits, the last 12 all "delete file", the newest tree has 0 files) | since 0.3.36 the criterion is **the file count inside the branch tree**: `ls-remote --heads` counts branches first (0 branches = empty, no fetch), and only when branches exist does it create a temporary bare repo, `fetch --depth 1 --filter=blob:none` and `ls-tree -r`, then delete it; `remoteFiles===0` always means "both sides empty" → push only, and `sync.ps1` overwrites that empty branch with `--force-with-lease` (the tree is empty, nothing is lost) |
+| a pull rewrote settings wholesale: edit a path, pull before pushing and the edit was silently replaced (only a backup folder, no notice) | since 0.3.36 the overwrite is compared first (roots → placeholders, CRLF flattened, the three timestamp fields in `our-free-model.json` zeroed); every difference lands in `config-sync-overwrite.json` and the panel/console say "N files were overwritten, local edits backed up first" |
+| after a sync, **creating a session failed outright**: `failed to create session … corrupt Zstandard session log: invalid frame magic at byte 186` | the first frame DSH writes carries a **4-byte content checksum** (frame header descriptor FHD bit2), and the decompressor happily succeeds on the prefix with that checksum trimmed, so the binary search for the "shortest decodable prefix" ended 4 bytes early; the rewritten file then kept the old checksum as garbage and DSH blew up on the second frame. Now: add 4 bytes per FHD bit2 → correct against "the next frame magic" → self-check before writing (cwd applied + new first frame is followed by a frame magic), refuse to write otherwise; leftover tails in already-broken files are dropped (self-healing) |
+
+Session header `cwd`, empty-snapshot fallback and missing `Get-FileHash` are handled by `apply.ps1` / `restore.ps1` / `dsh-sync-common.ps1` in the config repo; see sections 5 and 10 of its root `README.md`.
+
+## Performance (0.3.54): three speedups, zero behaviour change
+
+All three change *how* things are computed, not *what* is computed: the files written to the repo, the commit contents and the failure decisions stay byte-identical to 0.3.53 — it just runs faster. Numbers come from a same-size synthetic repo (50,889 files / 416 MB) and against real Gitee:
+
+| Step | Before | After | Why |
+|---|---|---|---|
+| capture deciding "does this file need rewriting" | two `Get-FileHash` per file (source + repo): 1.2 ms each → ~**120 s** for 50k files | two `Get-ChildItem` passes, one `FileInfo` each (Length / LastWriteTimeUtc already read by the enumeration) + an in-memory dictionary diff: **3.9 s**; hashes only for the few whose size or mtime differs | per-file `Test-Path` / `Get-Item` is *slower* (measured **37.8 s**, ~0.7 ms per cmdlet call), so bulk enumeration is the only sane way |
+| push scanning history for oversized blobs | `git ls-tree -r -l HEAD` on every push: **20–23 s** on a 50k-file repo, for a history that barely changes | cached per commit in `.dsh\sync-history-scan.json` (`{commit, oversized, at}`): skipped when the commit matches or is an ancestor of HEAD; a full scan only on first push, after a remote rejection, or with `-ScanHistory` | newly added files are already caught by the index pre-check; the history scan only covers "an old commit already carries a huge blob" |
+| pull | `git pull --ff-only` is fetch + merge internally, while the script had already fetched → **two network round trips** (SSH handshake measured ≈0.95 s) | `fetch origin --prune`, then `merge --ff-only origin/<branch>` → **one round trip**; `merge --ff-only` still refuses anything but a fast-forward, so a dirty tree or divergence fails exactly as before | when the run starts from a pending conflict list the earlier fetch was skipped, so one fetch is issued first to make the merge use fresh refs |
+
+Two new switches on `sync.ps1`, both **off by default** — the default path behaves exactly like 0.3.53:
+
+- `-DeepVerify`: forwarded to `capture.ps1`, ignoring the size/mtime fast path and **hashing every file**. Use it when you suspect drift where size and mtime both look unchanged (cost: back to 1.2 ms per file).
+- `-ScanHistory`: ignores the history-scan cache and **always does a full** `ls-tree -r -l HEAD`. Use it after switching remotes, when the cache looks stale, or for a manual re-check.
+
+```powershell
+pwsh -File sync.ps1 push -DeepVerify
+pwsh -File sync.ps1 push -ScanHistory
+```
+
+The log shows which path ran: `文件比较（快筛）：比对 N 个，深哈希 M 个` versus `文件比较（深校验开）：比对 N 个，深哈希 N 个`.
+
+## Self-check
+
+- `node tools\selftest.mjs <repo path>`: starts the host half with a fake ctx, hits status, generates scripts and asserts the JSON and the files on disk; it backs up any existing `同步-*.cmd` in the repo root and restores them afterwards. **The repo path must be passed explicitly.**
+- `node tools\clientcheck.mjs`: runs the client half with a fake `__ModuleLoader__` and a react stand-in, asserting the module loads, all three `apply()` registrations succeed (sidebar row and main with matching id/key), `inject` returns a disposer, and the component renders without throwing when data is empty. It validates the contract and structure; the UI still needs a restart and a look.
+- `pwsh -File tools\pack-plugin.ps1`: packs the tgz and writes the sha256 back into `version.json`. **PowerShell 7 is required** (the script is UTF-8 without a BOM, and 5.1 reads the Chinese text as GBK and fails).
+
+## Test log
+
+| Date | Version | Summary |
+|---|---|---|
+| 2026-11-24 | 0.3.93 | Clicking × to close DSH now checks once for auto pull/push and queues the watcher immediately (no more waiting for the 2-minute window); autoRestart semantics unified to !== false |
+| 2026-11-24 | 0.3.92 | Remote "uncommitted" now includes local pending data (pending); Refresh button really triggers git fetch; fixes "remote figures always 0" |
+| 2026-11-24 | 0.3.91 | Settings summary row fetches before refreshing remote info (no longer stale, auto-refresh every 30s); four generate-script buttons replaced with Pull/Push now (closes DSH) sharing the automation queue |
+| 2026-11-24 | 0.3.90 | Jump tabs highlight the current section; "Local data" label removed from To-do; To-do expands to concrete session names and local profile files |
+| 2026-11-24 | 0.3.89 | Plugin update card shows an "npm download URL"; falls back to two npm sources (mirror + official) when GitHub release is unreachable, still verified against the authoritative sha256 |
+| 2026-11-23 | 0.3.86 | Moved "Local data" into Overview / To-do, grouped pending files by the twelve sync-content groups, and show session names instead of session ids in the sample |
+| 2026-11-23 | 0.3.85 | Removed the tinted banner above the workspace list in edit mode; edit state is read from the Edit/Done button in the header |
+| 2026-11-23 | 0.3.84 | Workspace visibility card uses one Edit button for the whole card; each session row carries its own toggle with a background and divider, hidden names struck through |
+| 2026-11-23 | 0.3.83 | Workspace visibility card also collapses blank sessions and Mnemon idle-review parents; default view on this machine 99 → 10 |
+| 2026-11-23 | 0.3.82 | Workspace visibility card collapses agent sessions by default; hide/show goes through workspaceRegistry and applies instantly (no restart) |
+| 2026-11-21 | 0.3.75 | Sync hidden/archived workspaces across machines (workspace-archives.v1.json into settings); hidden workspaces and sessions stay hidden on B after pull |
+| 2026-11-19 | 0.3.69 | Carry billion-context compaction state across machines (bili-state.mjs); two new notice kinds (plugin-missing / context-state) |
+| 2026-11-19 | 0.3.68 | Session projection-cache guard (fixes agent-busy session creation) |
+| 2026-11-19 | 0.3.67 | Session log seq reconciliation guard (merge by seq, no more whole-file overwrite) |
+| 2026-11-19 | 0.3.66 | .gitattributes silences LF/CRLF warnings |
+| 2026-11-18 | 0.3.65 | Refresh button feedback (text changes to "Refreshing…") |
+| 2026-11-18 | 0.3.64 | Backup restore fix (write back to original location) + failure summary + auto-close |
+| 2026-11-18 | 0.3.63 | Push speed: Get-RelPath ~10x faster |
+| 2026-11-18 | 0.3.62 | Pull speed: 341s → 109s (3.1×) |
+| 2026-11-15 | 0.3.54 | Three speedups (fast-screen / history cache / single fetch), zero behaviour change |
+| 2026-11-14 | — | Two machines from scratch (isolated); session log first-frame 4-byte leftover fix |
+| 2026-11-11 | — | Single-machine isolated end-to-end (install → pull → push → restore) |
+
+Detailed test data is in each version's Release Notes.

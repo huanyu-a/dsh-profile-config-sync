@@ -1,0 +1,10 @@
+{
+  "version": "0.3.93",
+  "tgz": "https://github.com/QcWyGm/dsh-config-sync-plugin/releases/download/v0.3.93/dsh-config-sync-plugin-0.3.93.tgz",
+  "tgzBytes":422887,
+  "sha256":"9d8ed93de04c22ad0aaacb95b0ea8e057af54139a4940df0b0f948642b198ce6",
+  "releasedAt": "2026-11-24",
+  "notes": "点右上角 × 关闭 DSH（最后一个可见窗口关闭）时，插件先判一次自动拉取/推送并排好 watcher，再退出客户端：勾了开关、在两次 2 分钟复查之间做了改动就关闭，也不再漏执行。拉取优先（云端领先就排，关闭场景不弹确认框）、推送按领先/未提交/本机待同步三来源判据，复用在途 watcher、空仓只拉；排队在 app.quit() 之前 await，autoRestart 语义统一为 !== false（默认重启）。",
+  "notesEn": "Clicking the top-right × to close DSH (last visible window closed) now makes the plugin check once for auto pull/push and queue the watcher before the client exits: enabling a switch and making changes between the 2-minute re-checks then closing no longer skips the sync. Pull takes priority (behind > 0 queues a pull, no confirmation dialog on the close path); push uses the same commits-ahead/uncommitted/local-pending criteria; in-flight watchers are reused and an empty repo only pulls. Queueing is awaited before app.quit(), and autoRestart semantics are unified to !== false (relaunch by default).",
+  "minClient": "0.2.2-rc.2"
+}
