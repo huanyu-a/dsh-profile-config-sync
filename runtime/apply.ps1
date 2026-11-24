@@ -1,4 +1,4 @@
-﻿<#
+<#
  DSH 配置同步 —— 应用脚本（把本仓库的配置还原到当前电脑）
 
 用法
@@ -899,29 +899,29 @@ if ($dropped.Count -gt 0) { Ok "已剔除 $($dropped.Count) 个实验性 bundle�
 $localPluginMap = [ordered]@{
   'dsh-our-free-model-2.8.0'      = 'dsh-our-free-model'
   'dsh-purge-1.4.0'               = 'dsh-purge'
-  'dsh-config-sync-plugin-0.3.69' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.81' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.80' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.79' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.78' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.77' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.76' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.75' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.74' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.73' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.70' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.68' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.67' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.66' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.65' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.64' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.63' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.62' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.61' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.59' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.58' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.57' = 'dsh-config-sync-plugin'
-  'dsh-config-sync-plugin-0.3.56' = 'dsh-config-sync-plugin'
+  'dsh-profile-config-sync-0.3.69' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.81' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.80' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.79' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.78' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.77' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.76' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.75' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.74' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.73' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.70' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.68' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.67' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.66' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.65' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.64' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.63' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.62' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.61' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.59' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.58' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.57' = 'dsh-profile-config-sync'
+  'dsh-profile-config-sync-0.3.56' = 'dsh-profile-config-sync'
 }
 foreach ($dirName in $localPluginMap.Keys) {
   $pattern = 'link:[^"]*' + [regex]::Escape($dirName)
@@ -1285,7 +1285,7 @@ if (Test-SyncGroupEnabled $Scope 'local-plugins') {
 $needExtract = @()
 
 # 新增：预先扫描本机已部署的插件基础名，避免同一插件的不同历史版本号重复报「没装」。
-# 例如本机已装 dsh-config-sync-plugin-0.3.70，就不再为 0.3.57~0.3.69 各发一次 plugin-missing。
+# 例如本机已装 dsh-profile-config-sync-0.3.70，就不再为 0.3.57~0.3.69 各发一次 plugin-missing。
 $installedBaseNames = @{}
 Get-ChildItem -LiteralPath $AppRoot -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
     $dName = $_.Name

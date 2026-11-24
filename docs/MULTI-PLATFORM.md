@@ -1,4 +1,4 @@
-# dsh-config-sync-plugin 0.4.0：多端通用 + WebDAV
+# dsh-profile-config-sync 0.4.0：多端通用 + WebDAV
 
 0.4.0 把插件从「仅限 Windows」改成 **Windows / macOS / Linux 通用**，并新增 **WebDAV** 作为第二种同步通道。
 0.3.x 的 Windows 用户**不需要改任何配置**：默认行为、仓库格式、面板布局都保持原样。

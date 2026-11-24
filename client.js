@@ -18,7 +18,7 @@
  * 只能自己 append 一个独立 div（不参与宿主布局，pointer-events:none，5 秒后自己移除）。
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-config-sync-plugin',
+  id: 'dsh-profile-config-sync',
   factory: (require) => {
     // 官方 bundle 都在 factory 内部自建 module/exports —— 外层没有这两个名字，
     // 直接用外层的 exports 会在真实加载器里 ReferenceError，整个 bundle import 失败。
@@ -29,7 +29,7 @@ window.__ModuleLoader__.load({
     const react = require('react')
     const h = react.createElement
 
-    const name = 'dsh-config-sync-plugin'
+    const name = 'dsh-profile-config-sync'
     const inject = ['slots']
     const PANEL_ID = 'config-sync'
 
@@ -1185,7 +1185,7 @@ window.__ModuleLoader__.load({
       }
       // 「手动还原」指引里的目标位置：认不出类型时按内容猜不到，索性把三类常见落点都摆出来
       const manualTargets = () => [
-        M('插件本体 → 插件安装目录（如 D:\\DeepSeekHarness\\dsh-config-sync-plugin-<ver>）', 'Plugin files → the plugin install folder (e.g. D:\\DeepSeekHarness\\dsh-config-sync-plugin-<ver>)'),
+        M('插件本体 → 插件安装目录（如 D:\\DeepSeekHarness\\dsh-profile-config-sync-<ver>）', 'Plugin files → the plugin install folder (e.g. D:\\DeepSeekHarness\\dsh-profile-config-sync-<ver>)'),
         M('会话目录（--xxx--）→ ~\\.dsh\\sessions', 'Session folders (--xxx--) → ~\\.dsh\\sessions'),
         M('配置五件套（package.json / pnpm-lock.yaml / cordis.yml…）→ ~\\.dsh\\profiles\\desktop', 'Config files (package.json / pnpm-lock.yaml / cordis.yml…) → ~\\.dsh\\profiles\\desktop'),
       ]

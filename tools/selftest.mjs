@@ -93,7 +93,7 @@ function check(label, cond, detail = '') {
   else { failures++; console.log(`  [X] ${label}${detail ? ' — ' + detail : ''}`) }
 }
 
-console.log('== dsh-config-sync-plugin 宿主半身自检 ==')
+console.log('== dsh-profile-config-sync 宿主半身自检 ==')
 check('apply() 注册了路由', routes.size === 13 && routes.has('/config-sync/update') && routes.has('/config-sync/scope') && routes.has('/config-sync/extra-config') && routes.has('/config-sync/conflict') && routes.has('/config-sync/roots') && routes.has('/config-sync/feedback') && routes.has('/config-sync/cache-guard') && routes.has('/config-sync/workspace-view') && routes.has('/config-sync/webdav'), `实际 ${routes.size} 条：${[...routes.keys()].join(', ')}`)
 
 const status = await call('/config-sync/status', { headers: { host: 'localhost:3080' } })
@@ -644,7 +644,7 @@ if (prevScope === null) { try { unlinkSync(scopeFile) } catch { } } else writeFi
   const indexSrc = readFileSync(join(pluginRoot, 'index.js'), 'utf8')
   check('更新清单带实时反代候选（gh-proxy 排在最前，raw 兜底）',
     indexSrc.includes('gh-proxy.com') && indexSrc.includes('ghfast.top') &&
-    indexSrc.includes('UPDATE_MANIFEST_MIRRORS') && !indexSrc.includes('cdn.jsdelivr.net/gh/QcWyGm'),
+    indexSrc.includes('UPDATE_MANIFEST_MIRRORS') && !indexSrc.includes('cdn.jsdelivr.net/gh/huanyu-a'),
     'index.js')
   check('清单按候选依次尝试并汇总失败原因', indexSrc.includes('async function fetchManifestAuto'), 'index.js')
   check('清单超时放宽到 30 秒（raw 慢链路 10 秒会假失败）',

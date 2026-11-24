@@ -1,4 +1,4 @@
-# dsh-config-sync-plugin
+# dsh-profile-config-sync
 中文 | [English](README.en.md)
 
 DSH 插件：左侧栏多一行「配置同步」，点开是整页体检面板；「设置 → 通用」另有一行摘要。插件**只做体检 + 备命令**，同步动作在客户端退出后执行（自动同步那一路会自己拉起客户端）。
@@ -17,15 +17,15 @@ macOS / Linux 走 Node 引擎（`.sh` + `runtime/sync-engine.mjs`）；
 
 ## 安装
 
-插件包名是 **`dsh-config-sync-plugin`**（npm 上的 `dsh-config-sync` 是同名他人项目，不是本插件）。三种装法：
+插件包名是 **`dsh-profile-config-sync`**（npm 上的 `dsh-config-sync` 是同名他人项目，不是本插件）。三种装法：
 
 | 方式 | 命令 / 入口 | 说明 |
 |---|---|---|
-| npm | `npm i dsh-config-sync-plugin` | 适合把它当依赖管理，或在 profile 的 `package.json` 里写 `"dsh-config-sync-plugin": "^0.3.89"` 后 `pnpm i`；包名与 `cordis.patch.yml` 里注册的名字、插件目录 `dsh-config-sync-plugin-<ver>` 一致 |
+| npm | `npm i dsh-profile-config-sync` | 适合把它当依赖管理，或在 profile 的 `package.json` 里写 `"dsh-profile-config-sync": "^0.3.89"` 后 `pnpm i`；包名与 `cordis.patch.yml` 里注册的名字、插件目录 `dsh-profile-config-sync-<ver>` 一致 |
 | 插件市场 | 客户端「插件市场 → 发现」搜「配置同步」 | 走 `market-index.json` 登记的 git 提交，版本与 README 对齐 |
-| 离线 tgz | `releases\dsh-config-sync-plugin-<ver>.tgz` | GitHub Release 附件，适合内网机器；面板「更新」按钮下载的也是它 |
+| 离线 tgz | `releases\dsh-profile-config-sync-<ver>.tgz` | GitHub Release 附件，适合内网机器；面板「更新」按钮下载的也是它 |
 
-装好后插件目录是 `<客户端根>\dsh-config-sync-plugin-<ver>`，`appRoot` 留空时由插件位置反推客户端根，不用手填。
+装好后插件目录是 `<客户端根>\dsh-profile-config-sync-<ver>`，`appRoot` 留空时由插件位置反推客户端根，不用手填。
 
 ---
 
@@ -500,7 +500,7 @@ DSH 的会话标题会演进：先产生 fallback 临时标题（首条消息截
 
 **GitHub Issue 是唯一真源**，不再往配置仓库塞 json：
 
-1. 填标题 + 详情 → `POST /repos/QcWyGm/dsh-config-sync-plugin/issues`，label `feedback`，正文末尾自动附环境块（插件版本、机器名、时间、平台、安装目录、配置仓库路径）。
+1. 填标题 + 详情 → `POST /repos/huanyu-a/dsh-profile-config-sync/issues`，label `feedback`，正文末尾自动附环境块（插件版本、机器名、时间、平台、安装目录、配置仓库路径）。
 2. 列表直接读 Issue（`state=all&labels=feedback`），点标题去 GitHub 网页。
 3. 点「已解决」→ `PATCH issue {state:'closed'}`。
 4. 顶上一行连接状态三态：`已用 xxx 登录` / `令牌不属于所有者（只能读和提交）` / `匿名读取（提交走浏览器）`。
@@ -592,7 +592,7 @@ DSH 的会话标题会演进：先产生 fallback 临时标题（首条消息截
 
 ## 插件自更新
 
-面板「插件更新」卡显示本地版本、云端版本和一行状态；清单与安装包都在公开仓库（`version.json` + `releases/dsh-config-sync-plugin-<版本>.tgz`，只读几百字节，不拉整包），服务端缓存 30 分钟，挂载时查一次、之后每 30 分钟复查。
+面板「插件更新」卡显示本地版本、云端版本和一行状态；清单与安装包都在公开仓库（`version.json` + `releases/dsh-profile-config-sync-<版本>.tgz`，只读几百字节，不拉整包），服务端缓存 30 分钟，挂载时查一次、之后每 30 分钟复查。
 
 | 状态 | 含义 |
 |---|---|
@@ -613,21 +613,21 @@ DSH 的会话标题会演进：先产生 fallback 临时标题（首条消息截
 仓库根的 `market-index.json` 就是一份可直接用的 DSH 市场索引（`format: 1`，`source.type: git` + 40 位 commit）。索引地址：
 
 ```
-https://raw.githubusercontent.com/QcWyGm/dsh-config-sync-plugin/main/market-index.json
+https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/market-index.json
 ```
 
 在 DSH「插件 → 发现 → 索引源」填入即可。**前提**：这是宿主官方发现页（`@deepseek-ai/dsh-plugin-market`）的索引源，需要 profile 启用官方 `@deepseek-ai/dsh-experimental-plugin-market-bundle`。
 
 **dshmarket 里搜不到自建索引，是正常的**：dshmarket 的列表只来自它自己的精选目录（`awesome-dsh-plugin.com/plugins.json`，国内走 npm 的 `dsh-plugin-catalog`），源码里没有自定义索引源这条路，安装也被限定在「该目录列出的来源」。要出现在那里，只能向 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 提 PR 收录。
 
-> **收录后的可见性**（2026-11-13 实测）：PR `#14762` 已 MERGED，条目 `data/plugins/QcWyGm__dsh-config-sync.yml` 已进站点正本（`plugins.json`，`updated: 2026-11-13`，10974 条，含 `QcWyGm/dsh-config-sync-plugin`）。但客户端取源顺序是「站点正本 → 地区 npm 源 → jsDelivr 兜底」：13.8 MB 正本下载超时后落到 jsDelivr 镜像，而镜像（`dsh-plugin-catalog` npm 包每天 UTC 05:19 重建一次）还停在 `2026-11-12` / 10778 条、**不含** QcWyGm。所以「收录完了却搜不到」＝**镜像滞后**，不是代码问题；等当天目录包重建 + 缓存失效，或重启客户端让它重读，就会出来。用 CLI 强制刷新可立刻验证：
+> **收录后的可见性**（2026-11-13 实测）：PR `#14762` 已 MERGED，条目 `data/plugins/huanyu-a__dsh-config-sync.yml` 已进站点正本（`plugins.json`，`updated: 2026-11-13`，10974 条，含 `huanyu-a/dsh-profile-config-sync`）。但客户端取源顺序是「站点正本 → 地区 npm 源 → jsDelivr 兜底」：13.8 MB 正本下载超时后落到 jsDelivr 镜像，而镜像（`dsh-plugin-catalog` npm 包每天 UTC 05:19 重建一次）还停在 `2026-11-12` / 10778 条、**不含** huanyu-a。所以「收录完了却搜不到」＝**镜像滞后**，不是代码问题；等当天目录包重建 + 缓存失效，或重启客户端让它重读，就会出来。用 CLI 强制刷新可立刻验证：
 
 ```powershell
 node ~\.dsh\.dsh-plugin-market\market-core.mjs catalog --profile desktop
 # ok=true, source=official, fromCache=false, version=2026-11-13, count=10974
 ```
 
-> 同名冲突提醒：目录里 `dsh-config-sync` 有两条——`QcWyGm`（`github:QcWyGm/dsh-config-sync-plugin`，category git）与 `bxzfxl`（`@liangfengqi/dsh-config-sync`，category tools，downloads 843），搜索时会并排出现。
+> 同名冲突提醒：目录里 `dsh-config-sync` 有两条——`huanyu-a`（`github:huanyu-a/dsh-profile-config-sync`，category git）与 `bxzfxl`（`@liangfengqi/dsh-config-sync`，category tools，downloads 843），搜索时会并排出现。
 
 升级流程：改代码 → `pwsh -File tools\pack-plugin.ps1` 打包（自动把 sha256 回填 `version.json`）→ 改 `version.json` 的 `version` / `notes` → 把 `market-index.json` 里那条的 `version` 与 `commit` 换成新提交 → 推送。索引只引用 commit，旧版本随时能装回。打完包先跑 `node tools\selftest.mjs <仓库路径>` + `node tools\clientcheck.mjs`。
 

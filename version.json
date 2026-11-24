@@ -1,10 +1,10 @@
 {
-  "version": "0.3.93",
-  "tgz": "https://github.com/QcWyGm/dsh-config-sync-plugin/releases/download/v0.3.93/dsh-config-sync-plugin-0.3.93.tgz",
-  "tgzBytes":422887,
-  "sha256":"9d8ed93de04c22ad0aaacb95b0ea8e057af54139a4940df0b0f948642b198ce6",
-  "releasedAt": "2026-11-24",
-  "notes": "点右上角 × 关闭 DSH（最后一个可见窗口关闭）时，插件先判一次自动拉取/推送并排好 watcher，再退出客户端：勾了开关、在两次 2 分钟复查之间做了改动就关闭，也不再漏执行。拉取优先（云端领先就排，关闭场景不弹确认框）、推送按领先/未提交/本机待同步三来源判据，复用在途 watcher、空仓只拉；排队在 app.quit() 之前 await，autoRestart 语义统一为 !== false（默认重启）。",
-  "notesEn": "Clicking the top-right × to close DSH (last visible window closed) now makes the plugin check once for auto pull/push and queue the watcher before the client exits: enabling a switch and making changes between the 2-minute re-checks then closing no longer skips the sync. Pull takes priority (behind > 0 queues a pull, no confirmation dialog on the close path); push uses the same commits-ahead/uncommitted/local-pending criteria; in-flight watchers are reused and an empty repo only pulls. Queueing is awaited before app.quit(), and autoRestart semantics are unified to !== false (relaunch by default).",
+  "version": "0.4.0",
+  "tgz": "https://github.com/huanyu-a/dsh-profile-config-sync/releases/download/v0.4.0/dsh-profile-config-sync-0.4.0.tgz",
+  "tgzBytes": 0,
+  "sha256": "",
+  "releasedAt": "2026-11-25",
+  "notes": "0.4.0 多端通用 + WebDAV：Windows 走 PowerShell（.cmd + runtime/*.ps1），macOS/Linux 走 Node 引擎（.sh + runtime/sync-engine.mjs）；平台差异收敛在 runtime/platform.mjs，业务代码不再出现 process.platform 分支。新增 WebDAV 通道（与 git 共用同一份仓库格式，只换传输层，无三方合并、冲突本机留底 .conflict-<时间戳>）。跨端不分叉仓库：配置/技能/会话只有一份，客户端身份记在仓库 machines/<id>.json，host-contract.json 增加 platforms[] 并集。包名改为 dsh-profile-config-sync。",
+  "notesEn": "0.4.0 adds multi-platform support and WebDAV: Windows uses PowerShell (.cmd + runtime/*.ps1), macOS/Linux use the Node engine (.sh + runtime/sync-engine.mjs); platform differences live in runtime/platform.mjs so business code has no process.platform branches. New WebDAV transport reuses the same repo format as git (no three-way merge; conflicting local files are kept as .conflict-<timestamp>). The repo is not forked per OS: configs, skills and sessions stay single-copy, client identity is recorded in machines/<id>.json, and host-contract.json gains a platforms[] union. Package renamed to dsh-profile-config-sync.",
   "minClient": "0.2.2-rc.2"
 }

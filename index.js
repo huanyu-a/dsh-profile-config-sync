@@ -49,7 +49,7 @@ import {
 
 const pluginRequire = createRequire(import.meta.url)
 
-const PACKAGE_ID = 'dsh-config-sync-plugin'
+const PACKAGE_ID = 'dsh-profile-config-sync'
 const ROUTE_STATUS = '/config-sync/status'
 const ROUTE_PREPARE = '/config-sync/prepare'
 const ROUTE_SETTINGS = '/config-sync/settings'
@@ -88,7 +88,7 @@ function t(zh, en) {
 }
 
 // ---- 插件自身的版本与更新源 ----
-// 插件目录就是 index.js 所在目录（apply 会把它部署成 <AppRoot>\dsh-config-sync-plugin-<ver>\）。
+// 插件目录就是 index.js 所在目录（apply 会把它部署成 <AppRoot>\dsh-profile-config-sync-<ver>\）。
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const PLUGIN_VERSION = (() => {
   try {
@@ -107,10 +107,10 @@ const PLUGIN_VERSION = (() => {
 // **不要**用 jsDelivr 兜清单：它对 `@main` 这类分支别名有明显缓存（实测发版后仍返回上一版清单，purge 接口也没
 // 立刻刷新），拿它当清单源会让"有新版本"晚几小时才出现，比读不到更误导人。
 // 用户自己在设置里填了清单地址时只用他那一个 —— 不掺镜像，免得"读到的其实不是他指定的源"。
-const RAW_MANIFEST_URL = 'https://raw.githubusercontent.com/QcWyGm/dsh-config-sync-plugin/main/version.json'
+const RAW_MANIFEST_URL = 'https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/version.json'
 const UPDATE_MANIFEST_MIRRORS = [
-  'https://gh-proxy.com/https://raw.githubusercontent.com/QcWyGm/dsh-config-sync-plugin/main/version.json',
-  'https://ghfast.top/https://raw.githubusercontent.com/QcWyGm/dsh-config-sync-plugin/main/version.json',
+  'https://gh-proxy.com/https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/version.json',
+  'https://ghfast.top/https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/version.json',
   RAW_MANIFEST_URL,
 ]
 const UPDATE_MANIFEST_URL = RAW_MANIFEST_URL
@@ -120,7 +120,7 @@ const UPDATE_CHECK_TTL = 30 * 60 * 1000
 
 /**
  * 定位客户端根目录（AppRoot）。
- * 首选 config.appRoot；其次由插件自身位置反推（插件被 apply 部署在 <AppRoot>\dsh-config-sync-plugin-<ver>\，
+ * 首选 config.appRoot；其次由插件自身位置反推（插件被 apply 部署在 <AppRoot>\dsh-profile-config-sync-<ver>\，
  * 上一级就是 AppRoot，换机不用改配置）；都对不上时按常见安装位置探测。
  * 判据：解包版有 resources\app\package.json，打包版有 resources\app.asar —— 只看目录名会让装错位置的情况蒙混过去，
  * 只认解包版又会让 asar 构建的机器全部落空（那台会把"插件所在目录"当成客户端根）。
@@ -660,8 +660,8 @@ function readSnapshotPkg(dir) {
  *
  * 备份根 ~\.dsh\backups 是**多用途共用**的，不只是配置快照：
  *   profile  apply / restore 打的整份配置快照     顶层 package.json，name = dsh-profile-<名字>，带 dependencies
- *   plugin   插件自更新前打的插件本体备份          顶层 package.json，name = dsh-config-sync-plugin（带 dsh 字段），
- *                                                  或只有一个 dsh-config-sync-plugin-<ver>\ 子目录（半截残留）
+ *   plugin   插件自更新前打的插件本体备份          顶层 package.json，name = dsh-profile-config-sync（带 dsh 字段），
+ *                                                  或只有一个 dsh-profile-config-sync-<ver>\ 子目录（半截残留）
  *   session  修会话前的会话目录备份                顶层全是 --<路径编码>-- 目录
  *   other    冲突对照 / 手工拷来的 / 认不出来的     只给手动还原指引
  *
@@ -870,7 +870,7 @@ function restorePreview(dshHome, snapshotDir, config) {
 function restorePreviewForKind(snap, dshHome) {
   const kind = snap.kind
   if (kind === 'plugin') {
-    // 半截备份会多一层 dsh-config-sync-plugin-<ver>\：真正要写回的是里面的内容
+    // 半截备份会多一层 dsh-profile-config-sync-<ver>\：真正要写回的是里面的内容
     let srcRoot = snap.dir
     let entries = []
     try { entries = readdirSync(srcRoot, { withFileTypes: true }) } catch { }
@@ -1019,9 +1019,9 @@ async function inspect(config) {
   const remoteFiles = remoteProbe ? remoteProbe.files : null
   if (!appRoot) {
     advice.push(t(
-      '定位不到客户端根目录：插件不在 <客户端根> 下（如 D:\\DeepSeekHarness\\dsh-config-sync-plugin-0.3.67），'
+      '定位不到客户端根目录：插件不在 <客户端根> 下（如 D:\\DeepSeekHarness\\dsh-profile-config-sync-0.3.67），'
       + '或客户端是打包版（resources\\app.asar）而这里没认出来 —— 三份同步脚本会因此生成不了',
-      'Cannot locate the client root: the plugin is not under <client root> (e.g. D:\\DeepSeekHarness\\dsh-config-sync-plugin-0.3.67), '
+      'Cannot locate the client root: the plugin is not under <client root> (e.g. D:\\DeepSeekHarness\\dsh-profile-config-sync-0.3.67), '
       + 'or this is a packaged build (resources\\app.asar) that was not recognized — the three sync scripts cannot be generated.',
     ))
   }
@@ -1330,7 +1330,7 @@ function cmdHead(title) {
     '@echo off',
     `${CHCP} 65001 >nul`,
     'setlocal',
-    `echo 本脚本由 DSH 插件 dsh-config-sync-plugin 生成：${title}`,
+    `echo 本脚本由 DSH 插件 dsh-profile-config-sync 生成：${title}`,
     ...PROC_GUARD,
     'echo.',
   ]
@@ -1553,7 +1553,7 @@ function shQuote(value) {
 function shHead(title) {
   return [
     '#!/bin/sh',
-    '# 本脚本由 DSH 插件 dsh-config-sync-plugin 生成：' + title,
+    '# 本脚本由 DSH 插件 dsh-profile-config-sync 生成：' + title,
     '# 双击（或 sh 文件名）即可；参数 --yes 免确认。',
     'set -u',
     'export LC_ALL=${LC_ALL:-zh_CN.UTF-8}',
@@ -2417,10 +2417,10 @@ function compareVersion(a, b) {
 function npmTgzUrls(version) {
   const v = String(version || '').replace(/[^0-9A-Za-z.+\-]/g, '')
   if (!v) return []
-  const f = `dsh-config-sync-plugin-${v}.tgz`
+  const f = `dsh-profile-config-sync-${v}.tgz`
   return [
-    `https://registry.npmmirror.com/dsh-config-sync-plugin/-/${f}`,
-    `https://registry.npmjs.org/dsh-config-sync-plugin/-/${f}`,
+    `https://registry.npmmirror.com/dsh-profile-config-sync/-/${f}`,
+    `https://registry.npmjs.org/dsh-profile-config-sync/-/${f}`,
   ]
 }
 // 兼容旧调用：返回首选 npm 兜底地址
@@ -2624,7 +2624,7 @@ async function downloadPackage({ urls, sha256, version, dshHome }) {
   if (typeof fetch !== 'function') return { ok: false, error: t('当前运行环境没有 fetch，无法下载更新包', 'fetch is unavailable in this runtime — cannot download the update package') }
   const dir = join(dshHome, 'update-staging')
   try { mkdirSync(dir, { recursive: true }) } catch { }
-  const file = join(dir, `dsh-config-sync-plugin-${version}.tgz`)
+  const file = join(dir, `dsh-profile-config-sync-${version}.tgz`)
   const want = String(sha256 || '').toLowerCase()
   const errors = []
   for (const rawUrl of urls) {
@@ -3923,9 +3923,9 @@ async function handlePrepare(req, res, config) {
     if (!appRoot) {
       throw new Error(t(
         '定位不到客户端根目录（要能找到 resources\\app\\package.json 或 resources\\app.asar）：'
-        + '请确认插件装在 <客户端根> 下（例如 D:\\DeepSeekHarness\\dsh-config-sync-plugin-0.3.67），或在设置里填客户端根 appRoot',
+        + '请确认插件装在 <客户端根> 下（例如 D:\\DeepSeekHarness\\dsh-profile-config-sync-0.3.67），或在设置里填客户端根 appRoot',
         'Cannot locate the client root (needs resources\\app\\package.json or resources\\app.asar): '
-        + 'make sure the plugin is installed under <client root> (e.g. D:\\DeepSeekHarness\\dsh-config-sync-plugin-0.3.67), or set appRoot in the settings',
+        + 'make sure the plugin is installed under <client root> (e.g. D:\\DeepSeekHarness\\dsh-profile-config-sync-0.3.67), or set appRoot in the settings',
       ))
     }
     const state = {...await repoState(repo), message}
@@ -4380,7 +4380,7 @@ async function handleRoots(req, res, config) {
 // 面板里提交 → 直接建 issue（label=feedback，正文附环境块）；列表读 issue（含 open/closed）；
 // 点「已解决」就 PATCH 成 closed。网络不通时先进本机待发队列，下次点「补发」再建 issue。
 
-const GH_DEFAULT_REPO = 'QcWyGm/dsh-config-sync-plugin'
+const GH_DEFAULT_REPO = 'huanyu-a/dsh-profile-config-sync'
 const GH_FEEDBACK_LABEL = 'feedback'
 
 /** 当前插件版本（读自己的 package.json；读不到就空串，不抛）。 */
@@ -4620,7 +4620,7 @@ function cacheGuardRun(config, opts = {}) {
       cacheGuardState.lastApplyAt = Date.now()
       cacheGuardState.lastRemoved = (report.removed || []).map((x) => ({ id: x.id, to: x.to }))
       if (cacheGuardState.lastRemoved.length > 0) {
-        ctxLoggerInfo(`[dsh-config-sync-plugin] 已清理 ${cacheGuardState.lastRemoved.length} 条陈旧会话投影缓存：${cacheGuardState.lastRemoved.map((x) => x.id).join(', ')}`)
+        ctxLoggerInfo(`[dsh-profile-config-sync] 已清理 ${cacheGuardState.lastRemoved.length} 条陈旧会话投影缓存：${cacheGuardState.lastRemoved.map((x) => x.id).join(', ')}`)
       }
     }
     return report
@@ -4645,7 +4645,7 @@ function cacheGuardOnBusy(config, sessionId) {
       out.cleared = Array.isArray(res.removed) && res.removed.length > 0
       if (out.cleared) {
         appendGuardLog(dshHome, `[agent-busy] 客户端报 session/agent-busy，已清掉 ${id} 的投影缓存`)
-        ctxLoggerInfo(`[dsh-config-sync-plugin] agent-busy：已清掉 ${id} 的投影缓存，下次新建会话会按日志重建`)
+        ctxLoggerInfo(`[dsh-profile-config-sync] agent-busy：已清掉 ${id} 的投影缓存，下次新建会话会按日志重建`)
       }
     } catch (error) {
       out.ok = false

@@ -54,7 +54,7 @@ function loadClient(fetchImpl) {
   return loaded
 }
 
-console.log('== dsh-config-sync-plugin 客户端半身自检 ==')
+console.log('== dsh-profile-config-sync 客户端半身自检 ==')
 
 // 无副作用的 fetch：组件在无数据状态下不该真的发请求（useEffect 在替身里是 noop）
 const noopFetch = async () => ({ ok: true, status: 200, text: async () => '{}' })
@@ -178,7 +178,7 @@ const sample = {
     candidates: [],
   },
   remote: {
-    url: 'git@gitee.com:qcwygm/dsh-config.git',
+    url: 'git@gitee.com:huanyu-a/dsh-config.git',
     urlSource: 'git',
     sshKey: 'C:\\Users\\x\\.ssh\\id_ed25519_gitee',
     sshKeyExists: true,
