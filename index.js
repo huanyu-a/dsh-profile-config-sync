@@ -1261,6 +1261,8 @@ async function inspect(config) {
       script: autoScript(dshHome, repo),
       // post-exit.ps1 上次执行的结果（成功/失败/是否回滚），客户端启动后据此弹 5 秒提示
       lastResult: readAutoResult(dshHome),
+      // 不关闭 DSH 的在线推送状态（running / finishedAt / ok / phase / message / log）
+      livePush: { ...autoState.livePush },
     },
     // 拉取被本机文件挡住时 sync.ps1 留下的冲突清单，面板「同步冲突」卡据此渲染
     conflicts: (() => {
@@ -1766,6 +1768,16 @@ const autoState = {
   watcherStartedAt: 0,
   timer: null,
   interval: null,       // 每 2 分钟的复查（会话/资料是运行中产生的，只判一次会全漏）
+  livePush: {
+    running: false,
+    startedAt: 0,
+    finishedAt: 0,
+    ok: null,
+    phase: '',
+    message: '',
+    log: '',
+    initPush: false,
+  },
 }
 
 function autoScript(dshHome, repo) {
@@ -1956,21 +1968,39 @@ async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs =
     }
   } catch { }
 
+  const logsDir = join(dshHome, 'logs')
+  try { if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true }) } catch { }
+  const pidFile = join(logsDir, `.watch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.pid`)
+
   const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
     // 这一段是「等待态」：隐藏进程只盯着 DSH 退出，退出后才由它拉起一个可见窗口干活，
     // 否则排队期间（可能几小时）会一直挂着一个挡视线的空窗口。
-    '-Mode', mode, '-WatchPid', String(process.pid), '-Phase', 'wait', '-DshHome', dshHome]
+    '-Mode', mode, '-WatchPid', String(process.pid), '-Phase', 'wait', '-DshHome', dshHome,
+    '-PidFile', pidFile]
   if (repo) args.push('-RepoRoot', repo)
   if (appRoot) args.push('-AppRoot', appRoot)
   if (restart) args.push('-Restart')
   // 更新模式要带上下载地址与校验值，交给 post-exit 的 run 段执行
   if (Array.isArray(extraArgs) && extraArgs.length) args.push(...extraArgs)
   const exe = powershellExe()
+  const argLine = args.map((a) => psWinArg(a)).join(' ')
   const inner = [
-    // 等待态进程保持**隐藏**；可见窗口由 post-exit.ps1 在 DSH 真正退出后自己弹（-Phase run）。
-    // 每个元素先经 psWinArg 加内层双引号，防止 AppRoot/RepoRoot 含空格时被 Start-Process 拆开。
+    // DSH 在 Windows 下位于带 KILL_ON_JOB_CLOSE 且禁止 BREAKAWAY 的 Job Object 内；
+    // 直接 Start-Process 会继承同一 Job Object，DSH 一退等待进程就被连杀。
+    // 优先通过 Shell.Application.ShellExecute 委托 explorer.exe 启动（inJob=False），
+    // 等待脚本写出真实 PID；若无桌面 Shell 再兜底退回 Start-Process。
+    'try {',
+    `  (New-Object -ComObject Shell.Application).ShellExecute(${psQuote(exe)}, ${psQuote(argLine)}, ${psQuote(dshHome)}, 'open', 0)`,
+    `  for ($i = 0; $i -lt 35; $i++) {`,
+    `    if (Test-Path -LiteralPath ${psQuote(pidFile)}) {`,
+    `      $v = (Get-Content -LiteralPath ${psQuote(pidFile)} -Raw -ErrorAction SilentlyContinue).Trim()`,
+    `      if ($v -match '^\\d+$') { Write-Output "explorer:$v"; exit 0 }`,
+    '    }',
+    '    Start-Sleep -Milliseconds 150',
+    '  }',
+    '} catch { }',
     `$p = Start-Process -FilePath ${psQuote(exe)} -ArgumentList @(${args.map((a) => psQuote(psWinArg(a))).join(', ')}) -WindowStyle Hidden -PassThru`,
-    'Write-Output $p.Id',
+    'Write-Output "direct:$($p.Id)"',
   ].join('; ')
   const encoded = Buffer.from(inner, 'utf16le').toString('base64')
   let child
@@ -1978,6 +2008,7 @@ async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs =
     child = spawn(exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
       { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   } catch (error) {
+    try { unlinkSync(pidFile) } catch { }
     const msg = String((error && error.message) || error)
     logLaunch(dshHome, `启动失败 ${mode} exe=${exe}：${msg}`)
     return { ok: false, error: t(`拉不起 powershell（${exe}）：${msg}`, `Cannot launch PowerShell (${exe}): ${msg}`) }
@@ -1987,22 +2018,25 @@ async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs =
   child.stdout.on('data', (c) => { stdout += c })
   child.stderr.on('data', (c) => { stderr += c })
   const code = await new Promise((resolve) => {
-    const timer = setTimeout(() => resolve('timeout'), 8000)
+    const timer = setTimeout(() => resolve('timeout'), 10000)
     child.once('exit', (c) => { clearTimeout(timer); resolve(c) })
     child.once('error', (e) => { clearTimeout(timer); resolve('error:' + ((e && e.message) || e)) })
   })
+  try { unlinkSync(pidFile) } catch { }
   if (code !== 0) {
     const detail = String(stderr || stdout || code).trim().slice(0, 300)
     logLaunch(dshHome, `启动失败 ${mode} exe=${exe}：${detail}`)
     return { ok: false, error: t(`拉不起 post-exit（launcher 退出码 ${code}）：${detail}`, `Cannot launch post-exit (launcher exit code ${code}): ${detail}`) }
   }
-  const pid = Number(String(stdout).trim().split(/\s+/).pop()) || 0
+  const token = String(stdout).trim().split(/\s+/).pop() || ''
+  const via = token.startsWith('explorer:') ? 'explorer' : 'direct'
+  const pid = Number(token.replace(/^(explorer|direct):/, '')) || 0
   autoState.watcherStartedAt = Date.now()
   try {
     writeFileSync(lockFile, JSON.stringify({ pid, mode, at: Date.now() }), 'utf8')
   } catch { }
-  logLaunch(dshHome, `已启动 ${mode} pid=${pid} exe=${exe} script=${script}`)
-  return { ok: true, pid }
+  logLaunch(dshHome, `已启动 ${mode} pid=${pid} via=${via} exe=${exe} script=${script}`)
+  return { ok: true, pid, via }
 }
 
 /**
@@ -3607,6 +3641,187 @@ async function handleStatus(req, res, config) {
  *   {action:'cancel'}     取消已排队的动作
  * 只做只读 fetch 比对（check），真正动手一律交给退出后的 post-exit.ps1。
  */
+async function ensurePushAllowed(repo, settings) {
+  // 推送的门禁：真仓库直接推；本机还是空的，只有「云端确实没有文件」才能推 —— 那次推送就是初始化推送。
+  // 云端已有文件时拒绝，让用户先拉取（否则本机状态会被写进一份已经在用的历史里）。
+  // 注意判据是「树里有文件」而不是「有分支」：远端可能只剩一个空分支，那也是空仓库，可以初始化推送。
+  if (repoPhase(repo) === 'ok') return
+  const useWebdav = webdavActive(settings)
+  const url = useWebdav
+    ? normalizeWebdav(settings).url
+    : ((await git(repo, ['remote', 'get-url', 'origin'])) || settings.remoteUrl || '')
+  const probe = useWebdav ? await probeWebdavRemote(settings) : await probeRemote(url, settings)
+  if (!probe || probe.files === null) {
+    throw new Error(t(
+      useWebdav
+        ? `连不上 WebDAV（${url || '未配置'}）：${(probe && probe.error) || '初始化推送要先确认云端是空目录'}`
+        : `连不上云端、或还没有云端仓库地址（${url || '未配置'}）：初始化推送要先确认云端是空仓库`,
+      useWebdav
+        ? `Cannot reach WebDAV (${url || 'not set'}): ${(probe && probe.error) || 'initialize push needs to confirm the cloud folder is empty.'}`
+        : `Cannot reach the cloud or no remote URL is set (${url || 'not set'}): initialize push needs to confirm the cloud repo is still empty.`,
+    ))
+  }
+  if (probe.files > 0) {
+    throw new Error(t(
+      `云端仓库已经有内容（${probe.files} 个文件）：本机还是空的，先「拉取」把内容拉下来，再生成推送`,
+      `The cloud repo already has content (${probe.files} file(s)): run Pull to fetch it first, then push.`,
+    ))
+  }
+}
+
+function startLivePush({ repo, dshHome, appRoot, settings }) {
+  if (autoState.livePush.running) {
+    return { alreadyRunning: true, livePush: { ...autoState.livePush } }
+  }
+  const initPush = repoPhase(repo) !== 'ok'
+  const logsDir = join(dshHome, 'logs')
+  try { if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true }) } catch { }
+  const d = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+  const logFile = join(logsDir, `live-push-${stamp}.log`)
+
+  let cmd = ''
+  let cmdArgs = []
+  if (IS_WIN) {
+    const syncScript = [join(pluginRoot(), 'runtime', 'sync.ps1'), join(repo, 'sync.ps1')].find((p) => isFile(p))
+    if (!syncScript) throw new Error(t('找不到 sync.ps1，无法在线推送', 'sync.ps1 not found — cannot run live push'))
+    const psArgs = [
+      `Action = 'push'`,
+      `RepoRoot = ${psQuote(repo)}`,
+      `DshHome = ${psQuote(dshHome)}`,
+      ...(appRoot ? [`AppRoot = ${psQuote(appRoot)}`] : []),
+      `Force = $true`,
+    ].join('; ')
+    const psCmd = `[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; $a = @{ ${psArgs} }; & ${psQuote(syncScript)} @a; exit $LASTEXITCODE`
+    cmd = powershellExe()
+    cmdArgs = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(psCmd, 'utf16le').toString('base64')]
+  } else {
+    const engine = [join(pluginRoot(), 'runtime', 'sync-engine.mjs'), join(repo, 'sync-engine.mjs')].find((p) => isFile(p))
+    if (!engine) throw new Error(t('找不到 sync-engine.mjs，无法在线推送', 'sync-engine.mjs not found — cannot run live push'))
+    cmd = hostNodeExe(appRoot) || process.execPath
+    cmdArgs = [engine, 'push', '-RepoRoot', repo, '-DshHome', dshHome, ...(appRoot ? ['-AppRoot', appRoot] : [])]
+  }
+
+  autoState.livePush = {
+    running: true,
+    startedAt: Date.now(),
+    finishedAt: 0,
+    ok: null,
+    phase: 'starting',
+    message: initPush
+      ? t('正在后台初始化推送（不关闭 DSH）…', 'Initializing push in background (DSH stays open)…')
+      : t('正在后台抓取并推送（不关闭 DSH）…', 'Capturing and pushing in background (DSH stays open)…'),
+    log: logFile,
+    initPush,
+  }
+
+  const tail = []
+  const appendLog = (chunk) => {
+    const text = String(chunk || '')
+    try { writeFileSync(logFile, text, { flag: 'a' }) } catch { }
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim()
+      if (!line) continue
+      tail.push(line)
+      if (tail.length > 50) tail.shift()
+      if (/==\s*初始化仓库/.test(line)) {
+        autoState.livePush.phase = 'init'
+        autoState.livePush.message = t('正在初始化仓库骨架…', 'Initializing repo skeleton…')
+      } else if (/==\s*抓取|capture/.test(line)) {
+        autoState.livePush.phase = 'capture'
+        autoState.livePush.message = t('正在抓取本机配置与会话…', 'Capturing local config and sessions…')
+      } else if (/==\s*提交/.test(line)) {
+        autoState.livePush.phase = 'commit'
+        autoState.livePush.message = t('正在提交本机变更…', 'Committing local changes…')
+      } else if (/==\s*上传到 WebDAV|WebDAV 上传|==\s*推送/.test(line)) {
+        autoState.livePush.phase = 'upload'
+        autoState.livePush.message = t('正在上传到云端…', 'Uploading to cloud…')
+      }
+    }
+  }
+
+  const finish = async (ok, errText) => {
+    clearWebdavProbeCache()
+    if (ok) {
+      try {
+        if (webdavActive(settings)) {
+          const wp = await probeWebdavRemote(settings)
+          if (wp && wp.files !== null) {
+            autoState.drift = { ahead: 0, behind: 0, transport: 'webdav', files: wp.files, at: Date.now() }
+            autoState.lastCheckAt = Date.now()
+            autoState.lastCheckError = ''
+          }
+        } else {
+          const d2 = await checkDrift(repo)
+          if (d2) {
+            autoState.drift = d2
+            autoState.lastCheckAt = Date.now()
+            autoState.lastCheckError = ''
+          }
+        }
+      } catch { }
+    }
+    autoState.livePush = {
+      ...autoState.livePush,
+      running: false,
+      finishedAt: Date.now(),
+      ok,
+      phase: ok ? 'done' : 'error',
+      message: ok
+        ? (initPush
+          ? t('初始化推送完成（未关闭 DSH）', 'Initialize push completed (DSH stayed open)')
+          : t('推送完成（未关闭 DSH）', 'Push completed (DSH stayed open)'))
+        : (errText || t('推送失败，详见日志', 'Push failed — see log')),
+    }
+  }
+
+  const child = spawn(cmd, cmdArgs, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  child.stdout.on('data', appendLog)
+  child.stderr.on('data', appendLog)
+  child.once('error', (e) => {
+    const msg = String((e && e.message) || e)
+    appendLog(`\n[error] ${msg}\n`)
+    finish(false, msg)
+  })
+  child.once('exit', async (code) => {
+    if (code !== 0) {
+      const errLine = [...tail].reverse().find((l) => /\[X\]|失败|error|fatal:/i.test(l)) || tail[tail.length - 1] || `exit ${code}`
+      finish(false, errLine)
+      return
+    }
+    if (!IS_WIN && !webdavActive(settings)) {
+      try {
+        await git(repo, ['add', '-A'])
+        const st = await git(repo, ['status', '--porcelain'])
+        if (st && st.trim()) {
+          await git(repo, ['commit', '-m', `sync(live): ${stamp}`])
+        }
+        await git(repo, ['push'])
+      } catch (e) {
+        const msg = String((e && e.message) || e)
+        appendLog(`\n[git push error] ${msg}\n`)
+        finish(false, msg)
+        return
+      }
+    }
+    if (!IS_WIN) {
+      try {
+        const head = (await git(repo, ['log', '-1', '--format=%h'])) || ''
+        writeFileSync(join(dshHome, STATE_NAME), JSON.stringify({
+          lastSyncAt: new Date().toISOString(),
+          mode: 'push',
+          repo,
+          head: head.trim(),
+        }, null, 2) + '\n', 'utf8')
+      } catch { }
+    }
+    finish(true, '')
+  })
+
+  return { alreadyRunning: false, livePush: { ...autoState.livePush } }
+}
+
 async function handleAuto(req, res, config) {
   if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: 'POST only' }); return }
   if (!originAllowed(req)) { sendJson(res, 403, { ok: false, error: 'cross-origin request rejected' }); return }
@@ -3704,34 +3919,16 @@ async function handleAuto(req, res, config) {
       return
     }
 
+    if (action === 'push-live') {
+      await ensurePushAllowed(repo, settings)
+      const started = startLivePush({ repo, dshHome, appRoot, settings })
+      sendJson(res, 200, { ok: true, action, ...started })
+      return
+    }
+
     if (action === 'pull-now' || action === 'push-now') {
       const mode = action === 'pull-now' ? 'pull' : 'push'
-      // 推送的门禁：真仓库直接推；本机还是空的，只有「云端确实没有文件」才能推 —— 那次推送就是初始化推送。
-      // 云端已有文件时拒绝，让用户先拉取（否则本机状态会被写进一份已经在用的历史里）。
-      // 注意判据是「树里有文件」而不是「有分支」：远端可能只剩一个空分支，那也是空仓库，可以初始化推送。
-      if (mode === 'push' && repoPhase(repo) !== 'ok') {
-        const useWebdav = webdavActive(settings)
-        const url = useWebdav
-          ? normalizeWebdav(settings).url
-          : ((await git(repo, ['remote', 'get-url', 'origin'])) || settings.remoteUrl || '')
-        const probe = useWebdav ? await probeWebdavRemote(settings) : await probeRemote(url, settings)
-        if (!probe || probe.files === null) {
-          throw new Error(t(
-            useWebdav
-              ? `连不上 WebDAV（${url || '未配置'}）：${(probe && probe.error) || '初始化推送要先确认云端是空目录'}`
-              : `连不上云端、或还没有云端仓库地址（${url || '未配置'}）：初始化推送要先确认云端是空仓库`,
-            useWebdav
-              ? `Cannot reach WebDAV (${url || 'not set'}): ${(probe && probe.error) || 'initialize push needs to confirm the cloud folder is empty.'}`
-              : `Cannot reach the cloud or no remote URL is set (${url || 'not set'}): initialize push needs to confirm the cloud repo is still empty.`,
-          ))
-        }
-        if (probe.files > 0) {
-          throw new Error(t(
-            `云端仓库已经有内容（${probe.files} 个文件）：本机还是空的，先「拉取」把内容拉下来，再生成推送`,
-            `The cloud repo already has content (${probe.files} file(s)): run Pull to fetch it first, then push.`,
-          ))
-        }
-      }
+      if (mode === 'push' && repoPhase(repo) !== 'ok') await ensurePushAllowed(repo, settings)
       // 拉取/推送做完都把客户端拉回来（用户要求"完成后自动启动 dsh"），仍受 autoRestart 开关约束
       const restart = body.restart !== false && settings.autoRestart !== false
       const started = await spawnWatcher({ mode, repo, appRoot, dshHome, restart })
@@ -3747,7 +3944,7 @@ async function handleAuto(req, res, config) {
       return
     }
 
-    throw new Error(t('action 只能是 check / pull-now / push-now / restore-preview / restore-now / cancel', 'action must be check / pull-now / push-now / restore-preview / restore-now / cancel'))
+    throw new Error(t('action 只能是 check / pull-now / push-now / push-live / restore-preview / restore-now / cancel', 'action must be check / pull-now / push-now / push-live / restore-preview / restore-now / cancel'))
   } catch (error) {
     sendJson(res, 400, { ok: false, error: String((error && error.message) || error) })
   }

@@ -172,7 +172,16 @@ window.__ModuleLoader__.load({
       kvRow: { display: 'flex', gap: '10px', fontSize: '12px', lineHeight: '18px', alignItems: 'flex-start', padding: '2px 0' },
       kvKey: { minWidth: '100px', width: '100px', flexShrink: 0, color: 'var(--dsw-alias-label-tertiary)' },
       kvVal: { flex: 1, minWidth: 0, color: 'var(--dsw-alias-label-secondary)', overflowWrap: 'break-word' },
-      advice: { fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-secondary)', margin: 0, paddingLeft: '18px', display: 'flex', flexDirection: 'column', gap: '2px' },
+      advice: { fontSize: '12px', lineHeight: '20px', color: 'var(--dsw-alias-label-secondary)', margin: 0, paddingLeft: '18px', display: 'flex', flexDirection: 'column', gap: '4px' },
+      anchorBtn: {
+        display: 'inline-flex', alignItems: 'center', gap: '3px',
+        marginLeft: '8px', padding: '1px 9px', borderRadius: '999px',
+        fontSize: '11.5px', lineHeight: '18px', fontWeight: 600,
+        border: '1px solid var(--dsw-alias-toast-action)',
+        background: 'color-mix(in srgb, var(--dsw-alias-toast-action) 10%, transparent)',
+        color: 'var(--dsw-alias-toast-action)', cursor: 'pointer',
+        verticalAlign: 'baseline', textDecoration: 'none',
+      },
       actions: { display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' },
       hint: { fontSize: '12px', lineHeight: '19px', color: 'var(--dsw-alias-label-tertiary)', wordBreak: 'break-all' },
       code: {
@@ -800,8 +809,59 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** 根据待办文案与当前体检状态映射直达目标区（用于「待办」里的锚文本快捷按钮）。 */
+    function adviceTarget(text, data) {
+      const s = String(text || '')
+      const webdavOn = Boolean(data && data.webdav && data.webdav.active)
+      if (/初始化推送|Initialize push/i.test(s)) {
+        return { section: 'automation', label: M('前往初始化推送 →', 'Go to initialize push →') }
+      }
+      if (/连不上 WebDAV|Cannot reach WebDAV/i.test(s)) {
+        return { section: 'platform', label: M('检查 WebDAV →', 'Check WebDAV →') }
+      }
+      if (/连不上云端|云端仓库地址|Cloud repo is not set|Cannot reach the cloud/i.test(s)) {
+        return { section: webdavOn ? 'platform' : 'targets', label: webdavOn ? M('检查 WebDAV →', 'Check WebDAV →') : M('去配置云端 →', 'Go to cloud settings →') }
+      }
+      if (/拉取|run Pull|\bPull\b/i.test(s) && !/只允许拉取|only Pull is allowed/i.test(s)) {
+        return { section: 'automation', label: M('前往立即拉取 →', 'Go to pull →') }
+      }
+      if (/只允许拉取|only Pull is allowed/i.test(s)) {
+        return { section: webdavOn ? 'platform' : 'targets', label: webdavOn ? M('检查 WebDAV →', 'Check WebDAV →') : M('检查云端配置 →', 'Check cloud config →') }
+      }
+      if (/推送|run Push|\bPush\b/i.test(s)) {
+        return { section: 'automation', label: M('前往立即推送 →', 'Go to push →') }
+      }
+      if (/仓库路径|本机仓库|Repo path|repo directory is not set|Local repo/i.test(s)) {
+        return { section: 'targets', label: M('去设置仓库 →', 'Go to repo settings →') }
+      }
+      if (/客户端根目录|client root/i.test(s)) {
+        return { section: 'roots', openRoots: true, label: M('检查本机路径 →', 'Check local paths →') }
+      }
+      if (/客户端版本|two clients differ/i.test(s)) {
+        return { section: 'platform', label: M('查看跨端契约 →', 'View contract →') }
+      }
+      if (/bundle|依赖|dependency/i.test(s)) {
+        return { section: 'actions', label: M('查看生成脚本 →', 'View scripts →') }
+      }
+      return null
+    }
+
     function Advice(props) {
-      return h('ul', { style: S.advice }, (props.items || []).map((a, i) => h('li', { key: i }, a)))
+      const onNav = typeof props.onNavigate === 'function' ? props.onNavigate : null
+      return h('ul', { style: S.advice }, (props.items || []).map((a, i) => {
+        const target = onNav ? adviceTarget(a, props.data) : null
+        return h('li', { key: i },
+          h('span', null, a),
+          target
+            ? h('button', {
+              type: 'button',
+              style: S.anchorBtn,
+              title: M('点击直达对应操作区', 'Jump directly to this section'),
+              onClick: () => onNav(target),
+            }, target.label)
+            : null,
+        )
+      }))
     }
 
     function MadeNote(props) {
@@ -2258,6 +2318,10 @@ window.__ModuleLoader__.load({
             setMsg(d
               ? M(`云端：落后 ${d.behind} 个提交，领先 ${d.ahead} 个提交`, `Cloud: ${d.behind} commit(s) behind, ${d.ahead} ahead`)
               : (body.error || M('读不到远端', 'Cannot read the remote')))
+          } else if (action === 'push-live') {
+            setMsg(body.alreadyRunning
+              ? M('后台推送已在运行中，请稍候…', 'Live push is already running…')
+              : M('已开始后台推送（不关闭 DSH），进度与结果会在下方实时更新', 'Live push started in background (DSH stays open) — status updates below'))
           } else {
             setMsg(body.closeRequested
               ? M('已排队：客户端马上关闭，退出后执行；拉取完成后按设置自动重开', 'Queued: the client closes now and the sync runs after exit; it relaunches per your settings when pulling finishes')
@@ -2299,6 +2363,8 @@ window.__ModuleLoader__.load({
       }
 
       const pending = auto.pending
+      const livePush = auto.livePush || null
+      const liveRunning = Boolean(livePush && livePush.running)
       // 后台调度拿不到请求语言，宿主把原因中英各存一份，这里按当前界面语言挑
       const pendingReason = pending ? (langIsZh() ? (pending.reasonZh || pending.reason) : (pending.reasonEn || pending.reason)) : ''
       return h('div', { style: S.card },
@@ -2332,26 +2398,66 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             style: canPullNow ? S.btnPrimary : { ...S.btnPrimary, opacity: 0.5, cursor: 'not-allowed' },
-            disabled: Boolean(busy) || !canPullNow,
+            disabled: Boolean(busy) || !canPullNow || liveRunning,
             title: canPullNow ? '' : M('云端还是空的：没有内容可拉，先「初始化推送」', 'The cloud is still empty — nothing to pull, initialize push first'),
             onClick: () => act('pull-now'),
           }, M('立即拉取（会关闭 DSH）', 'Pull now (closes DSH)')),
           h('button', {
             type: 'button',
-            style: pushAllowed ? S.btnPrimary : { ...S.btnPrimary, opacity: 0.5, cursor: 'not-allowed' },
-            disabled: Boolean(busy) || !pushAllowed,
-            title: pushAllowed ? '' : M('云端已有内容：本机还是空的，先拉取', 'The cloud already has content — pull first'),
+            style: (pushAllowed && !liveRunning) ? S.btnPrimary : { ...S.btnPrimary, opacity: 0.5, cursor: 'not-allowed' },
+            disabled: Boolean(busy) || !pushAllowed || liveRunning,
+            title: pushAllowed
+              ? M('不关闭 DSH 直接在后台抓配置并上传（只读本地配置，安全不打断当前对话）', 'Capture and push in background without closing DSH')
+              : M('云端已有内容：本机还是空的，先拉取', 'The cloud already has content — pull first'),
+            onClick: () => act('push-live'),
+          }, liveRunning
+            ? M('后台推送中…', 'Pushing in background…')
+            : (initMode
+              ? M('初始化推送（不关 DSH）', 'Initialize push (keep DSH open)')
+              : M('立即推送（不关 DSH）', 'Push now (keep DSH open)'))),
+          h('button', {
+            type: 'button',
+            style: (pushAllowed && !liveRunning) ? S.btn : { ...S.btn, opacity: 0.5, cursor: 'not-allowed' },
+            disabled: Boolean(busy) || !pushAllowed || liveRunning,
+            title: pushAllowed
+              ? M('先退出 DSH 再推，可确保内存中尚未落盘的改动一并写入', 'Exit DSH before pushing so in-memory changes flush first')
+              : M('云端已有内容：本机还是空的，先拉取', 'The cloud already has content — pull first'),
             onClick: () => act('push-now'),
           }, initMode
             ? M('初始化推送（会关闭 DSH）', 'Initialize push (closes DSH)')
-            : M('立即推送（会关闭 DSH）', 'Push now (closes DSH)')),
+            : M('退出后推送（会关闭 DSH）', 'Push after exit (closes DSH)')),
           pending ? h('button', { type: 'button', style: S.btn, disabled: Boolean(busy), onClick: () => act('cancel') }, M('取消排队', 'Cancel queue')) : null,
         ),
+        livePush && (livePush.running || livePush.finishedAt)
+          ? h('div', {
+            style: {
+              padding: '8px 10px', borderRadius: '8px', fontSize: '12px', lineHeight: '18px',
+              border: '1px solid ' + (livePush.running
+                ? 'var(--dsw-alias-toast-action)'
+                : (livePush.ok ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)')),
+              background: 'var(--dsw-alias-fill-l1, var(--dsw-alias-bg-layer-2))',
+              color: livePush.running
+                ? 'var(--dsw-alias-label-primary)'
+                : (livePush.ok ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)'),
+            },
+          },
+          h('div', { style: { fontWeight: 600 } },
+            (livePush.running ? '⏳ ' : (livePush.ok ? '✓ ' : '✕ ')) + (livePush.message || '')),
+          livePush.finishedAt
+            ? h('div', { style: { ...S.footnote, marginTop: '2px' } },
+              M(`完成时间：${new Date(livePush.finishedAt).toLocaleTimeString(localeNow(), { hour12: false })}`,
+                `Finished at: ${new Date(livePush.finishedAt).toLocaleTimeString(localeNow(), { hour12: false })}`)
+              + (livePush.log ? ` · ${livePush.log}` : ''))
+            : (livePush.log
+              ? h('div', { style: { ...S.footnote, marginTop: '2px' } }, M(`日志：${livePush.log}`, `Log: ${livePush.log}`))
+              : null),
+          )
+          : null,
         initMode
           ? h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warn-primary)' } },
             M(
-              '本机仓库和云端仓库都还是空的：点「初始化推送」会把本机配置当作仓库的初始内容推上去（自动 git init + 写仓库骨架 + capture + 提交 + 推送）。这时没有东西可拉，拉取按钮是灰的。',
-              'Both the local repo and the cloud are empty: Initialize push uploads this machine\'s config as the repo\'s initial content (git init + repo skeleton + capture + commit + push). There is nothing to pull yet, so Pull stays disabled.',
+              '本机仓库和云端仓库都还是空的：点「初始化推送（不关 DSH）」会直接在后台抓配置并上传；若需先让内存状态完全落盘，也可选「初始化推送（会关闭 DSH）」。这时没有东西可拉，拉取按钮是灰的。',
+              'Both the local repo and the cloud are empty: "Initialize push (keep DSH open)" captures and uploads in background; use "(closes DSH)" if you want in-memory state flushed first. Pull stays disabled until content exists.',
             ))
           : null,
         (!pushAllowed || !canPullNow)
@@ -2669,6 +2775,57 @@ window.__ModuleLoader__.load({
         return () => { alive = false; clearInterval(timer) }
       }, [])
 
+      const lastLiveFinishedRef = react.useRef(0)
+
+      const jumpToSection = (sid, opts) => {
+        if (!sid) return
+        if (opts && opts.openRoots && !showRoots) setShowRoots(true)
+        setActiveSection(sid)
+        const scrollNow = () => {
+          const el = document.getElementById('sync-section-' + sid)
+          if (!el || !el.scrollIntoView) return
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+          try {
+            if (typeof el.animate === 'function') {
+              el.animate([
+                { boxShadow: '0 0 0 2px var(--dsw-alias-toast-action)' },
+                { boxShadow: '0 0 0 0px transparent' },
+              ], { duration: 1500, easing: 'ease-out' })
+            }
+          } catch { }
+        }
+        if (opts && opts.openRoots && !showRoots) {
+          setTimeout(scrollNow, 60)
+        } else {
+          scrollNow()
+        }
+      }
+
+      // 后台在线推送进行中时，每 1.5s 轮询状态直到结束，并弹出完成/失败提示
+      const liveRunning = Boolean(data && data.auto && data.auto.livePush && data.auto.livePush.running)
+      react.useEffect(() => {
+        if (!liveRunning) return undefined
+        const timer = setInterval(() => {
+          if (typeof refresh === 'function') refresh()
+        }, 1500)
+        return () => clearInterval(timer)
+      }, [liveRunning])
+
+      react.useEffect(() => {
+        const lp = data && data.auto && data.auto.livePush
+        if (!lp || lp.running || !lp.finishedAt) return
+        if (lastLiveFinishedRef.current === 0) {
+          // 首次挂载时如果已经是很久以前完成的旧记录不重弹；10 秒内刚完成则弹提示
+          if (Date.now() - lp.finishedAt > 10000) {
+            lastLiveFinishedRef.current = lp.finishedAt
+            return
+          }
+        }
+        if (lastLiveFinishedRef.current === lp.finishedAt) return
+        lastLiveFinishedRef.current = lp.finishedAt
+        showToast(lp.message || (lp.ok ? M('推送完成', 'Push completed') : M('推送失败', 'Push failed')))
+      }, [data])
+
       // 上次「退出后自动同步」的结果：15 分钟内、且没弹过，就弹 5 秒提示。
       // 判据与「启动即弹」共用 takeFreshResult（同一个 localStorage 键，不会弹两次）。
       react.useEffect(() => {
@@ -2964,11 +3121,20 @@ window.__ModuleLoader__.load({
                 }, pendingDetailOpen ? M('收起', 'Collapse') : M('展开', 'Expand'))
                 : null,
             ),
-            pendingDetailOpen ? localBlock : (localBlock ? h('div', { style: S.footnote }, M(
-              `${data.local.pending > 0 ? `有 ${data.local.pending} 个文件待推送` : '没有新写入'} · 点「展开」看具体会话记录与本机 profile`,
-              `${data.local.pending > 0 ? `${data.local.pending} file(s) to push` : 'nothing new'} · click Expand for session names and local profile`,
-            )) : null),
-            data && Array.isArray(data.advice) && data.advice.length ? h(Advice, { items: data.advice }) : null)
+            pendingDetailOpen ? localBlock : (localBlock ? h('div', { style: S.footnote },
+              h('span', null, M(
+                `${data.local.pending > 0 ? `有 ${data.local.pending} 个文件待推送` : '没有新写入'} · 点「展开」看具体会话记录与本机 profile`,
+                `${data.local.pending > 0 ? `${data.local.pending} file(s) to push` : 'nothing new'} · click Expand for session names and local profile`,
+              )),
+              data.local.pending > 0
+                ? h('button', {
+                  type: 'button',
+                  style: S.anchorBtn,
+                  onClick: () => jumpToSection('automation'),
+                }, M('前往立即推送 →', 'Go to push →'))
+                : null,
+            ) : null),
+            data && Array.isArray(data.advice) && data.advice.length ? h(Advice, { items: data.advice, data, onNavigate: jumpToSection }) : null)
           : null,
       )
 
@@ -3141,12 +3307,7 @@ window.__ModuleLoader__.load({
                     fontWeight: active ? 600 : 400,
                   },
                   title: active ? M('当前所在区', 'Current section') : M('跳转到此区', 'Jump to section'),
-                  onClick: () => {
-                    setActiveSection(sid)
-                    const el = document.getElementById('sync-section-' + sid)
-                    if (!el || !el.scrollIntoView) return
-                    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-                  },
+                  onClick: () => jumpToSection(sid),
                 }, label)
               }),
             ),

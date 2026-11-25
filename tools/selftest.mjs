@@ -1841,5 +1841,34 @@ console.log('== 0.4.1：空格路径传参修复 + WebDAV 接入拉取/推送流
     && cliSrc.includes("drift.transport === 'webdav'"),
     'client.js 仍把 WebDAV 模式当未配置远端')
 }
+console.log('')
+console.log('== 0.4.2：Job Object 脱离 + 在线推送（不关 DSH）+ 待办直达锚文本按钮 ==')
+{
+  const idxSrc = readFileSync(join(pluginRootSelf, 'index.js'), 'utf8')
+  const cliSrc = readFileSync(join(pluginRootSelf, 'client.js'), 'utf8')
+  const postSrc = readFileSync(join(pluginRuntime, 'post-exit.ps1'), 'utf8')
+  check('spawnWatcher 优先用 Shell.Application.ShellExecute 脱离 DSH Job Object，并保留 Start-Process 兜底',
+    idxSrc.includes('Shell.Application')
+    && idxSrc.includes('.ShellExecute(')
+    && idxSrc.includes("'-PidFile'")
+    && postSrc.includes('[string]$PidFile'),
+    'spawnWatcher 仍只用 Start-Process，DSH 退出时等待进程会被 Job Object 连杀')
+  check('宿主支持不关闭 DSH 的在线推送（action=push-live + livePush 状态）',
+    idxSrc.includes("action === 'push-live'")
+    && idxSrc.includes('function startLivePush(')
+    && idxSrc.includes('livePush: { ...autoState.livePush }'),
+    'index.js 缺 push-live 接口或 livePush 状态')
+  check('面板 AutoCard 提供「不关 DSH」推送主按钮与实时状态框',
+    cliSrc.includes("act('push-live')")
+    && cliSrc.includes('初始化推送（不关 DSH）')
+    && cliSrc.includes('立即推送（不关 DSH）')
+    && cliSrc.includes('auto.livePush'),
+    'client.js AutoCard 缺在线推送按钮或状态显示')
+  check('面板「待办」Advice 配备直达锚文本按钮并复用 jumpToSection',
+    cliSrc.includes('function adviceTarget(')
+    && cliSrc.includes('onNavigate: jumpToSection')
+    && cliSrc.includes('前往初始化推送 →'),
+    'client.js 待办列表缺少锚文本跳转按钮')
+}
 process.exit(failures === 0 ? 0 : 1)
 

@@ -28,6 +28,8 @@ param(
   [switch]$Restart,
   [int]$MaxWaitMinutes = 30,
   [string]$LogFile,
+  # 仅 Phase=wait 用：由外部启动器（如 ShellExecute 脱离 Job Object）回读本进程真实 PID
+  [string]$PidFile = '',
   # ---- 仅 -Mode restore 用：还原到哪份快照 ----
   [string]$BackupDir = '',
   # 备份类型：profile（配置快照，默认）/ plugin（插件本体备份）/ session（会话目录备份）
@@ -46,6 +48,13 @@ param(
 # 为什么要分两段：窗口必须**在 DSH 退出之后**才出现。排队阶段就弹窗的话，
 # 用户从开机到关窗口这段时间会一直挂着一个"等 DSH 退出"的黑窗，什么也干不了还挡着视线。
 if ($Phase -eq 'wait') {
+  if ($PidFile) {
+    try {
+      $pdir = Split-Path -Parent $PidFile
+      if ($pdir -and -not (Test-Path -LiteralPath $pdir)) { New-Item -ItemType Directory -Path $pdir -Force | Out-Null }
+      [IO.File]::WriteAllText($PidFile, [string]$PID, (New-Object Text.UTF8Encoding $false))
+    } catch { }
+  }
   $deadline = (Get-Date).AddMinutes($MaxWaitMinutes)
   $noWindowTicks = 0
   $waitLog = Join-Path $DshHome 'logs\auto-sync-wait.log'
