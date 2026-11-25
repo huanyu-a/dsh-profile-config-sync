@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/huanyu-a/dsh-profile-config-sync/compare/v0.4.1...v0.5.0) (2026-11-25)
+
+
+### Features
+
+* 支持不关闭 DSH 在线推送、待办锚文本直达与脱离 Job Object 修复 ([158914d](https://github.com/huanyu-a/dsh-profile-config-sync/commit/158914d14d4989fd794edfaf3ab47efef96edb4c))
+
 ## [0.4.1](https://github.com/huanyu-a/dsh-profile-config-sync/compare/v0.4.0...v0.4.1) (2026-11-25)
 
 
