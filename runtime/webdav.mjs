@@ -23,7 +23,9 @@
 
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import { dirname, join, sep as SEP } from 'node:path'
+import { homedir } from 'node:os'
+import { dirname, join, resolve, sep as SEP } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /** WebDAV 方法体里常用的 XML 命名空间。 */
 const NS_DAV = 'DAV:'
@@ -120,17 +122,39 @@ async function textOf(res) {
 
 /**
  * 确保远端目录存在（MKCOL，已存在则忽略 405/301）。
+ * nginx ngx_http_dav_module 要求 MKCOL URL 带尾斜杠，否则直接报 409；
+ * 若遇到 400/501 再退回不带尾斜杠。根路径含多段（如 a/b）时逐级创建。
  * 返回 { ok, error }。
  */
+async function mkcolOne(url, w) {
+  const withSlash = url.endsWith('/') ? url : `${url}/`
+  let res = await request(withSlash, w, { method: 'MKCOL' })
+  if (res.status === 400 || res.status === 501) {
+    res = await request(url.replace(/\/+$/, ''), w, { method: 'MKCOL' })
+  }
+  if (res.ok || res.status === 405 || res.status === 301) {
+    return { ok: true, status: res.status, error: '' }
+  }
+  if (res.status === 409) {
+    return { ok: false, status: 409, error: 'parent-missing' }
+  }
+  return { ok: false, status: res.status, error: `MKCOL ${res.status} ${await textOf(res)}` }
+}
+
 export async function ensureRemoteDir(w, relDir = '') {
   const url = remoteUrlFor(w, relDir)
   try {
-    const res = await request(url, w, { method: 'MKCOL' })
-    if (res.ok || res.status === 405 || res.status === 301 || res.status === 409) {
-      // 409 = 父目录不存在，交给上层逐级建
-      return { ok: res.status !== 409, status: res.status, error: res.status === 409 ? 'parent-missing' : '' }
+    let r = await mkcolOne(url, w)
+    if (r.status === 409 && !relDir && w.dir && w.dir.includes('/')) {
+      const segs = String(w.dir).split('/').filter(Boolean)
+      const base = String(w.url || '').replace(/\/+$/, '')
+      for (let i = 1; i <= segs.length; i++) {
+        const prefix = segs.slice(0, i).map((s) => encodeURIComponent(s)).join('/')
+        r = await mkcolOne(`${base}/${prefix}`, w)
+        if (!r.ok) return r
+      }
     }
-    return { ok: false, status: res.status, error: `MKCOL ${res.status} ${await textOf(res)}` }
+    return r
   } catch (e) {
     return { ok: false, error: e && e.message ? e.message : String(e) }
   }
@@ -473,7 +497,7 @@ function fromRepoRel(rel) {
   return String(rel).split('/').join(SEP)
 }
 
-/** 连通性测试（面板上「测试连接」用）。 */
+/** 连通性测试（面板「测试连接」与探云端是否为空共用）。 */
 export async function testConnection(w) {
   if (!w.enabled) return { ok: false, error: '未配置 WebDAV 地址' }
   if (!isSecureUrl(w.url)) {
@@ -481,5 +505,88 @@ export async function testConnection(w) {
   }
   const res = await listRemote(w, '')
   if (!res) return { ok: false, error: '连不上或认证失败（PROPFIND 无响应）' }
-  return { ok: true, exists: res.exists, files: res.entries.size, url: w.url }
+  const dirs = res.exists ? await listRemoteDirs(w, '') : []
+  return {
+    ok: true,
+    exists: res.exists,
+    files: res.entries.size + dirs.length,
+    rootFiles: res.entries.size,
+    rootDirs: dirs.length,
+    url: w.url,
+  }
+}
+
+function parseCliArgs(argv) {
+  const out = {}
+  for (let i = 0; i < argv.length; i++) {
+    const tok = String(argv[i])
+    if (!tok.startsWith('-')) continue
+    const clean = tok.replace(/^-+/, '')
+    const eq = clean.indexOf('=')
+    if (eq > 0) { out[clean.slice(0, eq)] = clean.slice(eq + 1); continue }
+    const next = argv[i + 1]
+    if (next !== undefined && !String(next).startsWith('-')) { out[clean] = String(next); i++ }
+    else out[clean] = true
+  }
+  return out
+}
+
+function readLocalSettings(dshHome) {
+  const p = join(dshHome, 'dsh-config-sync.json')
+  if (!existsSync(p)) return {}
+  return JSON.parse(readFileSync(p, 'utf8').replace(/^\uFEFF/, ''))
+}
+
+export async function runWebdavCli(argv) {
+  const [cmd, ...rest] = argv
+  const a = parseCliArgs(rest)
+  const dshHome = a.DshHome || a.dshHome || process.env.DSH_HOME || join(homedir(), '.dsh')
+  const repoRoot = a.RepoRoot || a.repoRoot || process.cwd()
+  if (!cmd || !['probe', 'upload', 'download'].includes(cmd)) {
+    console.error('用法：node webdav.mjs <probe|upload|download> -DshHome <dir> -RepoRoot <dir>')
+    return 2
+  }
+  const settings = readLocalSettings(dshHome)
+  const w = normalizeWebdav(settings)
+  if (!w.enabled) {
+    console.error('WebDAV 未配置地址')
+    return 1
+  }
+  if (cmd === 'probe') {
+    const r = await testConnection(w)
+    console.log(JSON.stringify(r))
+    return r.ok ? 0 : 1
+  }
+  if (cmd === 'upload') {
+    if (!isSecureUrl(w.url)) {
+      console.error('WebDAV 地址不是 https（明文传输密码有风险）；确需使用请设 DSH_SYNC_ALLOW_INSECURE=1')
+      return 1
+    }
+    const r = await uploadRepo(w, repoRoot)
+    console.log(`WebDAV 上传：上传 ${r.uploaded.length} · 跳过 ${r.skipped.length} · 错误 ${r.errors.length}`)
+    for (const e of r.errors.slice(0, 20)) console.error(`  [!] ${e}`)
+    return r.ok ? 0 : 1
+  }
+  if (cmd === 'download') {
+    if (!isSecureUrl(w.url)) {
+      console.error('WebDAV 地址不是 https（明文传输密码有风险）；确需使用请设 DSH_SYNC_ALLOW_INSECURE=1')
+      return 1
+    }
+    const r = await downloadRepo(w, repoRoot)
+    console.log(`WebDAV 下载：下载 ${r.downloaded.length} · 跳过 ${r.skipped.length} · 冲突 ${r.conflicts.length} · 错误 ${r.errors.length}`)
+    for (const e of r.errors.slice(0, 20)) console.error(`  [!] ${e}`)
+    return r.ok ? 0 : 1
+  }
+  return 2
+}
+
+const invokedDirectly = (() => {
+  try { return resolve(process.argv[1] || '') === resolve(fileURLToPath(import.meta.url)) } catch { return false }
+})()
+
+if (invokedDirectly) {
+  runWebdavCli(process.argv.slice(2)).then((code) => process.exit(code)).catch((e) => {
+    console.error(e && e.stack ? e.stack : e)
+    process.exit(1)
+  })
 }

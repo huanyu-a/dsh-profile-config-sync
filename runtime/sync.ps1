@@ -1,4 +1,4 @@
-﻿<#
+<#
 DSH 配置同步 —— 一条命令入口（把原来的「capture + git add + commit + push」和「git pull + apply」各收成一次调用）
 
 用法
@@ -47,9 +47,25 @@ if (-not $RepoRoot) { $RepoRoot = $PSScriptRoot }
 # 本动作的未同步清单从这里起算（pull 也要清：上一轮 push 的清单不能挂到这次拉取头上）
 Reset-SyncNotices $DshHome $Action
 
-# git 位置探测统一在 dsh-sync-common.ps1 里（Get-GitExe），这里只决定找不到时怎么报
+function Get-SyncSettings {
+  $p = Join-Path $DshHome 'dsh-config-sync.json'
+  if (-not (Test-Path -LiteralPath $p)) { return $null }
+  try { return (Get-Content -LiteralPath $p -Raw -Encoding utf8 | ConvertFrom-Json) } catch { return $null }
+}
+
+function Test-WebdavActive($s) {
+  if (-not $s) { return $false }
+  $mode = [string]$s.syncMode
+  $url = ([string]$s.webdavUrl).Trim()
+  return (($mode -eq 'webdav' -or $mode -eq 'auto') -and [bool]$url)
+}
+
+$SyncSettings = Get-SyncSettings
+$UseWebdav = Test-WebdavActive $SyncSettings
+
+# git 位置探测统一在 dsh-sync-common.ps1 里（Get-GitExe）；WebDAV 模式不依赖 git
 $git = Get-GitExe
-if (-not $git) { Die "找不到 git.exe。请先安装 Git 并加入 PATH。" }
+if (-not $git -and -not $UseWebdav) { Die "找不到 git.exe。请先安装 Git 并加入 PATH。" }
 
 # 客户端装哪个盘不是固定的（会被卸载重装到别处），所以 -AppRoot 传进来的值先校验，
 # 对不上就按注册表/常见位置重新定位 —— 老脚本里写死的旧路径因此不会把整条链路带偏。
@@ -104,7 +120,9 @@ function Write-SyncState([string]$Mode) {
   try {
     if (-not (Test-Path -LiteralPath $DshHome)) { New-Item -ItemType Directory -Path $DshHome -Force | Out-Null }
     $head = ''
-    try { $head = ((& $git -C $RepoRoot log -1 --format='%h' 2>$null) | Out-String).Trim() } catch {}
+    if ($git -and (Test-Path -LiteralPath (Join-Path $RepoRoot '.git'))) {
+      try { $head = ((& $git -C $RepoRoot log -1 --format='%h' 2>$null) | Out-String).Trim() } catch {}
+    }
     $state = [ordered]@{
       lastSyncAt = (Get-Date).ToString('o')
       mode       = $Mode
@@ -409,10 +427,20 @@ function Restore-LocalKept($Report) {
 
 # ---------- status ----------
 if ($Action -eq 'status') {
-  $st = Get-RepoState
-  Say "分支：$($st.Branch)"
-  Say "HEAD：$($st.Head)"
-  if ($st.Dirty -eq 0) { Ok "工作区干净" } else { Warn "工作区有 $($st.Dirty) 项未提交" }
+  if ($UseWebdav) {
+    Say ("传输方式：WebDAV（{0} / {1}）" -f $SyncSettings.webdavUrl, $(if ($SyncSettings.webdavDir) { $SyncSettings.webdavDir } else { 'dsh-config-sync' }))
+    $wp = Invoke-WebdavAction 'probe'
+    if ($wp.ok) { Ok ("WebDAV 已连通（云端 {0} 项）" -f [int]$wp.files) }
+    else { Warn ("WebDAV 探测失败：{0}" -f $wp.error) }
+  }
+  if ($git -and (Test-Path -LiteralPath (Join-Path $RepoRoot '.git'))) {
+    $st = Get-RepoState
+    Say "分支：$($st.Branch)"
+    Say "HEAD：$($st.Head)"
+    if ($st.Dirty -eq 0) { Ok "工作区干净" } else { Warn "工作区有 $($st.Dirty) 项未提交" }
+  } elseif (-not $UseWebdav) {
+    Warn "目录还没有 .git：$RepoRoot"
+  }
   $app = Get-HostAppVersion $AppRoot
   $contract = $null
   $cp = Join-Path $RepoRoot 'profile\host-contract.json'
@@ -520,41 +548,17 @@ function Get-RemoteFileCount([string]$RemoteUrl, [int]$Heads = -2) {
   少拷了它们，远端就变成「只有 settings 没有执行体」的半截仓库，另一台 pull 下来跑不起来。
   profile\host-contract.json 用本机客户端版本生成（apply 靠它校验两端版本，缺了只会跳过校验）。
 #>
-function Initialize-EmptyRepo([string]$RemoteUrl) {
-  if (-not $RemoteUrl) {
-    Die ("本机仓库还是空的（$RepoRoot），也没读到云端仓库地址：" +
-      "请先在面板「云端仓库」里填好地址并保存，再重跑本脚本。")
-  }
+function Initialize-RepoSkeleton {
   if (-not (Test-Path -LiteralPath $RepoRoot)) { New-Item -ItemType Directory -Path $RepoRoot -Force | Out-Null }
-  Say ""
-  Say "== 初始化仓库（首次推送） =="
-  Say "  目录：$RepoRoot"
-  Say "  云端：$RemoteUrl（空仓库）"
-  if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot '.git'))) {
-    $initLine = '"' + $git + '" -C "' + $RepoRoot + '" init --initial-branch=main 2>&1'
-    & "$env:ComSpec" /c $initLine | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      & "$env:ComSpec" /c ('"' + $git + '" -C "' + $RepoRoot + '" init 2>&1') | Out-Null
-      if ($LASTEXITCODE -ne 0) { Die "git init 失败：$RepoRoot" }
-    }
-  }
-  $originUrl = (@(& "$env:ComSpec" /c ('"' + $git + '" -C "' + $RepoRoot + '" remote get-url origin 2>nul')) -join '').Trim()
-  if ($originUrl) {
-    & "$env:ComSpec" /c ('"' + $git + '" -C "' + $RepoRoot + '" remote set-url origin "' + $RemoteUrl + '" 2>&1') | Out-Null
-  } else {
-    & "$env:ComSpec" /c ('"' + $git + '" -C "' + $RepoRoot + '" remote add origin "' + $RemoteUrl + '" 2>&1') | Out-Null
-  }
-  if ($LASTEXITCODE -ne 0) { Die "给仓库加 origin 失败：$RemoteUrl" }
-
   $copied = 0
-  foreach ($n in @('apply.ps1', 'capture.ps1', 'sync.ps1', 'restore.ps1', 'post-exit.ps1', 'dsh-sync-common.ps1')) {
+  foreach ($n in @('apply.ps1', 'capture.ps1', 'sync.ps1', 'restore.ps1', 'post-exit.ps1', 'dsh-sync-common.ps1', 'webdav.mjs')) {
     $src = Join-Path $PSScriptRoot $n
     if (Test-Path -LiteralPath $src) {
       Copy-Item -LiteralPath $src -Destination (Join-Path $RepoRoot $n) -Force
       $copied++
     }
   }
-  if ($copied -gt 0) { Ok "已写入仓库骨架：$copied 个执行体（apply / capture / sync / restore / post-exit / common）" }
+  if ($copied -gt 0) { Ok "已写入仓库骨架：$copied 个执行体（apply / capture / sync / restore / post-exit / common / webdav）" }
   # tools\fix-session-cwd.mjs 也随仓库同步（apply 在没有插件副本时会用它修会话工作目录），
   # 初始化骨架漏掉它，配置仓库就永远缺这一份，自检的逐字节一致性断言也会一直红。
   $toolSrc = Join-Path (Join-Path $PSScriptRoot 'tools') 'fix-session-cwd.mjs'
@@ -590,6 +594,79 @@ function Initialize-EmptyRepo([string]$RemoteUrl) {
       Warn "读不到本机客户端版本，跳过 profile\host-contract.json（另一台 pull 时会跳过版本校验）"
     }
   }
+}
+
+function Get-NodeExeForWebdav {
+  foreach ($c in @(
+    (Join-Path $AppRoot 'resources\runtime\primary-runtime\dependencies\node\bin\node.exe'),
+    (Join-Path $AppRoot 'resources\runtime\bin\node.exe'),
+    (Join-Path $AppRoot 'resources\runtime\node.exe')
+  )) {
+    if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+  }
+  $cmd = Get-Command node.exe -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  return $null
+}
+
+function Find-WebdavScript {
+  foreach ($c in @(
+    (Join-Path $PSScriptRoot 'webdav.mjs'),
+    (Join-Path $RepoRoot 'webdav.mjs')
+  )) {
+    if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+  }
+  return $null
+}
+
+function Invoke-WebdavAction([string]$SubCmd) {
+  $nodeExe = Get-NodeExeForWebdav
+  if (-not $nodeExe) { Die "找不到 node.exe，无法执行 WebDAV 同步（请确认客户端完整或已安装 Node.js）。" }
+  $script = Find-WebdavScript
+  if (-not $script) { Die "找不到 webdav.mjs，无法执行 WebDAV 同步。" }
+  $eap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $out = (& $nodeExe $script $SubCmd -DshHome $DshHome -RepoRoot $RepoRoot 2>&1 | Out-String)
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = $eap
+  if ($SubCmd -eq 'probe') {
+    $line = ($out -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+    if (-not $line) { return [pscustomobject]@{ ok = $false; error = ($out.Trim()) } }
+    try { return ($line | ConvertFrom-Json) } catch { return [pscustomobject]@{ ok = $false; error = ($out.Trim()) } }
+  }
+  foreach ($l in ($out -split "`r?`n")) {
+    if ($l -and $l.Trim()) { Say ('  ' + $l.TrimEnd()) }
+  }
+  if ($code -ne 0) { Die ("WebDAV $SubCmd 失败（退出码 $code）。") }
+}
+
+function Initialize-EmptyRepo([string]$RemoteUrl) {
+  if (-not $RemoteUrl) {
+    Die ("本机仓库还是空的（$RepoRoot），也没读到云端仓库地址：" +
+      "请先在面板「云端仓库」里填好地址并保存，再重跑本脚本。")
+  }
+  if (-not (Test-Path -LiteralPath $RepoRoot)) { New-Item -ItemType Directory -Path $RepoRoot -Force | Out-Null }
+  Say ""
+  Say "== 初始化仓库（首次推送） =="
+  Say "  目录：$RepoRoot"
+  Say "  云端：$RemoteUrl（空仓库）"
+  if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot '.git'))) {
+    $initLine = '"' + $git + '" -C "' + $RepoRoot + '" init --initial-branch=main 2>&1'
+    & "$env:ComSpec" /c $initLine | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      & "$env:ComSpec" /c ('"' + $git + '" -C "' + $RepoRoot + '" init 2>&1') | Out-Null
+      if ($LASTEXITCODE -ne 0) { Die "git init 失败：$RepoRoot" }
+    }
+  }
+  $originUrl = (@(& "$env:ComSpec" /c ('"' + $git + '" -C "' + $RepoRoot + '" remote get-url origin 2>nul')) -join '').Trim()
+  if ($originUrl) {
+    & "$env:ComSpec" /c ('"' + $git + '" -C "' + $RepoRoot + '" remote set-url origin "' + $RemoteUrl + '" 2>&1') | Out-Null
+  } else {
+    & "$env:ComSpec" /c ('"' + $git + '" -C "' + $RepoRoot + '" remote add origin "' + $RemoteUrl + '" 2>&1') | Out-Null
+  }
+  if ($LASTEXITCODE -ne 0) { Die "给仓库加 origin 失败：$RemoteUrl" }
+
+  Initialize-RepoSkeleton
   Ok "已初始化空仓库并指向 origin"
 }
 
@@ -639,6 +716,57 @@ function Initialize-RepoIfNeeded {
 
 # ---------- push ----------
 if ($Action -eq 'push') {
+  if ($UseWebdav) {
+    $repoReady = (Test-Path -LiteralPath (Join-Path $RepoRoot 'apply.ps1')) -and (Test-Path -LiteralPath (Join-Path $RepoRoot 'profile\package.json'))
+    if (-not $repoReady) {
+      if (Test-Path -LiteralPath $RepoRoot) {
+        $stray = @(Get-ChildItem -LiteralPath $RepoRoot -Force |
+          Where-Object { -not $_.Name.StartsWith('.') -and $_.Name -notmatch '^同步-[\s\S]*\.(cmd|sh)$' })
+        if ($stray.Count -gt 0) {
+          $isSyncRepo = (Test-Path -LiteralPath (Join-Path $RepoRoot 'dsh-sync-common.ps1')) -or
+                        (Test-Path -LiteralPath (Join-Path $RepoRoot 'sync.ps1')) -or
+                        (Test-Path -LiteralPath (Join-Path $RepoRoot 'capture.ps1'))
+          if (-not $isSyncRepo) {
+            Warn ("这个目录不是空的（{0} 项：{1}），也不像 dsh-config 仓库：{2}" -f `
+              $stray.Count, (($stray | Select-Object -First 3 | ForEach-Object { $_.Name }) -join '、'), $RepoRoot)
+            Die "已停止（未抓取、未上传）。请在面板「本机仓库」里重新设路径。"
+          }
+        }
+      }
+      $wp = Invoke-WebdavAction 'probe'
+      if (-not $wp.ok) {
+        Warn ("连不上 WebDAV（{0}）：{1}" -f $SyncSettings.webdavUrl, $wp.error)
+        Die "已停止（未抓取、未上传）。请先在 WebDAV 卡里确认地址/凭据能连通，再重跑。"
+      }
+      if ([int]$wp.files -gt 0) {
+        Warn ("云端 WebDAV 已经有内容（{0} 项）：本机还是空的，应该先拉取，而不是推送" -f [int]$wp.files)
+        Die "已停止（未抓取、未上传）。请先执行「立即拉取」。"
+      }
+      Say ""
+      Say "== 初始化仓库（WebDAV 首次推送） =="
+      Say "  目录：$RepoRoot"
+      Say ("  云端：{0} / {1}" -f $SyncSettings.webdavUrl, $(if ($SyncSettings.webdavDir) { $SyncSettings.webdavDir } else { 'dsh-config-sync' }))
+      Initialize-RepoSkeleton
+    }
+    if ((Test-DshRunning) -and (-not $Force)) {
+      Warn "检测到 DeepSeek Harness 在运行：capture 可能抓到写了一半的配置"
+      Warn "建议完全退出（含托盘）后重跑；确认要继续可加 -Force"
+      Die "已停止（未抓取、未上传）。"
+    }
+    $captureArgs = @{ RepoRoot = $RepoRoot; DshHome = $DshHome; ProfileName = $ProfileName; AppRoot = $AppRoot; WorkspaceHome = $WorkspaceHome; NoResetNotices = $true }
+    if ($WorkspaceOnly) { $captureArgs['WorkspaceOnly'] = $true }
+    if ($SkipWorkspace) { $captureArgs['SkipWorkspace'] = $true }
+    if ($DeepVerify) { $captureArgs['DeepVerify'] = $true }
+    & (Join-Path $PSScriptRoot 'capture.ps1') @captureArgs
+    if ($LASTEXITCODE -ne 0) { Die "capture.ps1 未正常结束，已停止（未上传）。" }
+    Say ""
+    Say "== 上传到 WebDAV =="
+    Invoke-WebdavAction 'upload'
+    Ok "已通过 WebDAV 推送到云端"
+    Write-SyncState 'push'
+    return
+  }
+
   # 推送的三种起点，判据统一成「本机有没有历史 + 云端有没有内容」：
   #   有仓库有历史            → 正常推送（老逻辑照旧）
   #   本机没内容、云端有内容   → 只能先拉取（硬推会把本机状态写进一份已经在用的历史）
@@ -924,6 +1052,33 @@ if ($Action -eq 'push') {
 }
 
 # ---------- pull ----------
+if ($UseWebdav) {
+  if ((Test-DshRunning) -and (-not $Force)) {
+    Die "DeepSeek Harness 仍在运行。请完全退出（含托盘）后重跑，或加 -Force 强制继续。"
+  }
+  if (-not (Test-Path -LiteralPath $RepoRoot)) { New-Item -ItemType Directory -Path $RepoRoot -Force | Out-Null }
+  Say ""
+  Say "== 从 WebDAV 拉取 =="
+  $wp = Invoke-WebdavAction 'probe'
+  if (-not $wp.ok) {
+    Die ("连不上 WebDAV（{0}）：{1}" -f $SyncSettings.webdavUrl, $wp.error)
+  }
+  if (-not $wp.exists -or [int]$wp.files -le 0) {
+    Die "云端 WebDAV 目录里还没有内容，请先在一台机器执行「推送」。"
+  }
+  Invoke-WebdavAction 'download'
+  Say ""
+  $applyArgs = @{ RepoRoot = $RepoRoot; DshHome = $DshHome; ProfileName = $ProfileName; AppRoot = $AppRoot; WorkspaceHome = $WorkspaceHome; NoResetNotices = $true }
+  if ($WorkspaceOnly) { $applyArgs['WorkspaceOnly'] = $true }
+  if ($SkipWorkspace) { $applyArgs['SkipWorkspace'] = $true }
+  if ($SkipInstall) { $applyArgs['SkipInstall'] = $true }
+  if ($AllowVersionDrift) { $applyArgs['AllowVersionDrift'] = $true }
+  if ($Force) { $applyArgs['Force'] = $true }
+  & (Join-Path $PSScriptRoot 'apply.ps1') @applyArgs
+  if ($LASTEXITCODE -eq 0) { Write-SyncState 'pull' }
+  exit $LASTEXITCODE
+}
+
 Initialize-RepoIfNeeded
 if ((Test-DshRunning) -and (-not $Force)) {
   Die "DeepSeek Harness 仍在运行。请完全退出（含托盘）后重跑，或加 -Force 强制继续。"

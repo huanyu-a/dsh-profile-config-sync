@@ -288,8 +288,9 @@ check('非法远端地址被拒（400）', badUrl.statusCode === 400, String(bad
 const badKey = await putSettings({ remoteUrl: body.remote.url, sshKey: 'C:\\nope\\no.key' })
 check('不存在的私钥被拒（400）', badKey.statusCode === 400, String(badKey.statusCode))
 
-// 合法保存：沿用当前地址，所以不会触发 git remote set-url（自检不该改用户仓库）
-const okSave = await putSettings({ remoteUrl: body.remote.url, sshKey: body.remote.sshKey })
+// 合法保存：沿用当前地址（若当前走 WebDAV 没设 remoteUrl，则借用合法占位 URL），不会触发 git remote set-url
+const testRemoteUrl = body.remote.url || 'https://example.invalid/dsh-config.git'
+const okSave = await putSettings({ remoteUrl: testRemoteUrl, sshKey: body.remote.sshKey })
 const okPayload = JSON.parse(okSave.body || '{}')
 check('合法设置保存成功', okSave.statusCode === 200 && okPayload.ok === true, okSave.body.slice(0, 160))
 check('保存后不回写非当前地址（gitRemoteSet=false，自检不动仓库）', okPayload.gitRemoteSet === false, String(okPayload.gitRemoteSet))
@@ -314,7 +315,8 @@ if (repoReady) {
   }
 } else {
   check('本机无内容时：保存设置后 push 仍按云端状态分流（不会因为改了设置就放行）',
-    (again.statusCode === 200 && againPayload.ok === true) || (again.statusCode === 400 && /云端仓库已经有内容/.test(againPayload.error || '')),
+    (again.statusCode === 200 && againPayload.ok === true)
+      || (again.statusCode === 400 && (/云端仓库已经有内容/.test(againPayload.error || '') || (!body.remote.url && /连不上云端/.test(againPayload.error || '')))),
     again.body.slice(0, 160))
   if (existsSync(againPayload.path || '')) restoreCmd(againPayload.path)
 }
@@ -1805,6 +1807,39 @@ console.log('== 0.3.93：点 × 关闭时判一次并排队自动拉取/推送 =
     /await triggerAutoSyncOnClose\(config\)[\s\S]{0,600}el\.app\.quit\(\)/.test(idxSrc), 'index.js 排队先于 quit')
   check('排队成功写日志：退出后立即执行',
     /退出前已排队 \$\{r\.mode\}（自动同步）/.test(idxSrc), 'index.js 排队日志')
+}
+console.log('')
+console.log('== 0.4.1：空格路径传参修复 + WebDAV 接入拉取/推送流水线 + 文案对齐 ==')
+{
+  const idxSrc = readFileSync(join(pluginRootSelf, 'index.js'), 'utf8')
+  const cliSrc = readFileSync(join(pluginRootSelf, 'client.js'), 'utf8')
+  const postSrc = readFileSync(join(pluginRuntime, 'post-exit.ps1'), 'utf8')
+  const syncSrc = readFileSync(join(pluginRuntime, 'sync.ps1'), 'utf8')
+  const davSrc = readFileSync(join(pluginRuntime, 'webdav.mjs'), 'utf8')
+  const engSrc = readFileSync(join(pluginRuntime, 'sync-engine.mjs'), 'utf8')
+  check('spawnWatcher 与 post-exit 中继对含空格参数加内层双引号',
+    idxSrc.includes('function psWinArg(')
+    && idxSrc.includes('psQuote(psWinArg(a))')
+    && postSrc.includes('function Quote-WinArg(')
+    && postSrc.includes('$quotedRelay'),
+    'Start-Process -ArgumentList 空格路径仍会拆包')
+  check('去掉过时的「点『设置路径』」误导文案',
+    !idxSrc.includes('点「设置路径」'),
+    'index.js 仍残留点「设置路径」提示')
+  check('webdav.mjs MKCOL 兼容 nginx 尾斜杠并支持 CLI 子命令',
+    davSrc.includes('mkcolOne')
+    && davSrc.includes('runWebdavCli'),
+    'webdav.mjs 缺 mkcolOne 或 runWebdavCli')
+  check('index.js / sync.ps1 / sync-engine.mjs 均接入 WebDAV 探测与同步',
+    idxSrc.includes('async function probeWebdavRemote(')
+    && syncSrc.includes('Test-WebdavActive')
+    && syncSrc.includes('Invoke-WebdavAction')
+    && engSrc.includes('webdavActive('),
+    'WebDAV 未完整接入主机/PS/Node 执行链')
+  check('client.js WebDAV 模式不误报缺失 git 远端',
+    cliSrc.includes('const webdavOn = Boolean(data.webdav && data.webdav.active)')
+    && cliSrc.includes("drift.transport === 'webdav'"),
+    'client.js 仍把 WebDAV 模式当未配置远端')
 }
 process.exit(failures === 0 ? 0 : 1)
 

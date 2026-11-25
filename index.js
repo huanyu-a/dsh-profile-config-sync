@@ -522,6 +522,35 @@ async function probeRemote(url, settings) {
   return value
 }
 
+async function probeWebdavRemote(settings) {
+  const w = normalizeWebdav(settings)
+  if (!w.enabled) return null
+  const key = `webdav:${w.url}/${w.dir}`
+  const hit = remoteProbeCache.get(key)
+  if (hit && Date.now() - hit.at < REMOTE_PROBE_TTL) return hit.value
+  let value = { heads: null, files: null }
+  try {
+    const res = await testConnection(w)
+    if (res && res.ok) {
+      value = (!res.exists || res.files === 0)
+        ? { heads: 0, files: 0, transport: 'webdav' }
+        : { heads: 1, files: res.files, transport: 'webdav' }
+    } else {
+      value = { heads: null, files: null, transport: 'webdav', error: (res && res.error) || '' }
+    }
+  } catch {
+    value = { heads: null, files: null, transport: 'webdav' }
+  }
+  remoteProbeCache.set(key, { at: Date.now(), value })
+  return value
+}
+
+function clearWebdavProbeCache() {
+  for (const k of remoteProbeCache.keys()) {
+    if (String(k).startsWith('webdav:')) remoteProbeCache.delete(k)
+  }
+}
+
 /** 只读缓存，不触发任何网络动作。 */
 function probeRemoteCached(url) {
   const hit = remoteProbeCache.get(url)
@@ -537,6 +566,10 @@ function warmRemoteProbe(config) {
   const settings = readSettings(dshHome)
   const repo = resolveRepo(config?.repoPath, dshHome).repo || ''
   if (repo && repoPhase(repo) === 'ok') return
+  if (webdavActive(settings)) {
+    probeWebdavRemote(settings).catch(() => { })
+    return
+  }
   const url = settings.remoteUrl || ''
   if (!url) return
   probeRemote(url, settings).catch(() => { })
@@ -552,17 +585,20 @@ function warmRemoteProbe(config) {
  * 下次刷新（或后台预热）就能读到真值。
  */
 function probeRemoteQuick(url, settings, budgetMs) {
-  if (!url) return Promise.resolve(null)
-  const cached = probeRemoteCached(url)
+  const useWebdav = webdavActive(settings)
+  if (!url && !useWebdav) return Promise.resolve(null)
+  const w = useWebdav ? normalizeWebdav(settings) : null
+  const cacheKey = useWebdav ? `webdav:${w.url}/${w.dir}` : url
+  const cached = probeRemoteCached(cacheKey)
   if (cached) return Promise.resolve(cached)
   const unknown = { heads: null, files: null }
-  const running = probeRemote(url, settings)
+  const running = useWebdav ? probeWebdavRemote(settings) : probeRemote(url, settings)
   return new Promise((resolve) => {
     let done = false
     const timer = setTimeout(() => {
       if (done) return
       done = true
-      resolve(probeRemoteCached(url) || unknown)
+      resolve(probeRemoteCached(cacheKey) || unknown)
     }, budgetMs)
     if (typeof timer.unref === 'function') timer.unref()
     running.then((value) => {
@@ -1012,8 +1048,11 @@ async function inspect(config) {
   // 本机仓库处在哪个阶段：空白目录 = 等首次拉取，是正常状态，不该报异常
   const phase = repoPhase(repo)
   // 云端有没有「可拉的内容」：只在本地仓库还没就位时才探（真仓库不需要每次刷面板都打一次网络）
-  const remoteProbeUrl = gitRemoteUrl || settings.remoteUrl || ''
-  const remoteProbe = (remoteProbeUrl && phase !== 'ok') ? await probeRemoteQuick(remoteProbeUrl, settings, 2500) : null
+  const useWebdav = webdavActive(settings)
+  const remoteProbeUrl = useWebdav ? normalizeWebdav(settings).url : (gitRemoteUrl || settings.remoteUrl || '')
+  const remoteProbe = (remoteProbeUrl && phase !== 'ok')
+    ? await probeRemoteQuick(remoteProbeUrl, settings, 2500)
+    : null
   const remoteHeads = remoteProbe ? remoteProbe.heads : null
   // 分支指向的树里有几个文件 —— 这才是「有没有内容」的真判据：分支还在但树被删空，等同空中空
   const remoteFiles = remoteProbe ? remoteProbe.files : null
@@ -1027,8 +1066,8 @@ async function inspect(config) {
   }
   if (!repo) {
     advice.push(t(
-      '还没有配置仓库目录：请在下面的「本机仓库」卡里点「设置路径」，指向那台机器上的 dsh-config 仓库（含 apply.ps1 和 profile\\package.json）',
-      'The repo directory is not set: use the Local repo card below to point at the dsh-config repo on this machine (it must contain apply.ps1 and profile\\package.json).',
+      '还没有配置仓库目录：请在下面「本机仓库」卡的「仓库路径」框里填好目录并点「保存」（已有仓库或新空目录均可）',
+      'The repo directory is not set: enter the path in the Repo path box in the Local repo card below and click Save (an existing repo or new empty folder both work).',
     ))
   } else if (phase === 'empty' || phase === 'missing') {
     const where = phase === 'missing'
@@ -1036,10 +1075,14 @@ async function inspect(config) {
       : t(`还是空目录（${repo}）`, `is still an empty folder (${repo})`)
     if (remoteFiles === 0) {
       advice.push(t(
-        `本机仓库${where}，云端仓库也还没有任何内容：点「初始化推送」把本机配置当作初始内容推上去（自动 git init + capture + 提交 + 推送）`,
-        `The local repo ${where} and the cloud has nothing yet: use "Initialize push" to upload this machine's config as the initial content (git init + capture + commit + push).`,
+        useWebdav
+          ? `本机仓库${where}，云端 WebDAV 也还没有任何内容：点「初始化推送」把本机配置作为初始内容传上去（自动抓配置并上传 WebDAV）`
+          : `本机仓库${where}，云端仓库也还没有任何内容：点「初始化推送」把本机配置当作初始内容推上去（自动 git init + capture + 提交 + 推送）`,
+        useWebdav
+          ? `The local repo ${where} and WebDAV has nothing yet: use "Initialize push" to capture and upload this machine's config as the initial content.`
+          : `The local repo ${where} and the cloud has nothing yet: use "Initialize push" to upload this machine's config as the initial content (git init + capture + commit + push).`,
       ))
-    } else if (remoteFiles === null && remoteHeads === 0) {
+    } else if (remoteFiles === null && (remoteHeads === 0 || remoteHeads === null)) {
       advice.push(t(
         `本机仓库${where}，云端连不上/判不了（离线或认证失败）：按老规矩先只允许拉取`,
         `The local repo ${where} and the cloud cannot be determined (offline or auth failure): only Pull is allowed, as before.`,
@@ -1051,8 +1094,12 @@ async function inspect(config) {
       ))
     } else {
       advice.push(t(
-        `本机仓库${where} —— 执行「拉取」会从云端把仓库内容拉到这里（首次拉取自动初始化，不需要推送）`,
-        `The local repo ${where} — running Pull brings the repo down from the cloud (the first pull initializes it; no push needed).`,
+        useWebdav
+          ? `本机仓库${where} —— 执行「拉取」会从 WebDAV 把配置拉到这里（首次拉取自动下载并还原，不需要推送）`
+          : `本机仓库${where} —— 执行「拉取」会从云端把仓库内容拉到这里（首次拉取自动初始化，不需要推送）`,
+        useWebdav
+          ? `The local repo ${where} — running Pull downloads the repo from WebDAV into this folder (no push needed).`
+          : `The local repo ${where} — running Pull brings the repo down from the cloud (the first pull initializes it; no push needed).`,
       ))
     }
   } else if (!isRepoDir(repo)) {
@@ -1378,12 +1425,18 @@ function buildCmd(config, action, repo, appRoot, dshHome, state = {}) {
   // 铁律：GIT_SSH_COMMAND 必须以可执行程序开头。找不到 ssh.exe 时宁可不设（交给 .ssh\config），
   // 也不能输出「-i "key" -o …」——git 会把它当命令交给 sh，直接 invalid option，报错还伪装成"仓库读不到"。
   const settings = readSettings(dshHome)
+  const w = normalizeWebdav(settings)
+  const useWebdav = webdavActive(settings)
   const key = settings.sshKey || defaultSshKey()
   const hasKey = Boolean(key) && isFile(key)
   const coreSsh = readSshCommandFromGitConfig(repo)
   const sshExe = coreSsh ? '' : resolveSshExe()
   let envLines = []
-  if (hasKey && coreSsh) {
+  if (useWebdav) {
+    envLines = [
+      `echo ${echoSafe(`传输：WebDAV（${w.url} / ${w.dir}）`)}`,
+    ]
+  } else if (hasKey && coreSsh) {
     envLines = [
       `set GIT_SSH_COMMAND=${coreSsh}`,
       `echo ${echoSafe(`认证：git config core.sshCommand（私钥 ${key} 由该命令使用）`)}`,
@@ -1601,14 +1654,20 @@ function buildSh(config, action, repo, appRoot, dshHome, state = {}) {
     `-DshHome ${shQuote(dshHome)}`,
   ]
   const settings = readSettings(dshHome)
+  const w = normalizeWebdav(settings)
+  const useWebdav = webdavActive(settings)
   const key = settings.sshKey || defaultSshKey()
   const hasKey = Boolean(key) && isFile(key)
   const sshExe = hasKey ? resolveSshExe() : ''
   const envLines = []
-  if (hasKey && sshExe) {
-    envLines.push(`export GIT_SSH_COMMAND=${shQuote(`${sshExe} -i ${key} -o BatchMode=yes -o StrictHostKeyChecking=accept-new`)}`)
+  if (useWebdav) {
+    envLines.push(`echo ${shQuote(`传输：WebDAV（${w.url} / ${w.dir}）`)}`)
+  } else {
+    if (hasKey && sshExe) {
+      envLines.push(`export GIT_SSH_COMMAND=${shQuote(`${sshExe} -i ${key} -o BatchMode=yes -o StrictHostKeyChecking=accept-new`)}`)
+    }
+    envLines.push('echo "认证：未配置私钥时交给 .ssh/config 决定"')
   }
-  envLines.push('echo "认证：未配置私钥时交给 .ssh/config 决定"')
 
   const target = action === 'push' ? 'push' : 'pull'
   const label = target === 'push'
@@ -1845,6 +1904,19 @@ function psQuote(value) {
 }
 
 /**
+ * 为 PowerShell 的 `Start-Process -ArgumentList @(...)` 拼单个参数。
+ * PowerShell 5.1 会把数组元素直接用空格拼成命令行、不会自动给含空格的值加引号，
+ * 结果像 `C:\Users\...\DeepSeek Harness` 会被拆成两个参数，把后续参数全顶偏并崩溃。
+ * 这里按 Windows CommandLineToArgvW 规则把空串或含空白/引号的参数包上双引号。
+ */
+function psWinArg(value) {
+  const s = String(value == null ? '' : value)
+  if (!s) return '""'
+  if (!/[\s"]/.test(s)) return s
+  return '"' + s.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1') + '"'
+}
+
+/**
  * 拉起外部守护：等本进程退出后执行一次同步。
  *
  * 两个坑都在这踩过：
@@ -1896,7 +1968,8 @@ async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs =
   const exe = powershellExe()
   const inner = [
     // 等待态进程保持**隐藏**；可见窗口由 post-exit.ps1 在 DSH 真正退出后自己弹（-Phase run）。
-    `$p = Start-Process -FilePath ${psQuote(exe)} -ArgumentList @(${args.map(psQuote).join(', ')}) -WindowStyle Hidden -PassThru`,
+    // 每个元素先经 psWinArg 加内层双引号，防止 AppRoot/RepoRoot 含空格时被 Start-Process 拆开。
+    `$p = Start-Process -FilePath ${psQuote(exe)} -ArgumentList @(${args.map((a) => psQuote(psWinArg(a))).join(', ')}) -WindowStyle Hidden -PassThru`,
     'Write-Output $p.Id',
   ].join('; ')
   const encoded = Buffer.from(inner, 'utf16le').toString('base64')
@@ -2228,8 +2301,8 @@ async function handleSettings(req, res, config) {
       // （可能正克隆到一半）也放行，否则刚 init 完的目录会被拒。
       if (repoPath && repoPhase(repoPath) === 'unusable' && !isFile(join(repoPath, '.git', 'HEAD'))) {
         throw new Error(t(
-          `这个目录里已经有别的东西，又不像 dsh-config 仓库（缺 apply.ps1 或 profile\\package.json）：${repoPath}`,
-          `That directory already holds something else and does not look like a dsh-config repo (no apply.ps1 or profile\\package.json): ${repoPath}`,
+          `这个目录里已经有别的东西，又不像 dsh-config 仓库（缺 apply.ps1 / sync-engine.mjs 或 profile\\package.json）：${repoPath}`,
+          `That directory already holds something else and does not look like a dsh-config repo (no apply.ps1 / sync-engine.mjs or profile\\package.json): ${repoPath}`,
         ))
       }
     }
@@ -3568,15 +3641,25 @@ async function handleAuto(req, res, config) {
       }
       autoState.checking = true
       autoState.lastCheckError = ''
-      const drift = await checkDrift(repo)
+      let drift = null
+      if (webdavActive(settings)) {
+        const wp = await probeWebdavRemote(settings)
+        if (wp && wp.files !== null) {
+          drift = { ahead: 0, behind: 0, transport: 'webdav', files: wp.files, at: Date.now() }
+        } else {
+          autoState.lastCheckError = (wp && wp.error) || t('连不上 WebDAV 服务端', 'Cannot reach WebDAV server')
+        }
+      } else {
+        drift = await checkDrift(repo)
+        if (!drift) {
+          autoState.lastCheckError = t(
+            '读不到远端（fetch 失败或没有 origin），先确认云端仓库地址与 SSH',
+            'Cannot read the remote (fetch failed or there is no origin) — check the cloud repo URL and SSH setup',
+          )
+        }
+      }
       autoState.checking = false
       autoState.lastCheckAt = Date.now()
-      if (!drift) {
-        autoState.lastCheckError = t(
-          '读不到远端（fetch 失败或没有 origin），先确认云端仓库地址与 SSH',
-          'Cannot read the remote (fetch failed or there is no origin) — check the cloud repo URL and SSH setup',
-        )
-      }
       autoState.drift = drift
       sendJson(res, 200, { ok: true, action, drift, error: autoState.lastCheckError || null })
       return
@@ -3627,12 +3710,19 @@ async function handleAuto(req, res, config) {
       // 云端已有文件时拒绝，让用户先拉取（否则本机状态会被写进一份已经在用的历史里）。
       // 注意判据是「树里有文件」而不是「有分支」：远端可能只剩一个空分支，那也是空仓库，可以初始化推送。
       if (mode === 'push' && repoPhase(repo) !== 'ok') {
-        const url = (await git(repo, ['remote', 'get-url', 'origin'])) || settings.remoteUrl || ''
-        const probe = await probeRemote(url, settings)
+        const useWebdav = webdavActive(settings)
+        const url = useWebdav
+          ? normalizeWebdav(settings).url
+          : ((await git(repo, ['remote', 'get-url', 'origin'])) || settings.remoteUrl || '')
+        const probe = useWebdav ? await probeWebdavRemote(settings) : await probeRemote(url, settings)
         if (!probe || probe.files === null) {
           throw new Error(t(
-            `连不上云端、或还没有云端仓库地址（${url || '未配置'}）：初始化推送要先确认云端是空仓库`,
-            `Cannot reach the cloud or no remote URL is set (${url || 'not set'}): initialize push needs to confirm the cloud repo is still empty.`,
+            useWebdav
+              ? `连不上 WebDAV（${url || '未配置'}）：${(probe && probe.error) || '初始化推送要先确认云端是空目录'}`
+              : `连不上云端、或还没有云端仓库地址（${url || '未配置'}）：初始化推送要先确认云端是空仓库`,
+            useWebdav
+              ? `Cannot reach WebDAV (${url || 'not set'}): ${(probe && probe.error) || 'initialize push needs to confirm the cloud folder is empty.'}`
+              : `Cannot reach the cloud or no remote URL is set (${url || 'not set'}): initialize push needs to confirm the cloud repo is still empty.`,
           ))
         }
         if (probe.files > 0) {
@@ -3674,7 +3764,8 @@ function scheduleAutoStart(config) {
       // 已经排队等退出了就别重复拉起 watcher：第二遍 fetch/stat 纯属浪费
       if (autoState.pending) return
       const repo = resolveRepo(config?.repoPath, dshHome).repo || ''
-      if (!repo || !isDir(join(repo, '.git'))) {
+      const useWebdav = webdavActive(settings)
+      if (!repo || (!useWebdav && !isDir(join(repo, '.git'))) || (useWebdav && repoPhase(repo) !== 'ok')) {
         // 空目录是「等首次拉取」的正常状态：不记错误，免得面板的云端徽标把它当成 fetch 失败
         autoState.lastCheckError = (repo && repoPhase(repo) === 'empty')
           ? ''
@@ -3683,12 +3774,24 @@ function scheduleAutoStart(config) {
         return
       }
       autoState.checking = true
-      const drift = await checkDrift(repo)
-      autoState.checking = false
-      autoState.lastCheckAt = Date.now()
-      if (!drift) {
-        autoState.lastCheckError = t('读不到远端（fetch 失败或没有 origin）', 'Cannot read the remote (fetch failed or there is no origin)')
-        return
+      let drift = null
+      if (useWebdav) {
+        const wp = await probeWebdavRemote(settings)
+        autoState.checking = false
+        autoState.lastCheckAt = Date.now()
+        if (!wp || wp.files === null) {
+          autoState.lastCheckError = (wp && wp.error) || t('连不上 WebDAV 服务端', 'Cannot reach WebDAV server')
+          return
+        }
+        drift = { ahead: 0, behind: 0, transport: 'webdav', files: wp.files, at: Date.now() }
+      } else {
+        drift = await checkDrift(repo)
+        autoState.checking = false
+        autoState.lastCheckAt = Date.now()
+        if (!drift) {
+          autoState.lastCheckError = t('读不到远端（fetch 失败或没有 origin）', 'Cannot read the remote (fetch failed or there is no origin)')
+          return
+        }
       }
       autoState.drift = drift
       const appRoot = resolveAppRoot(config?.appRoot) || ''
@@ -3800,7 +3903,10 @@ async function triggerAutoSyncOnClose(config) {
       return { queued: false }
     }
 
-    const drift = await checkDrift(repo)
+    const useWebdav = webdavActive(settings)
+    const drift = useWebdav
+      ? (() => ({ ahead: 0, behind: 0, transport: 'webdav', at: Date.now() }))()
+      : await checkDrift(repo)
     if (!drift) return { queued: false }
 
     // 拉取优先，和 scheduleAutoStart 一致；关闭时不再弹确认框，云端领先就排
@@ -3818,8 +3924,10 @@ async function triggerAutoSyncOnClose(config) {
     if (settings.autoPush) {
       // 判据和 scheduleAutoStart 完全相同：领先提交 / 未提交改动 / 本机资料比上次同步新
       let dirty = 0
-      const raw = await git(repo, ['status', '--porcelain'])
-      if (raw) dirty = raw.split('\n').filter((l) => l.trim()).length
+      if (!useWebdav || isDir(join(repo, '.git'))) {
+        const raw = await git(repo, ['status', '--porcelain'])
+        if (raw) dirty = raw.split('\n').filter((l) => l.trim()).length
+      }
       const syncState = readSyncState(dshHome)
       const lp = localPending(dshHome, syncState.lastSyncAt, config?.profileName, { repo, appRoot })
       const shouldPush = drift.ahead > 0 || dirty > 0 || (lp.known && lp.pending > 0)
@@ -3856,8 +3964,8 @@ async function handlePrepare(req, res, config) {
     // 只有「压根没配过路径」才拦。
     if (!repo) {
       throw new Error(t(
-        '还没有配置仓库目录：请先在面板「本机仓库」卡里点「设置路径」，指到一个目录（本地还没有仓库时，首次拉取会自动从云端克隆）',
-        'The repo directory is not configured: set the path in the Local repo card first (if the repo is not local yet, the first pull clones it from the cloud automatically)',
+        '还没有配置仓库目录：请先在面板「本机仓库」卡的「仓库路径」框里填好目录并点「保存」（本地还没有仓库时，首次拉取会自动从云端拉取/初始化）',
+        'The repo directory is not configured: enter the path in the Repo path box in the Local repo card and click Save first (if the repo is not local yet, the first pull initializes it from the cloud automatically)',
       ))
     }
     const repoReady = isRepoDir(repo)
@@ -3866,22 +3974,30 @@ async function handlePrepare(req, res, config) {
     // 一次请求算清楚，下面 push 门禁、all 的脚本组合、bootstrap 说明都用这同一个答案。
     // 判据是「云端分支树里有没有文件」——远端只剩空分支时也算空仓库（历史被删空就是这个样子）。
     const probeSettings = readSettings(dshHome)
+    const useWebdavForPrepare = webdavActive(probeSettings)
     let remoteFilesForPrepare = null
     let remoteHeadsForPrepare = null
     if (phase !== 'ok') {
-      const probeUrl = (await git(repo, ['remote', 'get-url', 'origin'])) || probeSettings.remoteUrl || ''
-      const probe = await probeRemote(probeUrl, probeSettings)
-      remoteFilesForPrepare = probe ? probe.files : null
-      remoteHeadsForPrepare = probe ? probe.heads : null
+      if (useWebdavForPrepare) {
+        const probe = await probeWebdavRemote(probeSettings)
+        remoteFilesForPrepare = probe ? probe.files : null
+        remoteHeadsForPrepare = probe ? probe.heads : null
+      } else {
+        const probeUrl = (await git(repo, ['remote', 'get-url', 'origin'])) || probeSettings.remoteUrl || ''
+        const probe = await probeRemote(probeUrl, probeSettings)
+        remoteFilesForPrepare = probe ? probe.files : null
+        remoteHeadsForPrepare = probe ? probe.heads : null
+      }
     }
     // 空白文件夹（或还没建）代表「本机还没有仓库内容」：能不能推，取决于云端有没有内容 ——
     //   云端也空 → 允许，这次推送就是「初始化推送」（sync.ps1 会 git init + 写骨架 + capture + 提交 + 推）
     //   云端有内容 → 拒绝，先拉取（硬推会把本机状态写进一份正在使用的历史）
     if (action === 'push' && phase !== 'ok') {
       if (remoteFilesForPrepare === null) {
+        const targetHint = useWebdavForPrepare ? normalizeWebdav(probeSettings).url : (probeSettings.remoteUrl || '还没配地址')
         throw new Error(t(
-          `连不上云端仓库（${probeSettings.remoteUrl || '还没配地址'}）：初始化推送要先确认云端是空仓库，请先确认地址与网络`,
-          `Cannot reach the cloud repo (${probeSettings.remoteUrl || 'no URL configured'}): initialize push needs to confirm the cloud repo is empty — check the URL and network.`,
+          `连不上云端仓库（${targetHint}）：初始化推送要先确认云端是空仓库，请先确认地址与网络`,
+          `Cannot reach the cloud repo (${useWebdavForPrepare ? normalizeWebdav(probeSettings).url : (probeSettings.remoteUrl || 'no URL configured')}): initialize push needs to confirm the cloud repo is empty — check the URL and network.`,
         ))
       }
       if (remoteFilesForPrepare > 0) {
@@ -3895,9 +4011,10 @@ async function handlePrepare(req, res, config) {
     // 面板状态原地不动，人以为「同步过了」，实际什么都没下来。两边都空只走「推送（初始化）」。
     if (action === 'pull' && phase !== 'ok') {
       if (remoteFilesForPrepare === null) {
+        const targetHint = useWebdavForPrepare ? normalizeWebdav(probeSettings).url : (probeSettings.remoteUrl || '还没配地址')
         throw new Error(t(
-          '连不上云端仓库（' + (probeSettings.remoteUrl || '还没配地址') + '）：先确认地址与网络，再生成拉取脚本',
-          'Cannot reach the cloud repo (' + (probeSettings.remoteUrl || 'no URL configured') + '): check the URL and network before generating the pull script.',
+          '连不上云端仓库（' + targetHint + '）：先确认地址与网络，再生成拉取脚本',
+          'Cannot reach the cloud repo (' + (useWebdavForPrepare ? normalizeWebdav(probeSettings).url : (probeSettings.remoteUrl || 'no URL configured')) + '): check the URL and network before generating the pull script.',
         ))
       }
       if (remoteFilesForPrepare === 0) {
@@ -3908,9 +4025,10 @@ async function handlePrepare(req, res, config) {
       }
     }
     // 推送 / 拉取都以「云端仓库地址」为前置；还原（最新快照或指定快照）只动本机快照，不需要远端。
-    if (action !== 'restore' && action !== 'restore-backup') {
+    // 0.4.0：WebDAV 模式下不需要 git remoteUrl。
+    if (action !== 'restore' && action !== 'restore-backup' && !useWebdavForPrepare) {
       const origin = isDir(join(repo, '.git')) ? await git(repo, ['remote', 'get-url', 'origin']) : null
-      const remoteUrl = origin || readSettings(dshHome).remoteUrl
+      const remoteUrl = origin || probeSettings.remoteUrl
       if (!remoteUrl) {
         throw new Error(t(
           '还没有配置云端仓库地址：请先在面板「云端仓库」卡里填好远端地址并保存，再生成推送/拉取脚本',
@@ -4158,6 +4276,7 @@ async function handleWebdav(req, res, config) {
     if (typeof body.pass === 'string' && body.pass.length > 0) next.webdavPass = body.pass
     try {
       writeSettings(dshHome, next)
+      clearWebdavProbeCache()
       const w = normalizeWebdav(next)
       sendJson(res, 200, { ok: true, configured: Boolean(w.url), hasPassword: Boolean(w.pass), mode: w.mode })
     } catch (e) {

@@ -239,9 +239,10 @@ window.__ModuleLoader__.load({
     function summarize(data) {
       if (!data) return { kind: 'idle', text: M('尚未检测', 'Not checked yet') }
       const { repo, version, bundles, deps } = data
+      const webdavOn = Boolean(data.webdav && data.webdav.active)
       if (!repo || (!repo.exists && !repo.empty)) return { kind: 'error', text: M('仓库路径未配置（见「本机仓库」卡）', 'Repo path not set (see the Local repo card)') }
       // 云端地址缺失只算"待处理"：云端有没有更新由右侧云端徽标讲，这里不重复报错
-      if (!data.remote || !data.remote.configured) return { kind: 'warn', text: M('云端仓库地址未配置', 'Cloud remote not set') }
+      if (!webdavOn && (!data.remote || !data.remote.configured)) return { kind: 'warn', text: M('云端仓库地址未配置', 'Cloud remote not set') }
       if (bundles.unresolved.length || deps.missing.length) {
         return {
           kind: 'error',
@@ -266,7 +267,7 @@ window.__ModuleLoader__.load({
           ),
         }
       }
-      if (repo.behind === null) return { kind: 'idle', text: M('读不到本机 git 状态（git 不可用或没 upstream）', 'Cannot read local git state (git missing or no upstream)') }
+      if (!webdavOn && repo.behind === null) return { kind: 'idle', text: M('读不到本机 git 状态（git 不可用或没 upstream）', 'Cannot read local git state (git missing or no upstream)') }
       if (repo.dirty > 0) return { kind: 'warn', text: M(`本机有 ${repo.dirty} 处未提交改动，建议推送`, `${repo.dirty} uncommitted change(s) — consider pushing`) }
       if (repo.ahead > 0) return { kind: 'warn', text: M(`本机有 ${repo.ahead} 个提交还没推送`, `${repo.ahead} local commit(s) not pushed yet`) }
       // git 干净不代表没东西要推：新会话/新资料还躺在 ~\.dsh 里，没 capture 之前仓库是完全干净的
@@ -2693,6 +2694,9 @@ window.__ModuleLoader__.load({
         if (auto.checking || checking) return { kind: 'idle', text: M('云端检查中…', 'Checking the cloud…') }
         const drift = auto.drift
         if (drift) {
+          if (drift.transport === 'webdav') {
+            return { kind: 'ok', text: M(`WebDAV 已连接（云端 ${drift.files ?? 0} 项）`, `WebDAV connected (${drift.files ?? 0} item(s))`) }
+          }
           const same = drift.behind === 0 && drift.ahead === 0
           if (same) return { kind: 'ok', text: M('云端已同步到最新，无需拉取', 'Cloud is up to date — nothing to pull') }
           const parts = []
@@ -2708,7 +2712,8 @@ window.__ModuleLoader__.load({
 
       const cloudLabel = cloudLine.kind === 'ok' ? M('一致', 'In sync')
         : (cloudLine.kind === 'error' ? M('不一致', 'Out of sync')
-          : (cloudLine.kind === 'pull' ? M('待拉取', 'To pull') : M('检查中', 'Checking')))
+          : (cloudLine.kind === 'pull' ? M('待拉取', 'To pull')
+            : (cloudLine.kind === 'init' ? M('待初始化', 'To initialize') : M('检查中', 'Checking'))))
 
       // 插件更新卡：老版本机器进来第一眼就能看到"有新版本 x.y.z"和更新按钮；
       // 更新相关的配置（清单地址、只读令牌）也收在这张卡里，别散到「云端仓库」去。
@@ -3008,7 +3013,7 @@ window.__ModuleLoader__.load({
               : M('本机仓库是空的：只生成「拉取」，拉完才能推送',
                 'The local repo has no content yet: only Pull (plus Restore) can be generated now. Pull brings the whole cloud repo into this path; push unlocks after that.'))
           : null,
-        data && data.remote && !data.remote.configured
+        data && !(data.webdav && data.webdav.active) && data.remote && !data.remote.configured
           ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-error-primary)' } },
             M('远端地址未配置：只能生成还原',
               'Cloud remote not set: push/pull unavailable (restore still works).'))

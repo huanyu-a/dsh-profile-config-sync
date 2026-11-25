@@ -29,6 +29,7 @@ import {
 } from './platform.mjs'
 import { buildContract, contractPath, contractText, readContract } from './contract.mjs'
 import { listMachines, localMachineInfo, writeMachineInfo } from './machines.mjs'
+import { downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive } from './webdav.mjs'
 
 /** 占位符：仓库里存这些，落地时展开成本机路径。 */
 export const TOKENS = {
@@ -696,6 +697,16 @@ function parseArgs(argv) {
   return out
 }
 
+function readSyncSettings(dshHome) {
+  try {
+    const p = join(dshHome, 'dsh-config-sync.json')
+    if (!existsSync(p)) return {}
+    return JSON.parse(readFileSync(p, 'utf8').replace(/^\uFEFF/, ''))
+  } catch {
+    return {}
+  }
+}
+
 /** 命令行主流程。返回进程退出码。 */
 export async function runCli(argv) {
   const [cmd, ...rest] = argv
@@ -705,6 +716,9 @@ export async function runCli(argv) {
   const appRoot = a.AppRoot || a.appRoot || ''
   const workspaceHome = a.WorkspaceHome || a.workspaceHome || ''
   const profileName = a.ProfileName || a.profileName || 'desktop'
+  const syncSettings = readSyncSettings(dshHome)
+  const useWebdav = webdavActive(syncSettings)
+  const w = normalizeWebdav(syncSettings)
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log([
@@ -735,15 +749,49 @@ export async function runCli(argv) {
       return 0
     }
     if (cmd === 'push') {
+      if (useWebdav) {
+        if (!isSecureUrl(w.url)) {
+          console.error('WebDAV 地址不是 https（明文传输密码有风险）；确需使用请设 DSH_SYNC_ALLOW_INSECURE=1')
+          return 1
+        }
+        const repoReady = existsSync(join(repoRoot, 'profile', 'package.json'))
+        if (!repoReady) {
+          const probe = await testConnection(w)
+          if (!probe.ok) { console.error(`WebDAV 探测失败：${probe.error}`); return 1 }
+          if (probe.files > 0) { console.error('云端 WebDAV 已有内容，本机还是空的，请先执行拉取'); return 1 }
+          mkdirSync(repoRoot, { recursive: true })
+        }
+      }
       const r = capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName })
       for (const c of r.changed) console.log(`  + ${c}`)
       for (const e of r.errors) console.error(`  [!] ${e}`)
       console.log(`capture 完成：${r.files} 个文件 / ${r.bytes} 字节，变更 ${r.changed.length} 项`)
-      return r.ok ? 0 : 1
+      if (!r.ok) return 1
+      if (useWebdav) {
+        const up = await uploadRepo(w, repoRoot)
+        for (const e of up.errors) console.error(`  [!] ${e}`)
+        console.log(`WebDAV 上传：上传 ${up.uploaded.length} · 跳过 ${up.skipped.length} · 错误 ${up.errors.length}`)
+        return up.ok ? 0 : 1
+      }
+      return 0
     }
     if (cmd === 'pull') {
+      if (useWebdav) {
+        if (!isSecureUrl(w.url)) {
+          console.error('WebDAV 地址不是 https（明文传输密码有风险）；确需使用请设 DSH_SYNC_ALLOW_INSECURE=1')
+          return 1
+        }
+        const probe = await testConnection(w)
+        if (!probe.ok) { console.error(`WebDAV 探测失败：${probe.error}`); return 1 }
+        if (!probe.exists || probe.files <= 0) { console.error('云端 WebDAV 目录里还没有内容，请先在一台机器推送'); return 1 }
+        mkdirSync(repoRoot, { recursive: true })
+        const dn = await downloadRepo(w, repoRoot)
+        for (const e of dn.errors) console.error(`  [!] ${e}`)
+        console.log(`WebDAV 下载：下载 ${dn.downloaded.length} · 跳过 ${dn.skipped.length} · 冲突 ${dn.conflicts.length} · 错误 ${dn.errors.length}`)
+        if (!dn.ok) return 1
+      }
       const r = apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName })
-      for (const w of r.written) console.log(`  > ${w}`)
+      for (const wItem of r.written) console.log(`  > ${wItem}`)
       for (const s of r.skipped) console.log(`  - 跳过 ${s}`)
       for (const e of r.errors) console.error(`  [!] ${e}`)
       if (r.backupDir) console.log(`  被覆盖的本机文件已留底：${r.backupDir}`)

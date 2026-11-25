@@ -1,4 +1,4 @@
-﻿<#
+<#
 退出后执行同步：等 DSH 完全退出，再跑 pull 或 push（插件在 DSH 进程里，自己等不了自己退出）
 
 由插件在 DSH 运行期用 detached 方式拉起：
@@ -97,7 +97,15 @@ if ($Phase -eq 'wait') {
   if ($UpdateTgz) { $relay += @('-UpdateTgz', $UpdateTgz) }
   if ($UpdateSha256) { $relay += @('-UpdateSha256', $UpdateSha256) }
   if ($UpdateToken) { $relay += @('-UpdateToken', $UpdateToken) }
-  try { Start-Process -FilePath $pwshExe -ArgumentList $relay -WindowStyle Normal | Out-Null } catch { }
+  # PowerShell 5.1 的 Start-Process -ArgumentList 会直接用空格拼接数组元素，不会自动给含空格的路径加引号；
+  # AppRoot（例如 ...\DeepSeek Harness）带空格时直接参数绑定失败退出。这里显式按 Windows argv 规则加引号。
+  function Quote-WinArg([string]$s) {
+    if ($null -eq $s -or $s -eq '') { return '""' }
+    if ($s -notmatch '[\s"]') { return $s }
+    return '"' + ($s -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+  }
+  $quotedRelay = @($relay | ForEach-Object { Quote-WinArg ([string]$_) })
+  try { Start-Process -FilePath $pwshExe -ArgumentList $quotedRelay -WindowStyle Normal | Out-Null } catch { }
   exit 0
 }
 
@@ -720,13 +728,14 @@ if ($AppRoot) { $syncArgs['AppRoot'] = $AppRoot }
 # ---------- pull 前留一张底：HEAD + 备份快照清单 ----------
 $git = Get-GitExe
 $headBefore = ''
+$hasGitRepo = $RepoRoot -and (Test-Path -LiteralPath (Join-Path $RepoRoot '.git'))
 $backupRoot = Join-Path $DshHome 'backups'
 $backupsBefore = @()
 if ($Mode -eq 'pull') {
-  if ($git) {
+  if ($git -and $hasGitRepo) {
     $headBefore = (& $git -C $RepoRoot rev-parse HEAD 2>$null | Out-String).Trim()
     Log ("拉取前 HEAD：{0}" -f $headBefore)
-  } else {
+  } elseif (-not $git) {
     Log '找不到 git.exe，失败时将无法回滚仓库（只能回滚配置）'
   }
   if (Test-Path -LiteralPath $backupRoot) {
