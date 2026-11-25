@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/huanyu-a/dsh-profile-config-sync/compare/v0.4.0...v0.4.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* 修复含空格路径传参崩溃、WebDAV 接入拉取/推送流水线与提示文案 ([8665735](https://github.com/huanyu-a/dsh-profile-config-sync/commit/86657350aeacf489a03407b90cb8b303d2acf7f9))
+
 ## [0.4.0](https://github.com/huanyu-a/dsh-profile-config-sync/compare/v0.3.99...v0.4.0) (2026-11-25)
 
 
