@@ -16,8 +16,7 @@
     "README.md",
     "README.en.md",
     "LICENSE",
-    "runtime",
-    "tools"
+    "runtime"
   ],
   "keywords": [
     "dsh",
@@ -30,6 +29,9 @@
     "node": ">=22"
   },
   "dsh": {
+    "engines": {
+      "dsh": ">=0.2.2-rc.2"
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
@@ -44,7 +46,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/huanyu-a/dsh-profile-config-sync"
+    "url": "git+https://github.com/huanyu-a/dsh-profile-config-sync.git"
   },
   "homepage": "https://github.com/huanyu-a/dsh-profile-config-sync#readme",
   "bugs": {

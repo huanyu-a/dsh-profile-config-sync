@@ -1,0 +1,143 @@
+# Version bump, changelog, tag and npm publish — all driven by what actually
+# landed on main.
+#
+# Why one workflow and not two: a GitHub Release created by release-please uses
+# the workflow's own GITHUB_TOKEN, and events caused by GITHUB_TOKEN never start
+# another workflow. A separate "on: release: published" publisher would look
+# correct and silently never run. Publishing therefore lives in this file,
+# behind `release_created`, in the same run that makes the release.
+#
+# The version is never typed by hand. release-please reads Conventional Commits
+# since the last tag, computes the next semver, and keeps a single release PR
+# updated on every push. Merging that PR is the only manual step, and it is
+# deliberate: npm versions are immutable once published, so the last moment a
+# mistake is still cheap is the merge button.
+#
+# `workflow_dispatch` with a tag exists for the one case the push path cannot
+# cover: a release whose publish failed. The tag is already cut at that point,
+# so re-running the push job would check out the same broken commit. Dispatching
+# publishes an existing tag through this same file — which matters, because the
+# npm trusted-publisher entry is scoped to the workflow filename `release.yml`.
+#
+# This plugin differs from dsh-ssh-hub in one way that matters for the gate:
+# it has no build step (index.js / client.js are shipped as-is) and its
+# `verify` script reads an *installed* DeepSeek Harness on this machine, which
+# a bare runner does not have. The gate below therefore runs only what can be
+# measured anywhere: syntax of every shipped module, the client bundle check,
+# and an assertion that the packed tarball really contains the runtime files.
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish (empty = just refresh the release PR)'
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      release-created: ${{ steps.release.outputs.release_created }}
+      tag-name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    needs: release-please
+    # Either the release PR was merged in this run (a new tag exists), or an
+    # operator pointed a dispatch at an existing tag.
+    if: |
+      always() && (
+        (github.event_name == 'push' && needs.release-please.outputs.release-created == 'true') ||
+        (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm trusted publishing: the registry verifies this run's OIDC identity
+      # instead of a long-lived token living in a repo secret.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A dispatch publishes the tag it names; a push publishes what it just
+          # tagged, which is the commit this run was started for.
+          ref: ${{ inputs.tag || github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+
+      # The Node image ships an npm older than the trusted-publishing support
+      # (11.5+). Without this the publish authenticates as a stranger and 404s.
+      - name: Use an npm that speaks OIDC
+        run: npm install --global npm@^11.6.0
+
+      # Gate: only what a bare runner can measure. No `npm ci` — this package
+      # has zero runtime dependencies and no lockfile, so there is nothing to
+      # install and the published tarball must not depend on a CI-only tree.
+      - name: Syntax-check every shipped module
+        run: |
+          set -euo pipefail
+          node --check index.js
+          node --check client.js
+          for f in runtime/*.mjs runtime/tools/*.mjs; do node --check "$f"; done
+
+      - name: Check the client bundle
+        run: node tools/clientcheck.mjs
+
+      # The published tarball is what users install. Assert it contains the
+      # cross-platform runtime, or a green pipeline ships a package that cannot
+      # sync on macOS / Linux.
+      - name: Pack and verify the tarball contents
+        run: |
+          set -euo pipefail
+          tgz="$(npm pack --ignore-scripts 2>/dev/null | tail -n1)"
+          echo "packed: $tgz"
+          tar -tzf "$tgz" > contents.txt
+          for f in index.js client.js cordis.patch.yml \
+                    runtime/sync-engine.mjs runtime/platform.mjs runtime/machines.mjs \
+                    runtime/contract.mjs runtime/webdav.mjs; do
+            if ! grep -qx "package/$f" contents.txt; then
+              echo "::error::tarball is missing $f"
+              exit 1
+            fi
+          done
+          echo "tarball contains the full runtime"
+
+      - name: Skip if this version is already on npm
+        id: probe
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if npm view "dsh-profile-config-sync@${version}" version >/dev/null 2>&1; then
+            echo "dsh-profile-config-sync@${version} is already published — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: steps.probe.outputs.skip == 'false'
+        # No --provenance: the registry rejects the attestation with E422
+        # ("only public source repositories are supported") while this
+        # repository is private. Trusted publishing does not depend on it —
+        # the OIDC identity check happens either way.
+        run: npm publish --access public
