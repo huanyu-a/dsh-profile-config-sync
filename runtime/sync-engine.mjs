@@ -477,28 +477,73 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
  * 铺开（仓库 → 本机）。
  *
  * 关键顺序：先备份当前状态，再写；写之前检查目标是否被占用。
+ *
+ * dryRun=true 时**一个字节都不写**（审核修正：旧实现先复制再判 dryRun）。
+ * 被覆盖的本机文件留底到 <DshHome>/backups/apply-<时间戳>/，路径结构与原位置一致。
  */
+let applyBackupDir = ''
+
+/**
+ * 覆盖前留底。只备份「将被覆盖且内容不同」的本机文件；内容相同的不重复拷。
+ * src 是目录时逐文件比对。备份失败不阻断同步，但要记进 errors（否则是静默丢底）。
+ */
+function backupBeforeWrite(src, dst, dshHome, errorsRef) {
+  try {
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '')
+    const ensureDir = () => {
+      if (applyBackupDir) return applyBackupDir
+      applyBackupDir = join(dshHome, 'backups', `apply-${stamp}`)
+      mkdirSync(applyBackupDir, { recursive: true })
+      return applyBackupDir
+    }
+    const one = (s, d) => {
+      if (!existsSync(d) || !isFile(d)) return
+      let same = false
+      try { same = fileHash(s) === fileHash(d) } catch { same = false }
+      if (same) return
+      const rel = relative(dshHome, d)
+      const target = join(ensureDir(), rel.startsWith('..') ? join('outside', basename(d)) : rel)
+      mkdirSync(dirname(target), { recursive: true })
+      copyFileSync(d, target)
+    }
+    if (isDir(src)) {
+      for (const f of walk(src)) one(f.full, join(dst, fromRepoPath(f.rel)))
+    } else {
+      one(src, dst)
+    }
+  } catch (e) {
+    if (errorsRef) errorsRef.push(`备份失败（文件仍会被覆盖）：${e && e.message ? e.message : e}`)
+  }
+}
+
 export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName = 'desktop', dryRun = false } = {}) {
   const local = probeLocal({ dshHome, appRoot, workspaceHome })
   const roots = collectRoots(local)
   const written = [], skipped = [], errors = []
   let files = 0, bytes = 0
+  applyBackupDir = ''
 
   const pull = (srcRel, dst) => {
     const src = join(repoRoot, fromRepoPath(srcRel))
     if (!existsSync(src)) { skipped.push(`${srcRel}: 仓库里没有`); return }
     try {
-      const r = isDir(src) ? copyWithExpand(src, dst, roots) : copyWithExpand(src, dst, roots)
-      if (dryRun) { files += r.files; bytes += r.bytes; written.push(srcRel); return }
-      // 文本里若还有没配值的占位符，宁可跳过也不把字面量写进配置
-      if (!isDir(src) && isTextName(src) && !isBinaryName(src)) {
-        const text = readFileSync(src, 'utf8')
-        const miss = missingTokens(text)
-        if (miss.length > 0) {
-          skipped.push(`${srcRel}: 待确认路径 ${miss.join(', ')}`)
-          return
-        }
+      // dryRun 必须在**任何写盘之前**返回。旧写法先 copyWithExpand 再判 dryRun，
+      // 于是"dryRun"会把文件真的覆盖掉（审核实测：dryRun=true 后本机 package.json 已变）。
+      if (dryRun) {
+        const st = statSync(src)
+        if (st.isDirectory()) { for (const f of walk(src)) written.push(`${srcRel}/${f.rel}`) } else written.push(srcRel)
+        return
       }
+      // 文本里若还有没配值的占位符，宁可跳过也不把字面量写进配置。
+      // 这一步必须在复制**之前**做：目录级复制会连带把带占位符的文件写出去。
+      if (!isDir(src) && isTextName(src) && !isBinaryName(src)) {
+        const miss = missingTokens(readFileSync(src, 'utf8'))
+        if (miss.length > 0) { skipped.push(`${srcRel}: 待确认路径 ${miss.join(', ')}`); return }
+      }
+      // 覆盖前留底：被覆盖的本机文件先拷到 backups/apply-<时间戳>/，与 PowerShell 版语义一致。
+      // 不留底 = 用户没推送的本地改动被静默清掉，且无处可寻。
+      backupBeforeWrite(src, dst, local.dshHome, errors)
+      const r = isDir(src) ? copyWithExpand(src, dst, roots) : copyWithExpand(src, dst, roots)
       files += r.files
       bytes += r.bytes
       written.push(srcRel)
@@ -519,7 +564,7 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   pull('skills', join(local.dshHome, 'skills'))
   pull('presets', join(local.dshHome, '.agent-presets'))
 
-  return { ok: errors.length === 0, written, skipped, errors, files, bytes, local }
+  return { ok: errors.length === 0, written, skipped, errors, files, bytes, local, backupDir: applyBackupDir }
 }
 
 /**
@@ -701,6 +746,7 @@ export async function runCli(argv) {
       for (const w of r.written) console.log(`  > ${w}`)
       for (const s of r.skipped) console.log(`  - 跳过 ${s}`)
       for (const e of r.errors) console.error(`  [!] ${e}`)
+      if (r.backupDir) console.log(`  被覆盖的本机文件已留底：${r.backupDir}`)
       console.log(`apply 完成：写入 ${r.written.length} 项 / ${r.files} 个文件，跳过 ${r.skipped.length} 项`)
       return r.ok ? 0 : 1
     }
@@ -722,9 +768,18 @@ export async function runCli(argv) {
         console.error(`快照里没有 profile/：${snapDir}`)
         return 2
       }
+      const restoreBackupRoot = join(dshHome, 'backups', `restore-before-${new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '')}`)
       mkdirSync(profileDir, { recursive: true })
-      copyWithExpand(src, profileDir, collectRoots({ appRoot, dshHome, workspaceHome }))
+      // 还原同样是"覆盖本机"：先把当前 profile 留底，否则还原错了没有回头路。
+      for (const f of walk(profileDir)) {
+        const target = join(restoreBackupRoot, fromRepoPath(f.rel))
+        mkdirSync(dirname(target), { recursive: true })
+        copyFileSync(f.full, target)
+      }
+      // 根必须用探测值（appRoot 可能为空串）——否则 {{APP_ROOT}} 会被展开成空，写出坏路径
+      copyWithExpand(src, profileDir, collectRoots(probeLocal({ dshHome, appRoot, workspaceHome })))
       console.log(`已从 ${snapDir} 还原 profile → ${profileDir}`)
+      console.log(`还原前的 profile 已留底：${restoreBackupRoot}`)
       return 0
     }
     console.error(`未知命令：${cmd}（用 help 看用法）`)

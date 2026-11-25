@@ -23,7 +23,7 @@
 
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join, sep as SEP } from 'node:path'
+import { dirname, join, sep as SEP } from 'node:path'
 
 /** WebDAV 方法体里常用的 XML 命名空间。 */
 const NS_DAV = 'DAV:'
@@ -69,14 +69,24 @@ export function isSecureUrl(url) {
   }
 }
 
-/** 拼出某个相对路径在 WebDAV 上的完整 URL。 */
+/**
+ * 拼出某个相对路径在 WebDAV 上的完整 URL。
+ *
+ * **每一段都必须百分号编码**：仓库里有中文文件名（同步-推送.cmd、中文工作区名）、
+ * 带空格的目录，还有 `#` `?` 这类在 URL 里有语法含义的字符。不编码的话，
+ * 空格直接让请求失败，`#` 后面的内容被当 fragment 截掉 —— 写到了错的资源上。
+ * `/` 保留为分隔符，所以按段编码而不是整串编码。
+ */
 export function remoteUrlFor(w, relPath) {
   const base = String(w.url || '').replace(/\/+$/, '')
   const dir = String(w.dir || '').replace(/^\/+|\/+$/g, '')
   const rel = String(relPath || '').split('\\').join('/').replace(/^\/+/, '')
+  const enc = (p) => p.split('/').filter(Boolean).map((seg) => encodeURIComponent(seg)).join('/')
   const parts = [base]
-  if (dir) parts.push(dir)
-  if (rel) parts.push(rel)
+  const encDir = enc(dir)
+  const encRel = enc(rel)
+  if (encDir) parts.push(encDir)
+  if (encRel) parts.push(encRel)
   return parts.join('/')
 }
 
@@ -290,10 +300,19 @@ export async function uploadRepo(w, localRepo, { dryRun = false } = {}) {
   const mkdir = await ensureRemoteDir(w, '')
   if (!mkdir.ok) errors.push(`建目录失败：${mkdir.error}`)
 
+  // 旧判据用 basename 去查"根目录一层"的 PROPFIND 结果：
+  //   - 子目录文件永远查不到 → 每次全量重传（不省流量）；
+  //   - 根目录同名文件**只比长度** → 同长度、内容不同被判"已存在"而静默跳过
+  //     （审核实测：AGENTS.md 从 "version A" 改成 "version B"，云端永远停在 A）。
+  // 现在改为：递归列远端全部文件 + 逐个比 sha256，内容真相同才跳过。
   const remote = await listRemote(w, '')
   if (!remote) {
     return { ok: false, uploaded, skipped, errors: [...errors, '读不到云端目录（PROPFIND 失败）'] }
   }
+
+  const remoteFiles = remote.exists ? await listRemoteRecursive(w, '') : []
+  const remoteMeta = await listRemoteMeta(w, '')
+  const remoteSet = new Set(remoteFiles)
 
   const files = listLocalFiles(localRepo)
   for (const rel of files) {
@@ -302,12 +321,18 @@ export async function uploadRepo(w, localRepo, { dryRun = false } = {}) {
       errors.push(`${rel}: ${e && e.message ? e.message : e}`)
       continue
     }
-    const hash = contentHash(buf)
-    const existing = remote.entries.get(basename(rel))
-    // 远端已有同名文件：只在内容不同时传（省流量，也避免无谓的 mtime 变化）
-    if (existing && existing.size === buf.length) {
-      skipped.push(rel)
-      continue
+    // 远端有同名文件：只在内容**真的**相同时跳过。
+    //
+    // 不能信 etag（审核实测）："强 etag"只保证对同一资源的表示唯一，不保证按内容算。
+    // 很多服务器（含常见 NAS 的 WebDAV）用 size+mtime 拼 etag —— 两次同长度的写在同一毫秒
+    // 落盘时 etag 完全相同、内容却不同；反过来别处拷过来的同内容文件 mtime 变了，etag 又不同。
+    // 两种情况都会判错。所以只认 sha256：size 不同直接判不同，size 相同才 GET 下来比哈希。
+    if (remoteSet.has(rel)) {
+      const meta = remoteMeta.get(rel)
+      if (meta && meta.size === buf.length) {
+        const remoteBuf = await getFile(w, rel)
+        if (remoteBuf && contentHash(remoteBuf) === contentHash(buf)) { skipped.push(rel); continue }
+      }
     }
     if (dryRun) { uploaded.push(rel); continue }
     const dir = dirname(rel).split('/').filter(Boolean)
@@ -374,22 +399,28 @@ export async function downloadRepo(w, localRepo, { dryRun = false } = {}) {
 
 /** 递归列远端所有文件（逐层 PROPFIND）。 */
 async function listRemoteRecursive(w, relDir, depth = 0) {
-  const out = []
+  return [...(await walkRemote(w, relDir, depth)).keys()]
+}
+
+/** 递归列远端所有文件，并带上 PROPFIND 给的 size / etag（上传时的快筛依据）。 */
+async function listRemoteMeta(w, relDir) {
+  return walkRemote(w, relDir, 0)
+}
+
+/** 共用遍历：返回 Map<relPath, {size, etag, mtime}>。 */
+async function walkRemote(w, relDir, depth = 0) {
+  const out = new Map()
   if (depth > 12) return out
   const res = await listRemote(w, relDir)
   if (!res) return out
   const baseDir = String(relDir || '').replace(/^\/+|\/+$/g, '')
-  // 先收本层文件
-  for (const name of res.entries.keys()) {
-    out.push(baseDir ? `${baseDir}/${name}` : name)
+  for (const [name, meta] of res.entries) {
+    out.set(baseDir ? `${baseDir}/${name}` : name, meta)
   }
-  // 再下钻子目录：需要列目录，PROPFIND 的 collection 标记在上面被跳过了，
-  // 所以这里用另一种方式：对每个可能的子目录再 PROPFIND 一次。
-  // WebDAV 服务器都会在 Depth:1 里带 collection 条目，所以改用一个独立调用。
   const dirs = await listRemoteDirs(w, relDir)
   for (const d of dirs) {
     const childRel = baseDir ? `${baseDir}/${d}` : d
-    out.push(...await listRemoteRecursive(w, childRel, depth + 1))
+    for (const [k, v] of await walkRemote(w, childRel, depth + 1)) out.set(k, v)
   }
   return out
 }

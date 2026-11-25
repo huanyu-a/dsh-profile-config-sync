@@ -32,29 +32,43 @@ export const MACHINES_DIR = 'machines'
  * 生成本机机器 ID。
  *
  * 不随机：同机重启必须得到同一个 id（否则每次推送都新建一份，清单会爆炸）。
- * 组成：平台族 + 主机名 + 用户名 hash 的短码。
- * 用 hash 而非明文用户名：机器 id 会进仓库，用户名算半敏感信息。
+ * 组成：平台族 + 主机名/用户名的**不可逆短哈希**。
+ *
+ * 为什么不再嵌明文主机名：id 会进仓库并推到远端（含 WebDAV），
+ * `windows-DESKTOP-VVPUJP9-alice` 等于把主机名和用户名一起发出去。
+ * 哈希后同一台机器仍然稳定，但读不出原始值。
  */
 export function machineId() {
   const os = platformFamily()
-  const host = String(hostname() || 'unknown').trim() || 'unknown'
+  let host = ''
   let user = ''
-  try { user = String(process.env.USER || process.env.USERNAME || '').trim() } catch { /* 忽略 */ }
-  // 主机名里常有空格/点（macOS 的 "xxx's MacBook"），清洗成路径安全的短名
-  const safeHost = host.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'host'
-  if (!user) return `${os}-${safeHost}`
-  // 极轻量的确定性 hash（不需要 crypto，避免 id 里出现 +/= 等需转义字符）
-  let h = 0
-  for (let i = 0; i < user.length; i++) h = ((h << 5) - h + user.charCodeAt(i)) | 0
-  const tag = Math.abs(h).toString(36).slice(0, 4).padStart(4, '0')
-  return `${os}-${safeHost}-${tag}`
+  try { host = String(hostname() || '').trim().toLowerCase() } catch { /* 忽略 */ }
+  try { user = String(process.env.USER || process.env.USERNAME || '').trim().toLowerCase() } catch { /* 忽略 */ }
+  return `${os}-${shortHash(`${host}|${user}`)}`
+}
+
+/** 稳定的短哈希（8 位 base36）。空输入给固定值，不随机。 */
+function shortHash(input) {
+  const s = String(input || '')
+  // FNV-1a 32bit：确定性、无依赖、输出只含数字和字母
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(36).padStart(7, '0').slice(0, 8)
 }
 
 /**
  * 本机的完整身份记录（写入 machines/<id>.json）。
  *
- * 刻意**不记**的东西：仓库路径、远端地址、SSH 私钥路径 —— 那些是本机私有设置，
- * 已经在本机 `dsh-config-sync.json` 里，进仓库等于泄露本机目录结构。
+ * **这个文件会进仓库、被推到远端**，所以只记"判断兼容性真正需要"的字段：
+ *   平台 / 架构 / 系统版本 / 客户端版本 / 最后同步时间。
+ *
+ * 刻意**不记**（审核修正）：仓库路径、appRoot、dshHome、工作区根、主机名、用户名。
+ * 它们是本机私有信息，之前的实现把绝对路径和主机名原样写进去并推到远端，
+ * 等于把本机目录结构和用户名泄露给了任何能读到仓库的人/服务（含 WebDAV）。
+ * hostname 也不进 id：改用主机名的不可逆短哈希区分机器，同一台机器仍稳定。
  */
 export function localMachineInfo(extra = {}) {
   return {
@@ -65,16 +79,11 @@ export function localMachineInfo(extra = {}) {
     osFamily: platformFamily(),
     osRelease: (() => { try { return release() } catch { return '' } })(),
     arch: (() => { try { return arch() } catch { return '' } })(),
-    hostname: (() => { try { return hostname() } catch { return '' } })(),
-    // 与 profile/package.json 无关的本机事实，用于「这份配置能不能直接铺到本机」判断
+    // 判断"这份配置能不能直接铺到本机"只需要版本，不需要任何本机路径
     dshVersion: extra.dshVersion || '',
-    appRoot: extra.appRoot || '',
-    dshHome: extra.dshHome || '',
-    workspaceHome: extra.workspaceHome || '',
     // 最后一次动作与时间：面板要显示「上次同步来自哪台」
     lastSyncAt: extra.lastSyncAt || '',
     lastMode: extra.lastMode || '',
-    // 推上去的配置里包含哪些组（本机勾选的结果快照，仅作参考，不是权威）
     pluginCount: extra.pluginCount || 0,
     updatedAt: new Date().toISOString(),
   }
@@ -158,7 +167,6 @@ export function listMachines(repoRoot) {
       osLabel: info.osLabel || info.os || '',
       osFamily: info.osFamily || '',
       arch: info.arch || '',
-      hostname: info.hostname || '',
       dshVersion: info.dshVersion || '',
       lastSyncAt: info.lastSyncAt || '',
       lastMode: info.lastMode || '',
