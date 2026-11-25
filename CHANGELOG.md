@@ -1,0 +1,13 @@
+# Changelog
+
+## [0.5.0](https://github.com/huanyu-a/dsh-profile-config-sync/compare/v0.4.0...v0.5.0) (2026-11-25)
+
+
+### Features
+
+* 0.4.0 多端通用（Windows/macOS/Linux）+ WebDAV 同步通道 ([e1f5e0e](https://github.com/huanyu-a/dsh-profile-config-sync/commit/e1f5e0e2cb140a652bb192dfb7651a0bb062ead4))
+
+
+### Bug Fixes
+
+* 深度审核发现的 6 个缺陷（含 1 个静默数据丢失、1 个隐私泄露） ([d243241](https://github.com/huanyu-a/dsh-profile-config-sync/commit/d243241dabd0cf08902a568b319f8ca5a8efe4be))
