@@ -122,22 +122,31 @@ jobs:
           done
           echo "tarball contains the full runtime"
 
-      - name: Skip if this version is already on npm
+      # Skip when this version is already live OR already staged. `npm view` only
+      # sees live versions; without the staged check, a re-run before approval
+      # would stage a duplicate.
+      - name: Skip if this version is already on npm (live or staged)
         id: probe
         run: |
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
           if npm view "dsh-profile-config-sync@${version}" version >/dev/null 2>&1; then
-            echo "dsh-profile-config-sync@${version} is already published — nothing to do."
+            echo "dsh-profile-config-sync@${version} is already live — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif npm stage list "dsh-profile-config-sync" 2>/dev/null | grep -q "${version}"; then
+            echo "dsh-profile-config-sync@${version} is already staged — waiting for approval."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Publish to npm
+      # `npm stage publish`, not `npm publish`: this package's trusted publisher
+      # is scoped to *stage* publish only (least privilege). Staging requires no
+      # 2FA, which is also what lets CI publish at all — the account has 2FA on,
+      # and a direct `npm publish` would fail with EOTP on a headless runner.
+      # The version then waits under "Staged Packages" on npmjs.com until a
+      # maintainer approves it with 2FA; only then does it become installable.
+      # Requires npm >= 11.15 (installed above) and Node >= 22.14.
+      - name: Stage to npm (awaiting maintainer approval)
         if: steps.probe.outputs.skip == 'false'
-        # No --provenance: the registry rejects the attestation with E422
-        # ("only public source repositories are supported") while this
-        # repository is private. Trusted publishing does not depend on it —
-        # the OIDC identity check happens either way.
-        run: npm publish --access public
+        run: npm stage publish --access public
