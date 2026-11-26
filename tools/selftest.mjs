@@ -636,7 +636,7 @@ if (prevScope === null) { try { unlinkSync(scopeFile) } catch { } } else writeFi
   // 0.3.64 起改成「展示 6 分钟后自动关窗」：远程桌面/无焦点时 ReadKey 会一直卡住，
   // 用户要的是别让窗口永远挡在前面。所以断言改成盯 Start-Sleep 而不是 ReadKey。
   check('推送/拉取完成后进度窗口保留一段时间再自动关闭（不再卡在 ReadKey）',
-    postExitSrc.includes("if ($Mode -eq 'pull' -or $Mode -eq 'push'") && /Start-Sleep -Seconds 360/.test(postExitSrc) && !postExitSrc.includes('RawUI.ReadKey'),
+    postExitSrc.includes("if ($Mode -eq 'pull' -or $Mode -eq 'push'") && /\[int\]\$HoldSeconds = 360/.test(postExitSrc) && /Start-Sleep -Seconds \$HoldSeconds/.test(postExitSrc) && !postExitSrc.includes('RawUI.ReadKey'),
     postExit || 'post-exit.ps1')
   check('插件更新完成后窗口同样留着（不与同步窗口两套行为）',
     /-eq 'pull'.*?-eq 'push'.*?-eq 'update'/.test(postExitSrc) && postExitSrc.includes('插件更新已完成'),
@@ -1014,7 +1014,7 @@ if (!existsSync(repoArg) || !existsSync(pluginRuntime) || !repoReady) {
     if (!existsSync(source)) detail = `插件 runtime 没有 ${name}`
     else {
       same = readFileSync(mirror).equals(readFileSync(source))
-      if (!same) detail = `副本 ${readFileSync(mirror).length}B / 正本 ${readFileSync(source).length}B，跑 tools/sync-plugin-mirror.ps1 重新同步`
+      if (!same) detail = `副本 ${readFileSync(mirror).length}B / 正本 ${readFileSync(source).length}B，从 runtime/tools/ 逐字节覆盖`
     }
     check(`执行体副本与插件 runtime 逐字节一致：${name}`, same, detail)
   }
@@ -1026,7 +1026,7 @@ if (!existsSync(repoArg) || !existsSync(pluginRuntime) || !repoReady) {
   } else {
     const toolSame = existsSync(sourceTool) && readFileSync(mirrorTool).equals(readFileSync(sourceTool))
     check('执行体副本与插件 runtime 逐字节一致：tools/fix-session-cwd.mjs', toolSame,
-      existsSync(sourceTool) ? '内容已漂移，跑 tools/sync-plugin-mirror.ps1 重新同步' : '插件 runtime 没有 tools/fix-session-cwd.mjs')
+      existsSync(sourceTool) ? '内容已漂移，从 runtime/tools/ 逐字节覆盖' : '插件 runtime 没有 tools/fix-session-cwd.mjs')
   }
   for (const tname of ['session-log-guard.mjs', 'session-log-lib.mjs', 'bili-state.mjs']) {
     const m = join(repoArg, 'tools', tname)
@@ -1037,7 +1037,7 @@ if (!existsSync(repoArg) || !existsSync(pluginRuntime) || !repoReady) {
     }
     const ok = existsSync(s) && readFileSync(m).equals(readFileSync(s))
     check(`执行体副本与插件 runtime 逐字节一致：tools/${tname}`, ok,
-      existsSync(s) ? '内容已漂移，跑 tools/sync-plugin-mirror.ps1 重新同步' : `插件 runtime 没有 tools/${tname}`)
+      existsSync(s) ? '内容已漂移，从 runtime/tools/ 逐字节覆盖' : `插件 runtime 没有 tools/${tname}`)
   }
 }
 

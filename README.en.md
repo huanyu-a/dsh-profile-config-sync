@@ -39,9 +39,9 @@ Package name **`dsh-profile-config-sync`** (the npm package `dsh-config-sync` is
 |---|---|
 | npm | `npm i dsh-profile-config-sync` — **npm only has `0.4.1`**, without the 0.6.x safety fixes |
 | Plugin market | Search “Config Backup & Sync” in the client's plugin market (via the git commit registered in `market-index.json`) |
-| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.39.tgz` |
+| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.40.tgz` |
 
-**Release status**: the GitHub Release is `v0.5.0` (2026-11-25) while this build is `0.6.39` — install the local tgz on machine B, not the Release. The panel's update check never downgrades (it requires a strictly greater remote version).
+**Release status**: the latest release is [`v0.6.40`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.40) (2026-11-26) and the repository is public; the npm package is awaiting publish approval.
 
 ## Known limits
 

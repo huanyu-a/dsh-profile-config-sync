@@ -110,7 +110,8 @@ check('客户端会调 /config-sync/settings 保存远端与私钥', /\/config-s
 check('客户端有可编辑的「本机仓库」卡（repoPath 走设置接口）', source.includes('function RepoCard') && source.includes('callSettings({ repoPath: path })'))
 check('没配仓库时强制停在编辑态、且不提供取消', /forced/.test(source) && /forced \? null :/.test(source))
 check('没配仓库时生成按钮被禁用', source.includes('disabled: busy || !canPush || noRemote'))
-check('云端仓库缺配置时也强制编辑态（无取消）', /missing \? null :/.test(source) && source.includes('云端仓库地址'))
+check('云端仓库缺配置时也强制编辑态（无取消）', /\(!wdConfigured && !gitConfigured\) \? null :/.test(source) && source.includes('云端仓库与同步方式'))
+check('强制编辑态时不渲染「取消」按钮（forced ? null）', /forced \? null :/.test(source))
 check('云端仓库没配时推送/拉取禁用、还原仍可用',
   source.includes('disabled: busy || !canPull || noRemote')
     && source.includes("disabled: busy || !hasRepoPath, onClick: () => prepare('restore')"))
