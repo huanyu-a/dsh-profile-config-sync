@@ -7,3 +7,7 @@ node_modules/
 
 # 安装包：仓库里只留最新一版，历史版本归档到 GitHub Releases（发版时 git add -f）
 releases/*.tgz
+
+# 根目录打包产物（发布时作为 Release 资产上传，不进 git）
+/dsh-profile-config-sync-*.tgz
+

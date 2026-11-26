@@ -362,6 +362,41 @@ export function homeDisplay() {
 }
 
 /** 是否支持符号链接（POSIX 恒 true；Windows 上创建 junction 不需要管理员）。 */
+/**
+ * 自选同步目录的路径归一化（按平台分档校验）。
+ *
+ * 为什么单独抽出来：这段逻辑曾经写死 Windows 语义，POSIX 上 /Users/x/docs 会被
+ * 「把 / 换成 \」后判成非法再静默丢弃 —— 面板显示保存成功，实际一条都没存。
+ * 现在被拒的路径会收集进 dropped，由调用方整批报错，绝不静默丢。
+ */
+export function normalizeSyncExtraPaths(list, platform = process.platform) {
+  const win = platform === 'win32'
+  const paths = []
+  const dropped = []
+  const used = new Set()
+  const baseName = (s) => String(s).replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'extra'
+  for (const item of Array.isArray(list) ? list : []) {
+    if (!item || typeof item.src !== 'string' || !item.src.trim()) continue
+    const raw = item.src.trim()
+    // Windows 上允许用户写正斜杠（C:/a/b），统一成反斜杠；POSIX 原样保留
+    const abs = win ? raw.replace(/\//g, '\\') : raw
+    const okPath = win
+      ? (/^[A-Za-z]:[\\/]/.test(abs) || abs.startsWith('\\\\'))
+      : abs.startsWith('/')
+    const okAbs = win ? (abs.startsWith('\\\\') || /^[A-Za-z]:\\/.test(abs)) : abs.startsWith('/')
+    if (!okPath || !okAbs) { dropped.push(raw); continue }
+    const label = (typeof item.label === 'string' && item.label.trim())
+      ? item.label.trim()
+      : (typeof item.id === 'string' && item.id.trim() ? item.id.trim() : baseName(abs))
+    let id = String(label).replace(/[\\/:*?"<>|\s]+/g, '-').replace(/^-+|-+$/g, '') || 'extra'
+    let n = 2
+    const root = id
+    while (used.has(id.toLowerCase())) id = `${root}-${n++}`
+    used.add(id.toLowerCase())
+    paths.push({ id, src: abs, label })
+  }
+  return { paths, dropped }
+}
 export function supportsSymlink() {
   return !IS_WIN
 }

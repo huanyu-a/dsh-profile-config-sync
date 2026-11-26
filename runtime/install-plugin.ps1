@@ -35,6 +35,92 @@ if (-not $LogFile) {
   if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
   $LogFile = Join-Path $logDir ("plugin-install-{0}.log" -f $stamp)
 }
+# ---------- 环境自愈：模块被别的 PowerShell 版本抢走时，这一步决定后面还能不能跑 ----------
+# 实测：DSH 从 pwsh（PowerShell 7）里启动时，子进程 powershell.exe 5.1 继承了 PS7 的 PSModulePath，
+# 自动加载先撞上 PS7 的 Microsoft.PowerShell.Utility（7.0.0.0，5.1 装不进去），于是
+# Get-FileHash / Invoke-WebRequest 直接「无法识别」——更新流程把空 hash 当校验失败，永远装不上。
+try {
+  if ($PSVersionTable -and $PSVersionTable.PSEdition -ne 'Core') {
+    $selfModules = Join-Path $PSHOME 'Modules'
+    if ($selfModules -and (Test-Path -LiteralPath $selfModules)) {
+      $cur = [string]$env:PSModulePath
+      $rest = @($cur -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ne $selfModules.TrimEnd('\')) })
+      $env:PSModulePath = (@($selfModules) + $rest) -join ';'
+    }
+  }
+} catch { }
+
+# Get-FileHash 的 .NET 等价实现：模块加载失败时也别让一个 cmdlet 决定整条链路生死
+if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+  function Get-FileHash {
+    param(
+      [Parameter(Mandatory = $true)][string]$LiteralPath,
+      [ValidateSet('SHA256', 'SHA1', 'MD5')][string]$Algorithm = 'SHA256'
+    )
+    $algo = [System.Security.Cryptography.HashAlgorithm]::Create($Algorithm)
+    $fs = [System.IO.File]::Open($LiteralPath, 'Open', 'Read', 'ReadWrite')
+    try { $bytes = $algo.ComputeHash($fs) } finally { $fs.Dispose(); $algo.Dispose() }
+    [pscustomobject]@{
+      Algorithm = $Algorithm
+      Hash      = (($bytes | ForEach-Object { $_.ToString('X2') }) -join '')
+      Path      = $LiteralPath
+    }
+  }
+}
+
+# 下载兜底：Invoke-WebRequest 不可用（或被策略挡掉）时直接用 .NET，带上同样的头与超时
+function Save-UrlToFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$Uri,
+    [Parameter(Mandatory = $true)][string]$OutFile,
+    [hashtable]$Headers = @{},
+    [int]$TimeoutSec = 180
+  )
+  # 这个兜底实现（HttpWebRequest）在 5.1 里会把 Authorization 头吃掉（实测：头存进对象但发不出去），
+  # 所以带令牌的下载宁可直接报错并给出办法，也不让用户对着一个没头没脑的 401 猜。
+  foreach ($hk in @($Headers.Keys)) {
+    if ([string]$hk -ieq 'Authorization') {
+      throw '当前 PowerShell 环境不支持带令牌下载（模块被别的 PowerShell 版本占用了）：请在面板里用「更新」，或从开始菜单/桌面重新启动 DSH 后重试'
+    }
+  }
+  $req = [System.Net.HttpWebRequest]::Create($Uri)
+  $req.Timeout = $TimeoutSec * 1000
+  $req.ReadWriteTimeout = $TimeoutSec * 1000
+  $req.UserAgent = 'dsh-profile-config-sync'
+  foreach ($k in @($Headers.Keys)) {
+    $v = [string]$Headers[$k]
+    if ($k -eq 'User-Agent') { $req.UserAgent = $v } else { $req.Headers[$k] = $v }
+  }
+  $resp = $req.GetResponse()
+  try {
+    $in = $resp.GetResponseStream()
+    $out = [System.IO.File]::Create($OutFile)
+    try { $in.CopyTo($out) } finally { $out.Dispose() }
+  } finally { $resp.Close() }
+}
+
+# 统一下载入口：优先 cmdlet，缺失时自动走 Save-UrlToFile
+function Invoke-DownloadFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$Uri,
+    [Parameter(Mandatory = $true)][string]$OutFile,
+    [hashtable]$Headers = @{},
+    [int]$TimeoutSec = 180
+  )
+  Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+  # 注意：Get-Command 只表示「命令能被发现」，不代表能执行 —— PS7 的模块目录排在 PSModulePath 前面时，
+  # Invoke-WebRequest 会被解析到装不进 5.1 的版本，调用当场抛装配错误（实测）。所以必须 try/catch 兜底，
+  # 而不是只看命令在不在。
+  if (Get-Command Invoke-WebRequest -ErrorAction SilentlyContinue) {
+    try {
+      Invoke-WebRequest -Uri $Uri -Headers $Headers -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec
+      return
+    } catch {
+      Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+    }
+  }
+  Save-UrlToFile -Uri $Uri -OutFile $OutFile -Headers $Headers -TimeoutSec $TimeoutSec
+}
 function Log([string]$text) {
   $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $text
   try { Add-Content -LiteralPath $LogFile -Value $line -Encoding utf8 } catch { }
@@ -90,7 +176,7 @@ if ($TgzFile -and (Test-Path -LiteralPath $TgzFile)) {
   foreach ($u in $urls) {
     Log ("尝试下载：{0}" -f $u)
     try {
-      Invoke-WebRequest -Uri $u.Trim() -OutFile $tmp -UseBasicParsing -TimeoutSec 90
+      Invoke-DownloadFile -Uri $u.Trim() -OutFile $tmp -TimeoutSec 90
       if ((Test-Path -LiteralPath $tmp) -and ((Get-Item -LiteralPath $tmp).Length -gt 0)) {
         $pkgPath = $tmp
         Log ("下载成功：{0:N0} 字节" -f (Get-Item -LiteralPath $tmp).Length)
@@ -110,8 +196,13 @@ if ($TgzFile -and (Test-Path -LiteralPath $TgzFile)) {
 }
 
 if ($Sha256) {
-  $hash = (Get-FileHash -LiteralPath $pkgPath -Algorithm SHA256).Hash.ToLower()
-  Log ("sha256：{0}" -f $hash)
+  $hash = ''
+  try { $hash = [string]((Get-FileHash -LiteralPath $pkgPath -Algorithm SHA256).Hash) } catch { $hash = '' }
+  $hash = $hash.Trim().ToLower()
+  Log ("sha256：{0}" -f $(if ($hash) { $hash } else { '（算不出来）' }))
+  if (-not $hash) {
+    EmitResult $false '本机 PowerShell 无法计算安装包 sha256（Get-FileHash 不可用且 .NET 回退也失败）' ''
+  }
   if ($hash -ne $Sha256.ToLower()) {
     Log 'sha256 与清单不一致，放弃安装'
     Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue

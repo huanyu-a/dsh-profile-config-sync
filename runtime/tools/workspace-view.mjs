@@ -56,9 +56,13 @@ function writeJsonAtomic(path, obj) {
   try {
     fs.writeFileSync(tmp, text, 'utf8')
     try {
-      fs.copyFileSync(tmp, path)
-    } finally {
-      try { fs.unlinkSync(tmp) } catch { }
+      // 同盘 rename 才是原子替换：copyFileSync 是「截断目标再写」，
+      // 宿主在这一瞬间读到的是半截 JSON —— workspace.json 会被当成空表重建（工作区列表瞬间清空）。
+      fs.renameSync(tmp, path)
+    } catch {
+      // Windows 上目标被别的进程打开时 rename 会 EPERM/EBUSY：退回拷贝，
+      // 只是失去原子性，比直接写错强。
+      try { fs.copyFileSync(tmp, path) } finally { try { fs.unlinkSync(tmp) } catch { } }
     }
   } catch (error) {
     try { fs.unlinkSync(tmp) } catch { }

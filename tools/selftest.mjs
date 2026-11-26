@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { apply } from '../index.js'
 
 const repoArg = process.argv[2] || 'D:\\dsh-config'
@@ -309,8 +309,14 @@ if (repoReady) {
   if (existsSync(againPayload.path || '')) {
     const text = readFileSync(againPayload.path, 'utf8')
     const keyInFile = okPayload.remote && okPayload.remote.sshKey
-    check('push 脚本带 GIT_SSH_COMMAND', text.includes('GIT_SSH_COMMAND'))
-    check('push 脚本里的私钥路径与设置一致', Boolean(keyInFile) && text.includes(keyInFile), keyInFile || '(无)')
+    // 没配私钥时脚本里本来就不该有 GIT_SSH_COMMAND（认证交给 .ssh\config 或 Git 凭据管理器）——
+    // 旧断言不分情况一律要求它存在，在没配私钥的机器上必然失败。
+    if (keyInFile) {
+      check('push 脚本带 GIT_SSH_COMMAND', text.includes('GIT_SSH_COMMAND'))
+      check('push 脚本里的私钥路径与设置一致', text.includes(keyInFile), keyInFile)
+    } else {
+      check('没配私钥时不注入 GIT_SSH_COMMAND（认证交给 .ssh\\config）', !text.includes('GIT_SSH_COMMAND'))
+    }
     restoreCmd(againPayload.path)
   }
 } else {
@@ -387,7 +393,19 @@ check('scope 列出十二组同步内容', Array.isArray(scopeBody.groups) && sc
 check('scope 每组都带标题 / 说明 / 明细项',
   (scopeBody.groups || []).every((g) => g && typeof g.title === 'string' && typeof g.desc === 'string' && Array.isArray(g.items)),
   (scopeBody.groups || []).map((g) => g.id).join(', '))
-check('没配过时默认全勾（组与明细都参与同步）', (scopeBody.groups || []).every((g) => g.enabled === true))
+// 本机可能早就存过自定义勾选（比如给「会话记录 / 工作区」关了同步）：
+// 那种情况下不能要求「全勾」，否则这条断言只是把用户自己的配置判成失败。
+if (prevScope === null) {
+  check('没配过时默认全勾（组与明细都参与同步）', (scopeBody.groups || []).every((g) => g.enabled === true))
+} else {
+  let prevDoc = {}
+  try { prevDoc = JSON.parse(prevScope) || {} } catch { prevDoc = {} }
+  const offInFile = Object.entries(prevDoc.groups || {})
+    .filter(([, v]) => v && v.enabled === false).map(([g]) => g).sort()
+  const offRead = (scopeBody.groups || []).filter((g) => g.enabled === false).map((g) => g.id).sort()
+  check('已存的 scope 勾选被如实读出（本机关掉的组仍为关）',
+    offInFile.join(',') === offRead.join(','), `文件 [${offInFile.join(',')}] / 读出 [${offRead.join(',')}]`)
+}
 check('deleteCloud 默认关闭（取消勾选不删云端副本）', scopeBody.deleteCloud === false)
 check('scope 带回本机文件路径（面板要显示出来）', Boolean(scopeBody.path && scopeBody.path.endsWith('config-sync-scope.json')), scopeBody.path || '(空)')
 
@@ -658,7 +676,8 @@ if (prevScope === null) { try { unlinkSync(scopeFile) } catch { } } else writeFi
     indexSrc.includes("action === 'prepare'") && indexSrc.includes('async function downloadPackage') &&
     indexSrc.includes('update-staging'), 'index.js')
   check('只下载会按候选地址逐个试并校验 sha256',
-    /function downloadPackage[\s\S]{0,1200}createHash\('sha256'\)/.test(indexSrc), 'index.js')
+    // 窗口别卡太死：函数体已经有 1300+ 字节，1200 的窗口会在正常改动后假失败（实测 1354 字节就失败）
+    /function downloadPackage[\s\S]{0,2600}createHash\('sha256'\)/.test(indexSrc), 'index.js')
   check('宿主有「装并重启」动作（install-restart，把本地包交给退出后的脚本）',
     indexSrc.includes("action === 'install-restart'") &&
     /action === 'install-restart'[\s\S]{0,900}-UpdateTgz/.test(indexSrc), 'index.js')
@@ -986,8 +1005,13 @@ if (!existsSync(repoArg) || !existsSync(pluginRuntime) || !repoReady) {
     const source = join(pluginRuntime, name)
     let same = false
     let detail = ''
-    if (!existsSync(mirror)) detail = `配置仓库没有 ${name}`
-    else if (!existsSync(source)) detail = `插件 runtime 没有 ${name}`
+    // 仓库里还没有这份副本时不要判失败：副本是「初始化推送」写进去的，
+    // 没推过的新仓库/只放了配置的仓库本来就没有它。真漂移（有副本但内容不同）才算失败。
+    if (!existsSync(mirror)) {
+      console.log(`  [SKIP] 配置仓库还没有 ${name}（初始化推送会写入）`)
+      continue
+    }
+    if (!existsSync(source)) detail = `插件 runtime 没有 ${name}`
     else {
       same = readFileSync(mirror).equals(readFileSync(source))
       if (!same) detail = `副本 ${readFileSync(mirror).length}B / 正本 ${readFileSync(source).length}B，跑 tools/sync-plugin-mirror.ps1 重新同步`
@@ -997,15 +1021,23 @@ if (!existsSync(repoArg) || !existsSync(pluginRuntime) || !repoReady) {
   // tools\fix-session-cwd.mjs 同样是随仓库同步的副本，改了插件忘了同步会静默跑旧逻辑
   const mirrorTool = join(repoArg, 'tools', 'fix-session-cwd.mjs')
   const sourceTool = join(pluginRuntime, 'tools', 'fix-session-cwd.mjs')
-  const toolSame = existsSync(mirrorTool) && existsSync(sourceTool) && readFileSync(mirrorTool).equals(readFileSync(sourceTool))
-  check('执行体副本与插件 runtime 逐字节一致：tools/fix-session-cwd.mjs', toolSame,
-    existsSync(mirrorTool) ? '内容已漂移，跑 tools/sync-plugin-mirror.ps1 重新同步' : '配置仓库没有 tools/fix-session-cwd.mjs')
+  if (!existsSync(mirrorTool)) {
+    console.log('  [SKIP] 配置仓库还没有 tools/fix-session-cwd.mjs（初始化推送会写入）')
+  } else {
+    const toolSame = existsSync(sourceTool) && readFileSync(mirrorTool).equals(readFileSync(sourceTool))
+    check('执行体副本与插件 runtime 逐字节一致：tools/fix-session-cwd.mjs', toolSame,
+      existsSync(sourceTool) ? '内容已漂移，跑 tools/sync-plugin-mirror.ps1 重新同步' : '插件 runtime 没有 tools/fix-session-cwd.mjs')
+  }
   for (const tname of ['session-log-guard.mjs', 'session-log-lib.mjs', 'bili-state.mjs']) {
     const m = join(repoArg, 'tools', tname)
     const s = join(pluginRuntime, 'tools', tname)
-    const ok = existsSync(m) && existsSync(s) && readFileSync(m).equals(readFileSync(s))
+    if (!existsSync(m)) {
+      console.log(`  [SKIP] 配置仓库还没有 tools/${tname}（初始化推送会写入）`)
+      continue
+    }
+    const ok = existsSync(s) && readFileSync(m).equals(readFileSync(s))
     check(`执行体副本与插件 runtime 逐字节一致：tools/${tname}`, ok,
-      !existsSync(m) ? `配置仓库没有 tools/${tname}` : (existsSync(s) ? '内容已漂移，跑 tools/sync-plugin-mirror.ps1 重新同步' : `插件 runtime 没有 tools/${tname}`))
+      existsSync(s) ? '内容已漂移，跑 tools/sync-plugin-mirror.ps1 重新同步' : `插件 runtime 没有 tools/${tname}`)
   }
 }
 
@@ -1243,10 +1275,16 @@ console.log('== 跨机路径占位符与问题反馈 ==')
   check('capture 首次自动落一份 config-sync-roots.json',
     captureSrc.includes('Save-SyncRoots $DshHome $roots'),
     '没写 roots 文件')
-  const settingsCount = (captureSrc.match(/Repo = 'settings\\/g) || []).length
-  const applyCount = (applySrc.match(/Repo = 'settings\\/g) || []).length
-  check('capture 覆盖到各插件自己的配置（不止 4 个）', settingsCount >= 11, `实际 ${settingsCount} 项`)
-  check('capture 与 apply 的 settings 清单一致', settingsCount === applyCount, `capture ${settingsCount} / apply ${applyCount}`)
+  // 0.6.18 起清单只有一份：dsh-sync-common.ps1 的 Get-SyncSettingsMap。
+  // 旧的「capture 里数 Repo = 'settings\ 字面量」检查会永远数到 0，属于检查自己过期。
+  const settingsCount = (common.match(/Repo = 'settings\\/g) || []).length
+  check('settings 清单单源在 common（capture/apply 都用 Get-SyncSettingsMap）',
+    captureSrc.includes('Get-SyncSettingsMap') && applySrc.includes('Get-SyncSettingsMap'),
+    '有一侧还在自己拼清单')
+  check('settings 覆盖到各插件自己的配置（不止 4 个）', settingsCount >= 11, `实际 ${settingsCount} 项`)
+  check('apply 用的就是同一份清单（不各写一份）',
+    applySrc.includes('Get-SyncSettingsMap $DshHome $ProfileName'),
+    'apply 传参不一致')
   check('apply 展开占位符，缺值的跳过不写并记 pending',
     applySrc.includes('Expand-TokenText $txt $roots') && applySrc.includes('Write-PendingPaths $DshHome $pendingItems')
       && applySrc.includes('continue'),
@@ -1255,8 +1293,7 @@ console.log('== 跨机路径占位符与问题反馈 ==')
     captureSrc.includes("storages\\workspace.json") && applySrc.includes("storages\\workspace.json"),
     '工作区登记表没同步')
   check('workspace-archives.v1.json（工作区隐藏/归档状态）进了同步范围',
-    captureSrc.includes('settings\\workspace-archives.json') && captureSrc.includes('dsh-session-manager\\workspace-archives.v1.json')
-      && applySrc.includes('settings\\workspace-archives.json') && applySrc.includes('dsh-session-manager\\workspace-archives.v1.json'),
+    common.includes('settings\\workspace-archives.json') && common.includes('dsh-session-manager\\workspace-archives.v1.json'),
     '工作区隐藏状态没纳入 settingsMap（A 机隐藏的工作区会带到 B 机显示）')
   check('面板有「本机路径」卡：只读展示 + 「修改」进编辑 + 保存',
     cli.includes("M('本机路径', 'Local paths')") && cli.includes("M('修改', 'Edit')")
@@ -1869,6 +1906,113 @@ console.log('== 0.4.2：Job Object 脱离 + 在线推送（不关 DSH）+ 待办
     && cliSrc.includes('onNavigate: jumpToSection')
     && cliSrc.includes('前往初始化推送 →'),
     'client.js 待办列表缺少锚文本跳转按钮')
+}
+console.log('')
+console.log('== 0.5.x 回归守卫：PS5.1 BOM + jumpToSection 参数解包 + 在线推送进度与报错 ==')
+{
+  const idxSrc = readFileSync(join(pluginRootSelf, 'index.js'), 'utf8')
+  const cliSrc = readFileSync(join(pluginRootSelf, 'client.js'), 'utf8')
+  const davSrc = readFileSync(join(pluginRuntime, 'webdav.mjs'), 'utf8')
+  const psFiles = [
+    ...['apply.ps1', 'capture.ps1', 'dsh-sync-common.ps1', 'install-plugin.ps1', 'post-exit.ps1', 'restore.ps1', 'sync.ps1'].map((n) => join(pluginRuntime, n)),
+    join(pluginRootSelf, 'tools', 'pack-plugin.ps1'),
+  ]
+  const noBom = psFiles.filter((p) => {
+    const b = readFileSync(p)
+    return !(b.length >= 3 && b[0] === 0xEF && b[1] === 0xBB && b[2] === 0xBF)
+  })
+  check('所有 .ps1 脚本均带 UTF-8 BOM（防 Windows PowerShell 5.1 乱码 ParseException）',
+    noBom.length === 0, noBom.join(', '))
+  check('Advice 与 jumpToSection 正确解包 target.section 且直接滚动 bodyRef',
+    cliSrc.includes('onNav(target.section, target)')
+    && cliSrc.includes('sidOrTarget.section')
+    && cliSrc.includes('body.scrollTo('),
+    'client.js 仍可能把 target 对象拼进 sync-section-[object Object]')
+  check('client.js jsonHeaders 为动态函数（不锁死模块加载瞬间的 accept-language）',
+    cliSrc.includes('const jsonHeaders = () =>')
+    && cliSrc.includes('headers: jsonHeaders()'),
+    'jsonHeaders 仍是静态对象')
+  check('startLivePush 捕获 PowerShell $? / try-catch / CLIXML 错误并保留请求语言',
+    idxSrc.includes('if (-not $?)')
+    && idxSrc.includes('sawFatalOutput')
+    && idxSrc.includes('const reqLang = langStore.getStore()'),
+    'startLivePush 仍可能把 ParseException 当成 exit 0 成功')
+  check('AutoCard 实时进度框含步骤进度与最近日志行',
+    cliSrc.includes('liveSteps')
+    && cliSrc.includes('livePush.recent')
+    && davSrc.includes('onProgress'),
+    '缺少分步进度或实时日志展示')
+}
+console.log('')
+console.log('== 0.5.1：环境变量读取令牌 + 防令牌/凭据推入仓库 ==')
+{
+  const idxSrc = readFileSync(join(pluginRootSelf, 'index.js'), 'utf8')
+  const cliSrc = readFileSync(join(pluginRootSelf, 'client.js'), 'utf8')
+  const commonSrc = readFileSync(join(pluginRuntime, 'dsh-sync-common.ps1'), 'utf8')
+  const captureSrc = readFileSync(join(pluginRuntime, 'capture.ps1'), 'utf8')
+  const syncSrc = readFileSync(join(pluginRuntime, 'sync.ps1'), 'utf8')
+  const davSrc = readFileSync(join(pluginRuntime, 'webdav.mjs'), 'utf8')
+  const eng = await import(pathToFileURL(join(pluginRuntime, 'sync-engine.mjs')).href)
+
+  check('Feedback / Update 支持从本机环境变量动态读取令牌且不把环境变量值写盘',
+    idxSrc.includes('GH_TOKEN_ENV_CANDIDATES')
+    && idxSrc.includes('parseEnvTokenRef')
+    && idxSrc.includes('getEnvValue')
+    && idxSrc.includes("saveFields = { token: '', tokenEnv: envName, repo }")
+    && idxSrc.includes('authHeadersForUrl')
+    && !/withAccessToken[\s\S]{0,200}gh-proxy\.com/.test(idxSrc),
+    'index.js 环境变量解析或代理防泄漏逻辑缺失')
+
+  check('FeedbackCard / UpdateCard 展示令牌来源并支持绑定环境变量与清除已存明文令牌',
+    cliSrc.includes('st.tokenSource')
+    && cliSrc.includes('st.envCandidates')
+    && cliSrc.includes('clearToken: true')
+    && cliSrc.includes('$GITHUB_TOKEN')
+    && cliSrc.includes('gh-proxy / ghfast / GitHub raw'),
+    'client.js 缺少环境变量交互或仍残留 jsDelivr 旧文案')
+
+  check('capture / sync / webdav 全链路包含私密文件名黑名单与 GitHub 令牌防泄漏门禁',
+    commonSrc.includes('Test-PrivateSecretFileName')
+    && commonSrc.includes('SyncGitHubTokenPattern')
+    && captureSrc.includes('Test-SyncExtraSecret $m.Src $DshHome')
+    && !captureSrc.includes('本次仍按你的设置抓取')
+    && syncSrc.includes('安全拦截：发现含令牌或本机私有凭据的文件')
+    && syncSrc.includes('安全拦截：检测到本机私有凭据或 GitHub 令牌')
+    && davSrc.includes('isSecretLeakCandidate'),
+    '同步/上传链路防令牌泄漏门禁缺失')
+
+  // 运行时实测：sync-engine.mjs copyWithTokens 必须拦截 config-sync-gh.json 与含 GitHub 令牌的文本
+  const leakTmp = mkdtempSync(join(tmpdir(), 'dsh-sync-leak-'))
+  try {
+    const srcD = join(leakTmp, 'src')
+    const dstD = join(leakTmp, 'dst')
+    mkdirSync(srcD, { recursive: true })
+    writeFileSync(join(srcD, 'config-sync-gh.json'), '{"repo":"a/b","token":"plain"}', 'utf8')
+    writeFileSync(join(srcD, 'notes.txt'), 'token=ghp_1234567890abcdefghij1234567890\n', 'utf8')
+    writeFileSync(join(srcD, 'ok.txt'), 'hello world\n', 'utf8')
+    eng.copyWithTokens(srcD, dstD, { appRoot: '', dshHome: '', workspaceHome: '' })
+    check('运行时实测：copyWithTokens 自动跳过 config-sync-gh.json 与含 ghp_ 令牌的文件',
+      !existsSync(join(dstD, 'config-sync-gh.json'))
+      && !existsSync(join(dstD, 'notes.txt'))
+      && existsSync(join(dstD, 'ok.txt')),
+      '存在未被拦截的敏感文件')
+  } finally {
+    rmSync(leakTmp, { recursive: true, force: true })
+  }
+
+  check('默认反馈仓库从 package.json 解析并自动迁移旧上游 QcWyGm 仓库名',
+    idxSrc.includes('LEGACY_UPSTREAM_REPOS')
+    && idxSrc.includes('function normalizeGhRepo(')
+    && idxSrc.includes('huanyu-a/dsh-profile-config-sync'),
+    'index.js 缺少旧上游仓库自动迁移')
+  check('ghApi 网络异常不抛 500、支持 gh auth token 兜底并传递 tokenPresent 与 credLogin',
+    idxSrc.includes('networkError: true')
+    && idxSrc.includes('function tokenFromGhCli(')
+    && idxSrc.includes('credFromGitCredential')
+    && idxSrc.includes('tokenPresent: Boolean(g.token)')
+    && cliSrc.includes('st.tokenPresent')
+    && cliSrc.includes("st.tokenSource === 'gh-cli'"),
+    'index.js 或 client.js 缺少网络容错或本机登录态识别')
 }
 process.exit(failures === 0 ? 0 : 1)
 

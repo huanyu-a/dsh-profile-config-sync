@@ -43,7 +43,11 @@ if (typeof zlib.zstdDecompressSync !== 'function' || typeof zlib.zstdCompressSyn
 }
 
 const spec = JSON.parse(fs.readFileSync(specPath, 'utf8'));
-const home = String(spec.home || '').replace(/\//g, '\\').replace(/\\+$/, '');
+// 只在 Windows 上把 / 归一成 \：在 macOS/Linux 上这么干会把 /home/u/.dsh 变成
+// \home\u\.dsh，路径直接失效（这个脚本是要跨平台跑的）。
+const isWin = process.platform === 'win32';
+const homeRaw = String(spec.home || '');
+const home = (isWin ? homeRaw.replace(/\//g, '\\') : homeRaw).replace(/[\\/]+$/, '');
 const dirs = spec.dirs || {};
 const sessionsRoot = path.join(home, 'sessions');
 
@@ -103,8 +107,13 @@ for (const [dirName, cwd] of Object.entries(dirs)) {
   if (!fs.existsSync(dirPath)) { result.missing++; continue; }
   for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
-    const file = path.join(dirPath, entry.name, 'session.v4.jsonl.zstd');
-    if (!fs.existsSync(file)) continue;
+    // 会话文件名带版本号（session.v4.jsonl.zstd）：写死版本号会在宿主升版（v5/v6…）后
+    // 静默跳过所有会话，报告里却是「已修正 0 个」，看起来像没事。
+    const sessionFiles = fs.readdirSync(path.join(dirPath, entry.name))
+      .filter((n) => /^session\.v\d+\.jsonl\.zstd$/.test(n))
+      .sort()
+    if (!sessionFiles.length) continue;
+    const file = path.join(dirPath, entry.name, sessionFiles[sessionFiles.length - 1]);
     try {
       const buf = fs.readFileSync(file);
       const first = decodeFirstFrame(buf);

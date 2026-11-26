@@ -33,6 +33,12 @@ export function readContract(repoRoot) {
     if (!existsSync(p)) return null
     const doc = JSON.parse(readFileSync(p, 'utf8'))
     if (!doc || typeof doc !== 'object') return null
+    // 老版本（上游 QcWyGm 时期）写的是一份残缺的「手写契约」：只有 appVersion + generatedAt + note，
+    // 没有 electronVersion / platforms / platformFamily。那种文件里的 appVersion 常被填成
+    // Electron 版本（实测 44.7.0），拿它跟本机 0.2.2-rc.5 比主版本必然「不一致」，
+    // 于是 pull 被永久 block。残缺契约一律当「没有契约」：不拦同步，下次推送按现在的结构重写一份。
+    const looksComplete = Array.isArray(doc.platforms) || typeof doc.electronVersion === 'string'
+    if (!looksComplete) return null
     return {
       appVersion: typeof doc.appVersion === 'string' ? doc.appVersion : '',
       electronVersion: typeof doc.electronVersion === 'string' ? doc.electronVersion : '',
@@ -50,6 +56,43 @@ export function readContract(repoRoot) {
 }
 
 /**
+ * 取两个版本字符串里较大的一个（只升不降）。
+ *
+ * 规则：
+ *  - 任一侧为空 → 用另一侧；
+ *  - 数字点分段逐个比（1.10.0 > 1.9.9），缺省段按 0；
+ *  - 带预发布后缀（-rc.1 / -beta）视为**比同版本正式版小**；两侧都是预发布时按字符串比较；
+ *  - 完全比不出来（格式异常）→ 保持既有值，不做决定。
+ */
+function parseVersion(v) {
+  const text = String(v || '').trim()
+  if (!text) return null
+  const m = /^v?(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?/.exec(text)
+  if (!m) return null
+  return { nums: m[1].split('.').map((n) => Number(n) || 0), pre: m[2] || '' }
+}
+
+function pickHigherVersion(existing, local) {
+  if (!existing) return local
+  if (!local) return existing
+  if (existing === local) return existing
+  const a = parseVersion(existing)
+  const b = parseVersion(local)
+  if (!a || !b) return existing
+  const len = Math.max(a.nums.length, b.nums.length)
+  for (let i = 0; i < len; i += 1) {
+    const x = a.nums[i] || 0
+    const y = b.nums[i] || 0
+    if (x !== y) return y > x ? local : existing
+  }
+  // 数字段相同：正式版 > 预发布版
+  if (a.pre === b.pre) return existing
+  if (!a.pre) return existing
+  if (!b.pre) return local
+  return b.pre > a.pre ? local : existing
+}
+
+/**
  * 把「本机实测事实」合成一份契约。
  *
  * preserveExisting：若仓库里已有契约，保留它已有的 platforms 并集，
@@ -63,19 +106,28 @@ export function buildContract(local, repoRoot) {
   if (existing && existing.platforms.length) {
     for (const p of existing.platforms) platforms.add(p)
   }
-  if (local && local.os) platforms.add(String(local.os))
+  if (local && local.os) {
+    // 大小写去重：contract 里可能已有 'windows'（老版本/手工改过），本机是 'Windows'，
+    // 直接 add 会让同一个平台在清单里出现两次，跨端判断与面板显示都会看花。
+    const os = String(local.os)
+    const same = [...platforms].find((p) => String(p).toLowerCase() === os.toLowerCase())
+    if (!same) platforms.add(os)
+  }
 
-  // appVersion / electronVersion 的更新规则沿用上游：
-  // 已存在且与本机不同 → 保持不变（避免较旧那台 capture 一次就把契约拉低）。
+  // appVersion / electronVersion：只升不降。
+  // 旧规则是「已存在就不动」，本意是防止较旧那台把契约拉低 —— 但升级较新的那台时同样不动，
+  // 于是契约永远停在旧版本号：每次 pull 都报「两端版本不同」，直到有人手工改文件。
+  // 现在按版本段比较，取较大的那个；比不出来（预发布后缀、格式异常）时保持原值不动。
   const existingVersion = existing ? existing.appVersion : ''
   const localVersion = local ? String(local.dshVersion || '') : ''
-  const appVersion = existingVersion || localVersion
+  const appVersion = pickHigherVersion(existingVersion, localVersion)
+
+  const existingElectron = existing ? existing.electronVersion : ''
+  const localElectron = local ? String(local.electronVersion || '') : ''
 
   return {
     appVersion,
-    electronVersion: existing && existing.electronVersion
-      ? existing.electronVersion
-      : String((local && local.electronVersion) || ''),
+    electronVersion: pickHigherVersion(existingElectron, localElectron),
     platforms: [...platforms].sort(),
     platformFamily: String((local && local.osFamily) || (existing && existing.platformFamily) || ''),
     os: String((local && local.os) || (existing && existing.os) || ''),

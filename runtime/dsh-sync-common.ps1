@@ -70,7 +70,7 @@ function Save-SyncNotices {
       byKind = $byKind
       items  = @($script:SyncNoticeItems)
     }
-    [IO.File]::WriteAllText($p, ($obj | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
+    Write-FileAtomic $p ($obj | ConvertTo-Json -Depth 4) (New-Object Text.UTF8Encoding $false)
   } catch { }
 }
 
@@ -129,6 +129,20 @@ function Get-SyncNoticesSummary($notices) {
   return ($parts -join '、')
 }
 
+# ---------- 环境自愈：模块路径被别的 PowerShell 版本抢走时，先把 5.1 自己的目录顶到最前 ----------
+# 实测：DSH 从 pwsh 启动 → 子进程 5.1 继承 PS7 的 PSModulePath → Microsoft.PowerShell.Utility 优先
+# 解析到 PS7 的 7.0.0.0 清单（5.1 装不进去）→ Get-FileHash / Invoke-WebRequest 直接「无法识别」，
+# 连带 Compress-Archive / Expand-Archive（插件快照、还原）一起失效。必须在任何模块 cmdlet 之前修。
+try {
+  if ($PSVersionTable -and $PSVersionTable.PSEdition -ne 'Core') {
+    $selfModules = Join-Path $PSHOME 'Modules'
+    if ($selfModules -and (Test-Path -LiteralPath $selfModules)) {
+      $cur = [string]$env:PSModulePath
+      $rest = @($cur -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ne $selfModules.TrimEnd('\')) })
+      $env:PSModulePath = (@($selfModules) + $rest) -join ';'
+    }
+  }
+} catch { }
 # Windows PowerShell 5.1 的模块自动加载偶尔拿不到 Get-FileHash（PSModulePath 被别的版本目录污染时，
 # 会先撞上一个装不进 5.1 的同名模块，之后这个 cmdlet 就"不存在"了，脚本直接 CommandNotFound 崩掉）。
 # 同步链路全靠它判断"文件要不要覆盖"，所以缺了就补一个等价实现，不让一个 cmdlet 决定整条链路生死。
@@ -270,13 +284,55 @@ function Read-TextPreserveBom([string]$path) {
   return $text
 }
 
+# 原子落盘：先写同目录临时文件，再 Move-Item -Force 覆盖目标。
+# 为什么必须：apply 会写 storages\workspace.json、profiles\<名字>\package.json 这些
+# DSH 启动就要解析的文件。裸 WriteAllText 是「先截断再写」，进程在中间被杀（关机、
+# 任务管理器结束进程、断电）就会留下半截 JSON，客户端下次启动直接读不出来。
+# Move-Item 在同卷上走 MoveFileEx + REPLACE_EXISTING，是原子的；目标被别的进程占用时
+# 会短暂失败，所以带递增重试，最后实在换不掉才退回直写（并清临时文件）。
+# 读 JSON 时容忍「极短的占用窗口」：面板保存走原子写（rename），读者正好撞上那一瞬
+# 会拿到 share violation。这里短重试；重试用尽返回 $null —— 调用方必须把 $null 与
+# 「文件本来就不存在」区分开，否则一次临时失败会被误读成「没配置」。
+function Read-JsonFileWithRetry([string]$path, [int]$tries = 6, [int]$baseMs = 20) {
+  if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $null }
+  for ($i = 0; $i -lt $tries; $i++) {
+    try { return (Get-Content -LiteralPath $path -Raw -Encoding utf8 -ErrorAction Stop | ConvertFrom-Json) } catch {
+      if ($i -eq ($tries - 1)) { return $null }
+      Start-Sleep -Milliseconds ($baseMs * ($i + 1))
+    }
+  }
+  return $null
+}
+function Write-FileAtomic([string]$path, [string]$text, $encoding) {
+  if (-not $encoding) { $encoding = New-Object Text.UTF8Encoding($false, $false) }
+  $dir = Split-Path -Parent $path
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  $tmp = $path + ".tmp-" + $PID + "-" + ([guid]::NewGuid().ToString("N").Substring(0, 6))
+  [IO.File]::WriteAllText($tmp, $text, $encoding)
+  for ($i = 0; $i -lt 25; $i++) {
+    try {
+      Move-Item -LiteralPath $tmp -Destination $path -Force -ErrorAction Stop
+      return $true
+    } catch {
+      Start-Sleep -Milliseconds (8 * ($i + 1))
+    }
+  }
+  try {
+    [IO.File]::WriteAllText($path, $text, $encoding)
+    return $false
+  } finally {
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+  }
+}
 function Write-TextPreserveBom([string]$path, [string]$text) {
   $hasBom = $false
   if (Test-Path -LiteralPath $path) {
     $b = [IO.File]::ReadAllBytes($path)
     $hasBom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
   }
-  [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding($hasBom, $false)))
+  # 这个函数写的是 DSH 启动就要解析的文件（cordis.yml / cordis.patch.yml / profile\package.json /
+  # AGENTS.md / skills），半截写入会让宿主直接 fatal —— 所以走原子写。BOM 选择语义不变。
+  Write-FileAtomic $path $text (New-Object Text.UTF8Encoding($hasBom, $false))
 }
 
 # ---------- 宿主版本 ----------
@@ -466,7 +522,12 @@ function Get-HostElectronVersion([string]$appRoot) {
 function Test-AppRootDir([string]$path) {
   if ([string]::IsNullOrWhiteSpace($path)) { return $false }
   $p = $path.TrimEnd('\', '/')
-  return (Test-Path -LiteralPath (Join-Path $p 'resources\app.asar')) -or (Test-Path -LiteralPath (Join-Path $p 'resources\app\package.json'))
+  # 这里拿到的是「候选路径」：可能指向不存在的盘（换过盘的机器、探测列表里的 G:\DSH）。
+  # PS 5.1 的 Join-Path 对不存在的盘符会抛 DriveNotFoundException，$ErrorActionPreference=Stop 时
+  # 直接把调用它的脚本（restore / sync）打断。字符串拼接 + SilentlyContinue 更稳。
+  $asar = $p + '\resources\app.asar'
+  $plain = $p + '\resources\app\package.json'
+  return (Test-Path -LiteralPath $asar -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $plain -ErrorAction SilentlyContinue)
 }
 
 function Get-InstalledAppLocation([string]$namePattern) {
@@ -532,10 +593,39 @@ $SyncScopeGroups = @('profile', 'prompt', 'skills', 'presets', 'storages-record'
 # 排除名单可改、单文件上限可改（硬顶 100MB —— GitHub 单文件超过 100MB 会被拒收，调大也没用）。
 $SyncExtraHardMaxBytes = 104857600
 
+# 安全必需项：用户自己的 config-sync-extra.json 不能把它们去掉。
+# 起因（本机实测）：设置文件里的 exclude / skipDirs 是**整份替换**语义，用户早先存下的 50 条旧快照
+# 会让 0.6.12 新增的 browser-profiles 规则整条失效 —— 那目录里有 3,696 个文件 / 297MB，含密码库。
+# 这两个字段可以在面板里删改某一条，但下面这些名字不允许消失。
+$SyncExtraMandatorySkipDirs = @(
+  'browser-profiles'
+)
+$SyncExtraMandatoryExcludes = @(
+  'browser-profiles', 'User Data', 'Login Data', 'Cookies', 'Web Data', 'Local State'
+)
+
+# 浏览器剖面 / 凭据库：插件把 CDP 用的 Edge/Chrome 用户目录放在这里，本机实测
+# <DshHome>\plugin-data\browser-profiles 有 3,696 个文件 / 297 MB，含 Login Data（密码库）、
+# Cookies（登录态）、Web Data（自动填充）。这些一旦进仓库就等于把登录态搬走，
+# 而且体积足够让一次 push 直接失败。按**路径段**判定，深层嵌套也拦得住。
+$SyncBlockedProfileSegments = @(
+  'browser-profiles', 'user data', 'login data', 'login data for account',
+  'cookies', 'cookies-journal', 'web data', 'web data-journal', 'secure preferences',
+  'local state', 'history', 'history-journal', 'top sites', 'current session', 'current tabs'
+)
+
+function Test-BlockedProfilePath([string]$rel) {
+  if (-not $rel) { return $false }
+  foreach ($seg in @($rel -split '[\\/]' | Where-Object { $_ })) {
+    if ($SyncBlockedProfileSegments -contains $seg.ToLowerInvariant()) { return $true }
+  }
+  return $false
+}
+
 $SyncExtraDefaultSkipDirs = @(
   'profiles', 'skills', '.agent-presets', 'storages', 'sessions', 'attachments', 'logs', 'backups',
   'update-staging', 'electron', 'dsh-runtimes', 'dsh-market', '.dsh-plugin-market', 'dsh-session-manager',
-  'im', 'node_modules'
+  'browser-profiles', 'im', 'node_modules'
 )
 
 $SyncExtraDefaultExclude = @(
@@ -543,35 +633,208 @@ $SyncExtraDefaultExclude = @(
   '*.node', '*.exe', '*.dll', '*.asar', '*.pak', '*.bin', '*.iso', '*.img',
   '*.zip', '*.7z', '*.rar', '*.tar', '*.gz', '*.tgz', '*.mp4', '*.mkv', '*.avi',
   '*.log', '*.log.*', '*.tmp', '*.bak', '*.bak-*', '*.old', '*.orig', '*.swp',
+  '*.env', '.env*', 'config-sync-gh.json', 'config-sync-feedback-outbox.json', 'dsh-config-sync.json', 'dsh-ssh-master.key',
   'api-key', '*.pem', '*.key', '*.p12', '*.pfx', '*.crt',
   '*cache*', '*token*', '*secret*', '*credential*', '*password*', '*vault*',
+  'browser-profiles', 'User Data', 'Login Data', 'Cookies', 'Web Data', 'Local State',
   'node_modules', '.git', '.cache', '__pycache__', '.venv'
 )
 
-# 凭据内容嗅探：名字看不出、内容里却带登录态的文件（workbuddy-vault\cn\<hash>.json 就是这种，
-# 里面是 accessToken）不能进仓库。抓取时读前 8KB 判一次，命中就跳过并 Warn。
-$SyncExtraSecretMarkers = @(
-  '"accesstoken"', '"refreshtoken"', '"idtoken"', '"apikey"', '"api_key"',
-  '"clientsecret"', '"privatekey"', '"password"', 'authorization: bearer'
+# 本机私有文件名黑名单：绝不允许抓进同步仓库或推到云端
+$SyncPrivateFileNames = @(
+  'config-sync-gh.json',
+  'config-sync-feedback-outbox.json',
+  'dsh-config-sync.json',
+  'config-sync-state.json',
+  'config-sync-roots.json',
+  'config-sync-scope.json',
+  'config-sync-delete-cloud.json',
+  'config-sync-extra.json',
+  'sync-notices.json',
+  '.credentials.yaml',
+  '.env',
+  'dsh-ssh-master.key'
 )
 
-function Test-SyncExtraSecret([string]$file) {
+function Test-PrivateSecretFileName([string]$path) {
+  if (-not $path) { return $false }
+  $leaf = ([IO.Path]::GetFileName($path)).ToLowerInvariant()
+  if (-not $leaf) { return $false }
+  if ($SyncPrivateFileNames -contains $leaf) { return $true }
+  if ($leaf -like '.env.*' -or $leaf -like '*.pem' -or $leaf -like '*.key' -or $leaf -like '*.p12' -or $leaf -like '*.pfx') { return $true }
+  return $false
+}
+
+# 凭据内容嗅探：名字看不出、内容里却带登录态或 GitHub 令牌的文件不能进仓库。
+$SyncExtraSecretMarkers = @(
+  '"accesstoken"', '"refreshtoken"', '"idtoken"', '"apikey"', '"api_key"',
+  '"clientsecret"', '"privatekey"', '"password"', '"webdavpass"', '"updatetoken"',
+  'authorization: bearer', 'github_token=', 'gh_token='
+)
+$SyncGitHubTokenPattern = 'gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}'
+
+$script:ActiveSecretCache = $null
+function Get-ActiveRuntimeSecrets([string]$DshHomeHint = '') {
+  if ($null -ne $script:ActiveSecretCache) { return $script:ActiveSecretCache }
+  $list = New-Object System.Collections.Generic.List[string]
+  $add = {
+    param([string]$v)
+    if ($v) {
+      $t = $v.Trim()
+      if ($t.Length -ge 12 -and -not $t.StartsWith('$') -and $t -notmatch '^env:') {
+        if (-not $list.Contains($t)) { [void]$list.Add($t) }
+      }
+    }
+  }
+  foreach ($n in @('DSH_CONFIG_SYNC_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN')) {
+    & $add ([Environment]::GetEnvironmentVariable($n))
+    & $add ([Environment]::GetEnvironmentVariable($n, 'User'))
+    & $add ([Environment]::GetEnvironmentVariable($n, 'Machine'))
+  }
+  $dh = if ($DshHomeHint) { $DshHomeHint } elseif ($env:DSH_HOME) { $env:DSH_HOME } else { (Join-Path $HOME '.dsh') }
+  if ($dh) {
+    foreach ($fn in @('config-sync-gh.json', 'dsh-config-sync.json')) {
+      $p = Join-Path $dh $fn
+      if (Test-Path -LiteralPath $p) {
+        try {
+          $j = Read-JsonFileWithRetry $p
+          if ($j.token) { & $add ([string]$j.token) }
+          if ($j.updateToken) { & $add ([string]$j.updateToken) }
+          if ($j.webdavPass) { & $add ([string]$j.webdavPass) }
+          if ($j.tokenEnv) {
+            $en = [string]$j.tokenEnv
+            & $add ([Environment]::GetEnvironmentVariable($en))
+            & $add ([Environment]::GetEnvironmentVariable($en, 'User'))
+          }
+        } catch { }
+      }
+    }
+  }
+  $script:ActiveSecretCache = @($list)
+  return $script:ActiveSecretCache
+}
+
+function Test-SyncExtraSecret([string]$file, [string]$DshHomeHint = '') {
   try {
-    if ((Get-Item -LiteralPath $file -Force).Length -gt 8MB) { return $false }
-    $bytes = [IO.File]::ReadAllBytes($file)
-    if ($bytes.Length -gt 8192) { $bytes = $bytes[0..8191] }
-    # 二进制里到处是 NUL，别拿它当文本嗅探（真正的二进制文件另有扩展名清单挡着）
-    if ($bytes -contains 0) { return $false }
-    $text = ([Text.Encoding]::UTF8.GetString($bytes)).ToLowerInvariant()
+    if (Test-PrivateSecretFileName $file) { return $true }
+    $item = Get-Item -LiteralPath $file -Force
+    if ($item.PSIsContainer) { return $false }   # 目录由调用方逐文件判定
+    $len = [long]$item.Length
+    if ($len -le 2100000) {
+      $sample = [IO.File]::ReadAllBytes($file)
+    } else {
+      # 旧写法对 >8MB 直接 return $false —— 一个大 JSON 导出、把令牌记在末尾的日志就能绕过
+      # 唯一一道门禁原样进仓库。改成头尾各抽 512KB（令牌一般落在配置头部或日志尾部）。
+      $fs = [IO.File]::OpenRead($file)
+      try {
+        $chunk = [int](512 * 1024)
+        $headLen = [int][Math]::Min($chunk, $len)
+        $head = New-Object byte[] $headLen
+        $headRead = $fs.Read($head, 0, $headLen)
+        $tailStart = [long][Math]::Max(0, $len - $chunk)
+        [void]$fs.Seek($tailStart, [IO.SeekOrigin]::Begin)
+        $tailLen = [int][Math]::Min($chunk, $len - $tailStart)
+        $tail = New-Object byte[] $tailLen
+        $tailRead = $fs.Read($tail, 0, $tailLen)
+        $sample = New-Object byte[] ($headRead + $tailRead)
+        [Array]::Copy($head, 0, $sample, 0, $headRead)
+        [Array]::Copy($tail, 0, $sample, $headRead, $tailRead)
+      } finally { $fs.Dispose() }
+    }
+    # 用 latin1（码位 = 字节）解码：二进制文件里的 ASCII 令牌照样能命中，
+    # 也不会因为非法 UTF-8 序列抛错。旧写法「含 NUL 就 return $false」等于给二进制开后门。
+    $rawText = [Text.Encoding]::GetEncoding(28591).GetString($sample)
+    if ($rawText -match $SyncGitHubTokenPattern) { return $true }
+    foreach ($sec in (Get-ActiveRuntimeSecrets $DshHomeHint)) {
+      if ($rawText.Contains($sec)) { return $true }
+    }
+    $text = $rawText.ToLowerInvariant()
     foreach ($m in $SyncExtraSecretMarkers) { if ($text.Contains($m)) { return $true } }
     return $false
-  } catch { return $false }
+  } catch {
+    # 读不了 = 判不了。旧写法 catch 里 return $false，等于「读不了就放行」：超长路径、被独占、
+    # 权限不足的文件会静默进仓库。这里改成宁可跳过（调用方会记进未同步清单并告警）。
+    return $true
+  }
 }
 
 # 自动枚举时被凭据嗅探挡下的文件：抓完集中 Warn 一次，用户知道"这些没进来、为什么"
 $script:SyncExtraSecretSkips = New-Object System.Collections.ArrayList
 function Reset-SyncExtraSecretSkips { $script:SyncExtraSecretSkips.Clear() }
 function Get-SyncExtraSecretSkips { return @($script:SyncExtraSecretSkips) }
+
+# 仓库里的 settings\xxx.json ↔ 本机实际路径。三处（capture / apply / restore）共用这一份，
+# 否则「从仓库还原」会把文件放错目录：实测 dsh-workspaces.json 被丢到 ~/.dsh 根，
+# 而 DSH 读的是 ~/.dsh\storages\workspace.json，工作区看起来全部消失。
+# 同一 DSH 目录的同步互斥：capture 和 apply 都可能被「面板按钮 / 自动 watcher / 定时任务」同时触发，
+# 两个进程撞同一个文件会抛 .NET IOException（实测 package.json「being used by another process」）。
+# 命名 Mutex 在进程退出时自动释放，崩溃也不会留下死锁文件。
+# 返回 $true 表示拿到锁；$false 表示已有同步在跑，调用方应明确告知用户本次没有执行（退出码非 0，不假绿）。
+function Lock-SyncRun([string]$DshHome, [string]$Label) {
+  try {
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    $bytes = [Text.Encoding]::UTF8.GetBytes(([string]$DshHome).ToLowerInvariant())
+    $hash = -join ($sha1.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") })
+    $sha1.Dispose()
+    $name = "Local\dsh-config-sync-" + $hash.Substring(0, 16)
+    $script:SyncRunMutex = New-Object System.Threading.Mutex($false, $name)
+    try {
+      return $script:SyncRunMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+      # 上一个进程崩了，锁被系统留给我们：视为拿到（这正是 Mutex 比锁文件好的地方）
+      return $true
+    }
+  } catch {
+    # 拿不到互斥能力（极老系统 / 受限环境）时不能因此阻止同步：放行并留一句警告
+    Warn ("无法启用同步互斥（" + $_.Exception.Message + "），本次 " + $Label + " 继续执行")
+    return $true
+  }
+}
+
+# 只探测「有没有别的同步动作正在跑」，不持有锁：
+# pull 会先下载/快进仓库、再调 apply 落地配置。如果等到 apply 才发现锁被占用，
+# 仓库已经变了而配置没变 —— 半截状态。所以拉取要在动手前先问一句。
+# 探测本身有极小竞态（问完到 apply 抢锁之间），但 apply 那层仍然是权威判据。
+function Test-SyncRunBusy([string]$DshHome) {
+  $hash = [System.Security.Cryptography.SHA1]::Create()
+  try {
+    $bytes = [Text.Encoding]::UTF8.GetBytes(([string]$DshHome).ToLowerInvariant())
+    $hex = (($hash.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join "")
+    $name = "Local\dsh-config-sync-" + $hex.Substring(0, 16)
+    $m = New-Object System.Threading.Mutex($false, $name)
+  } catch {
+    # 建不出互斥时不要挡住用户：宁可放行（apply 那层还会再判一次）
+    return $false
+  } finally { try { $hash.Dispose() } catch { } }
+  try {
+    try {
+      if ($m.WaitOne(0)) { try { $m.ReleaseMutex() } catch { }; return $false }
+      return $true
+    } catch [System.Threading.AbandonedMutexException] {
+      # 上一个持锁进程崩了：锁是空的，别把它当占用
+      try { $m.ReleaseMutex() } catch { }
+      return $false
+    }
+  } catch { return $false } finally { try { $m.Dispose() } catch { } }
+}
+function Get-SyncSettingsMap([string]$DshHome, [string]$ProfileName) {
+  return @(
+    @{ Repo = 'settings\our-free-model.json';        Src = (Join-Path $DshHome 'our-free-model\settings.json');                          Label = 'our-free-model 插件设置' }
+    @{ Repo = 'settings\comfyui-workflows.json';     Src = (Join-Path $DshHome 'data\dsh-comfyui\workflows.json');                    Label = 'ComfyUI 工作流库' }
+    @{ Repo = 'settings\dsh-pet-main-config.jsonc';  Src = (Join-Path $DshHome 'dsh-pet\main-config.jsonc');                          Label = '桌宠配置' }
+    @{ Repo = 'settings\dsh-market-state.json';      Src = (Join-Path $DshHome ("profiles\" + $ProfileName + '\.dsh-market\state.json')); Label = '插件市场状态' }
+    @{ Repo = 'settings\dsh-pet-memory.json';        Src = (Join-Path $DshHome 'dsh-pet\memory.json');                                Label = '桌宠记忆' }
+    @{ Repo = 'settings\our-free-model-picks.json';  Src = (Join-Path $DshHome 'our-free-model\picks.json');                          Label = 'our-free-model 收藏' }
+    @{ Repo = 'settings\dsh-im-interface-language.json'; Src = (Join-Path $DshHome 'integrations\dsh-im\interface-language.json');   Label = 'dsh-im 界面语言' }
+    @{ Repo = 'settings\dsh-qq-config.json';         Src = (Join-Path $DshHome 'integrations\dsh-qq\config.json');                    Label = 'QQ 集成配置' }
+    @{ Repo = 'settings\dsh-qq-workspaces.json';     Src = (Join-Path $DshHome 'integrations\dsh-qq\workspaces.json');                Label = 'QQ 集成工作区' }
+    @{ Repo = 'settings\redteam-preset-declare.json'; Src = (Join-Path $DshHome 'redteam\preset-declare.json');                        Label = '红队预设声明' }
+    @{ Repo = 'settings\task-board-ledger.json';     Src = (Join-Path $DshHome 'task-board\ledger-v2.json');                          Label = '任务板台账' }
+    @{ Repo = 'settings\task-board-scheduler.json';  Src = (Join-Path $DshHome 'task-board\scheduler-v2.json');                       Label = '任务板调度' }
+    @{ Repo = 'settings\dsh-workspaces.json';        Src = (Join-Path $DshHome 'storages\workspace.json');                            Label = 'DSH 工作区登记' }
+    @{ Repo = 'settings\workspace-archives.json';    Src = (Join-Path $DshHome 'dsh-session-manager\workspace-archives.v1.json');     Label = 'DSH 工作区隐藏状态' }
+  )
+}
 
 function Get-SyncExtraPath([string]$DshHome) { return (Join-Path $DshHome 'config-sync-extra.json') }
 
@@ -586,8 +849,11 @@ function Get-SyncExtraConfig([string]$DshHome) {
   $f = $null
   if ($DshHome) { $f = Get-SyncExtraPath $DshHome }
   if ($f -and (Test-Path -LiteralPath $f)) {
+    # 这份文件是面板写的（走原子 rename）：撞上极短占用窗口时要重试，别直接退回默认规则
     try {
-      $j = Get-Content -LiteralPath $f -Raw -Encoding utf8 | ConvertFrom-Json
+      $j = Read-JsonFileWithRetry $f
+      # 重试用尽返回 $null：文件确实读不出/坏了，仍要人话告知，别静默退回默认规则
+      if ($null -eq $j) { throw "重试 $SyncExtraReadTries 次仍读不出（文件可能损坏，或被别的进程长期占用）" }
       if ($j.pluginData) {
         if ($null -ne $j.pluginData.PSObject.Properties['enabled']) { $pd.enabled = ($j.pluginData.enabled -ne $false) }
         if ($null -ne $j.pluginData.PSObject.Properties['maxFileBytes']) {
@@ -611,6 +877,19 @@ function Get-SyncExtraConfig([string]$DshHome) {
       Warn ("config-sync-extra.json 解析失败，按默认规则处理：" + $_.Exception.Message)
     }
   }
+  # 必需项补齐：用户文件可以改别的东西，但这些名字必须留着
+  $addedSkip = @()
+  foreach ($must in $SyncExtraMandatorySkipDirs) {
+    if (-not ($pd.skipDirs -contains $must)) { $pd.skipDirs = @($pd.skipDirs) + @($must); $addedSkip += $must }
+  }
+  $addedExcl = @()
+  foreach ($must in $SyncExtraMandatoryExcludes) {
+    if (-not ($pd.exclude -contains $must)) { $pd.exclude = @($pd.exclude) + @($must); $addedExcl += $must }
+  }
+  if ($addedSkip.Count -gt 0 -or $addedExcl.Count -gt 0) {
+    # 不静默：告诉用户他的规则文件少了安全项、这次按内置名单补齐了（文件本身不改，面板里保存时才写）
+    Warn ("你的 config-sync-extra.json 缺少安全必需项，本次已按内置名单补齐：跳过目录 " + $(if ($addedSkip.Count) { ($addedSkip -join ",") } else { "无" }) + "；排除 " + $(if ($addedExcl.Count) { ($addedExcl -join ",") } else { "无" }))
+  }
   return [pscustomobject]@{ version = 1; pluginData = $pd; extra = $ex }
 }
 
@@ -629,7 +908,7 @@ function Save-SyncExtraConfig([string]$DshHome, $cfg) {
     }
   }
   $f = Get-SyncExtraPath $DshHome
-  [IO.File]::WriteAllText($f, ($j | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+  Write-FileAtomic $f ($j | ConvertTo-Json -Depth 6) (New-Object Text.UTF8Encoding($false))
   return $f
 }
 
@@ -637,6 +916,8 @@ function Save-SyncExtraConfig([string]$DshHome, $cfg) {
 function Test-SyncExtraSkip([string]$relName, [long]$size, $cfg) {
   $max = [Math]::Min([int64]$cfg.pluginData.maxFileBytes, [int64]$SyncExtraHardMaxBytes)
   if ($size -gt $max) { return 'too-big' }
+  # 浏览器剖面 / 凭据库：抓取阶段就不收（与 webdav.mjs 的上传门禁同一份名单）
+  if (Test-BlockedProfilePath $relName) { return 'blocked-profile' }
   if (-not $relName) { return '' }
   $parts = @($relName -split '[\\/]' | Where-Object { $_ })
   $name = if ($parts.Count -gt 0) { $parts[$parts.Count - 1] } else { $relName }
@@ -764,10 +1045,32 @@ function Test-SyncDeleteCloud($Scope) {
   return ($Scope.deleteCloud -eq $true)
 }
 
+$script:SyncDeleteCloudPrefixes = New-Object System.Collections.Generic.List[string]
+
+function Add-SyncDeleteCloudPrefix([string]$rel) {
+  if (-not $rel) { return }
+  $norm = $rel.Replace('\', '/').Trim('/')
+  if ($norm -and -not $script:SyncDeleteCloudPrefixes.Contains($norm)) {
+    [void]$script:SyncDeleteCloudPrefixes.Add($norm)
+  }
+}
+
+function Save-SyncDeleteCloudQueue([string]$DshHome) {
+  if (-not $DshHome) { return }
+  $qPath = Join-Path $DshHome 'config-sync-delete-cloud.json'
+  if ($script:SyncDeleteCloudPrefixes.Count -eq 0) {
+    if (Test-Path -LiteralPath $qPath) { try { Remove-Item -LiteralPath $qPath -Force } catch { } }
+    return
+  }
+  $json = ([ordered]@{ prefixes = @($script:SyncDeleteCloudPrefixes) } | ConvertTo-Json -Depth 3)
+  [void](Write-FileAtomic $qPath $json (New-Object Text.UTF8Encoding($false, $false)))
+}
+
 # 整组被跳过时调用：deleteCloud 打开就把仓库里那份删掉；默认什么都不做（留着，以后勾回来接着用）
 function Skip-SyncGroup($Scope, [string]$RepoRoot, [string]$Group) {
   Warn ("跳过（未勾选同步）：" + $Group)
   if (-not (Test-SyncDeleteCloud $Scope)) { return }
+  Add-SyncDeleteCloudPrefix $Group
   $target = Join-Path $RepoRoot $Group
   if (Test-Path -LiteralPath $target) {
     Remove-Item -LiteralPath $target -Recurse -Force
@@ -778,6 +1081,7 @@ function Skip-SyncGroup($Scope, [string]$RepoRoot, [string]$Group) {
 # 组内单项被跳过时调用（item 是仓库里的相对路径，如 skills\foo、settings\x.json）
 function Skip-SyncItem($Scope, [string]$RepoRoot, [string]$Group, [string]$Item, [string]$RepoRel) {
   if (-not (Test-SyncDeleteCloud $Scope) -or -not $RepoRel) { return }
+  Add-SyncDeleteCloudPrefix $RepoRel
   $target = Join-Path $RepoRoot $RepoRel
   if (Test-Path -LiteralPath $target) {
     Remove-Item -LiteralPath $target -Recurse -Force
@@ -908,7 +1212,8 @@ function Get-SyncRoots([string]$DshHome, [string]$AppRoot = '', [string]$Workspa
   $f = Get-SyncRootsPath $DshHome
   if (Test-Path -LiteralPath $f) {
     try {
-      $j = Get-Content -LiteralPath $f -Raw -Encoding utf8 | ConvertFrom-Json
+      $j = Read-JsonFileWithRetry $f
+      if ($null -eq $j) { throw "config-sync-roots.json 重试后仍读不出" }
       if ($j.appRoot) { $o.appRoot = [string]$j.appRoot }
       if ($j.dshHome) { $o.dshHome = [string]$j.dshHome }
       if ($j.workspaceHome) { $o.workspaceHome = [string]$j.workspaceHome }
@@ -938,7 +1243,7 @@ function Save-SyncRoots([string]$DshHome, $roots) {
     confirmed     = @($roots.confirmed)
     updatedAt     = $roots.updatedAt
   }
-  [IO.File]::WriteAllText($f, ($j | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+  Write-FileAtomic $f ($j | ConvertTo-Json -Depth 6) (New-Object Text.UTF8Encoding($false))
   return $f
 }
 
@@ -1007,7 +1312,7 @@ function Get-MissingTokens([string]$text) {
 function Write-PendingPaths([string]$DshHome, $items) {
   $f = Get-PendingPathsPath $DshHome
   $j = [ordered]@{ generatedAt = (Get-Date).ToString('s'); missing = @($items) }
-  [IO.File]::WriteAllText($f, ($j | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+  Write-FileAtomic $f ($j | ConvertTo-Json -Depth 6) (New-Object Text.UTF8Encoding($false))
   return $f
 }
 
@@ -1103,7 +1408,7 @@ function Invoke-SessionLogGuard {
       [ordered]@{ src = [string]$_.Src; dst = [string]$_.Dst; writeTo = [string]$_.WriteTo }
     })
   }
-  [IO.File]::WriteAllText($jobPath, ($spec | ConvertTo-Json -Depth 5 -Compress), (New-Object Text.UTF8Encoding($false)))
+  Write-FileAtomic $jobPath ($spec | ConvertTo-Json -Depth 5 -Compress) (New-Object Text.UTF8Encoding($false))
 
   $oldRunAsNode = $env:ELECTRON_RUN_AS_NODE
   try {
@@ -1216,7 +1521,7 @@ function Invoke-BiliStateSync {
   }
   if ($BiliDir) { $spec.biliDir = [string]$BiliDir }
   if ($Sessions -and @($Sessions).Count -gt 0) { $spec.sessions = @($Sessions | ForEach-Object { [string]$_ }) }
-  [IO.File]::WriteAllText($specPath, ($spec | ConvertTo-Json -Depth 5 -Compress), (New-Object Text.UTF8Encoding($false)))
+  Write-FileAtomic $specPath ($spec | ConvertTo-Json -Depth 5 -Compress) (New-Object Text.UTF8Encoding($false))
 
   $oldRunAsNode = $env:ELECTRON_RUN_AS_NODE
   try {
@@ -1292,4 +1597,38 @@ function Write-BiliStateSyncReport($State, [string]$DshHome) {
     Warn ('  压缩状态处理失败：{0}（{1}）' -f $sid, [string]$f.error)
     if ($DshHome) { Add-SyncNotice -Kind 'context-state' -Path $sid -Reason ('billion-context 压缩状态搬运失败：' + [string]$f.error) }
   }
+}
+
+
+# ---------- 版本比较 / 契约新旧判定（capture 与 apply 共用） ----------
+# 比较两个版本字符串的「三段数字」：a>b 返回 1，a<b 返回 -1，相等返回 0，解析不出来返回 $null。
+# 预发布后缀（-rc.5）不参与比较，只按三段数字；需要区分时由 Test-ContractStale 处理。
+function Compare-SyncVersion([string]$a, [string]$b) {
+  $pa = $null; $pb = $null
+  if ($a -match '^v?(\d+)\.(\d+)\.(\d+)') { $pa = @([int]$matches[1], [int]$matches[2], [int]$matches[3]) }
+  if ($b -match '^v?(\d+)\.(\d+)\.(\d+)') { $pb = @([int]$matches[1], [int]$matches[2], [int]$matches[3]) }
+  if ((-not $pa) -or (-not $pb)) { return $null }
+  for ($i = 0; $i -lt 3; $i++) { if ($pa[$i] -gt $pb[$i]) { return 1 }; if ($pa[$i] -lt $pb[$i]) { return -1 } }
+  return 0
+}
+
+# 仓库契约是不是「该按本机版本重写」。
+# 三条依据：
+#   1) 老格式（缺少 electronVersion / platforms）：上游手写契约常把 Electron 版本写进 appVersion
+#      （实测 44.7.0），拿它跟本机 app 比永远不一致 → 另一台 pull 被永久拦住。这种契约不可信，重写。
+#   2) 本机版本更新（三段数字更大）→ 重写；本机更旧 → 保留，别把契约拉低。
+#   3) 三段数字相同但只有预发布后缀差异：正式版优先（0.2.2 > 0.2.2-rc.5）。
+function Test-ContractStale($Doc, [string]$HostVer) {
+  if (-not $Doc) { return $true }
+  $names = @($Doc.PSObject.Properties.Name)
+  if (-not (($names -contains 'electronVersion') -or ($names -contains 'platforms'))) { return $true }
+  $repoVer = [string]$Doc.appVersion
+  if (-not $repoVer) { return $true }
+  if ($repoVer -eq $HostVer) { return $false }
+  $cmp = Compare-SyncVersion $HostVer $repoVer
+  if ($null -eq $cmp) { return $true }
+  if ($cmp -gt 0) { return $true }
+  if ($cmp -lt 0) { return $false }
+  if (($repoVer -match '-') -and ($HostVer -notmatch '-')) { return $true }
+  return $false
 }

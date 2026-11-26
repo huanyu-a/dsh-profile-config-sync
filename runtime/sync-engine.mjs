@@ -27,7 +27,7 @@ import {
   IS_WIN, SEP, appRootCandidates, clientExecutable, dshHome as resolveDshHome,
   defaultWorkspaceHome, findGit, hostNodeExe, isAppRoot, isDir, isFile, platformFamily,
 } from './platform.mjs'
-import { buildContract, contractPath, contractText, readContract } from './contract.mjs'
+import { buildContract, checkContract, contractPath, contractText, readContract } from './contract.mjs'
 import { listMachines, localMachineInfo, writeMachineInfo } from './machines.mjs'
 import { downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive } from './webdav.mjs'
 
@@ -104,6 +104,91 @@ export function fromRepoPath(p) {
   return String(p).split('/').join(sep)
 }
 
+/** 同步内容勾选：与 PowerShell 侧 dsh-sync-common.ps1 的 Get-SyncScope 同语义。
+ *
+ * 必需组（profile）永远算开启：关掉它会让另一台 apply 直接报错，不是「少同步一点」。
+ * 文件缺失 / 解析失败一律按「全勾」处理（与 PS 的 fallback 一致），不能让坏 JSON 变成「什么都不同步」。
+ */
+export const SYNC_REQUIRED_GROUPS = ['profile']
+
+/**
+ * 本机根集合：与 PowerShell 侧 Get-SyncRoots 同语义。
+ *
+ * <DshHome>/config-sync-roots.json 是用户确认过的值，优先；没有才用探测/传参值。
+ * custom 里补一个 userHome —— 有些配置把工作区建在 ~/Documents/deepseek-harness 下，
+ * 那个路径既不在安装目录也不在 .dsh / 工作区根里，不归一就会把老机器的用户名带过去。
+ */
+export function readSyncRoots(dshHome, detected = {}) {
+  const out = {
+    appRoot: String(detected.appRoot || ''),
+    dshHome: String(detected.dshHome || dshHome || ''),
+    workspaceHome: String(detected.workspaceHome || ''),
+    custom: {},
+  }
+  if (!dshHome) {
+    try { out.custom.userHome = homedir() } catch { /* 取不到就不加 */ }
+    return out
+  }
+  const file = join(dshHome, 'config-sync-roots.json')
+  let saved = null
+  try { saved = JSON.parse(readFileSync(file, 'utf8')) } catch { saved = null }
+  if (saved && typeof saved === 'object') {
+    if (typeof saved.appRoot === 'string' && saved.appRoot) out.appRoot = saved.appRoot
+    if (typeof saved.dshHome === 'string' && saved.dshHome) out.dshHome = saved.dshHome
+    if (typeof saved.workspaceHome === 'string' && saved.workspaceHome) out.workspaceHome = saved.workspaceHome
+    if (saved.custom && typeof saved.custom === 'object') {
+      for (const [k, v] of Object.entries(saved.custom)) {
+        if (k && typeof v === 'string' && v) out.custom[k] = v
+      }
+    }
+  }
+  if (!out.custom.userHome) {
+    try { out.custom.userHome = homedir() } catch { /* 取不到就不加 */ }
+  }
+  return out
+}
+
+export function readSyncScope(dshHome) {
+  const fallback = { deleteCloud: false, groups: {} }
+  if (!dshHome) return fallback
+  const file = join(dshHome, 'config-sync-scope.json')
+  let raw = ''
+  try { raw = readFileSync(file, 'utf8') } catch { return fallback }
+  if (!raw || !raw.trim()) return fallback
+  try {
+    const obj = JSON.parse(raw)
+    if (!obj || typeof obj !== 'object') return fallback
+    return {
+      deleteCloud: obj.deleteCloud === true,
+      groups: obj.groups && typeof obj.groups === 'object' ? obj.groups : {},
+    }
+  } catch { return fallback }
+}
+
+function scopeGroupEnabled(scope, group) {
+  if (SYNC_REQUIRED_GROUPS.includes(group)) return true
+  const g = scope && scope.groups ? scope.groups[group] : null
+  if (!g || typeof g !== 'object') return true
+  return g.enabled !== false
+}
+
+function scopeItemEnabled(scope, group, item) {
+  if (SYNC_REQUIRED_GROUPS.includes(group)) return true
+  if (!scopeGroupEnabled(scope, group)) return false
+  const g = scope && scope.groups ? scope.groups[group] : null
+  if (!g || typeof g !== 'object') return true
+  if (!Array.isArray(g.excluded)) return true
+  return !g.excluded.includes(item)
+}
+
+/** 整组被跳过时：只有显式打开 deleteCloud 才删仓库里那份。 */
+function skipScopedGroup(scope, repoRoot, group, skipped) {
+  skipped.push(`${group}: 未勾选同步`)
+  if (!scope || scope.deleteCloud !== true) return
+  const target = join(repoRoot, fromRepoPath(group))
+  try { if (existsSync(target)) { clearDir(target); skipped.push(`${group}: 已按「删除云端副本」移除`) } } catch { /* 删不掉不影响其余 */ }
+}
+
 /** 本机路径列表 → 归一化的根集合（capture 用）。 */
 export function collectRoots({ appRoot, dshHome, workspaceHome }) {
   return {
@@ -134,6 +219,7 @@ function pathVariants(p) {
  */
 export function toTokenText(text, roots) {
   if (!text) return text
+  roots = roots || {}
   const items = []
   if (roots.appRoot && roots.appRoot.length >= 3) items.push({ token: TOKENS.APP_ROOT, value: roots.appRoot })
   if (roots.workspaceHome && roots.workspaceHome.length >= 5) items.push({ token: TOKENS.WORKSPACE_HOME, value: roots.workspaceHome })
@@ -147,7 +233,7 @@ export function toTokenText(text, roots) {
     for (const v of pathVariants(it.value)) out = out.split(v).join(it.token)
   }
   // 占位符后面的分隔符统一成正斜杠
-  out = out.replace(/(\{\{(?:APP_ROOT|DSH_HOME|WORKSPACE_HOME|ROOT:[A-Za-z0-9_.-]+)\}\})((?:\\\\|\\|\/)[^"\s,;:}{\[\]]*)/g,
+  out = out.replace(/(\{\{(?:APP_ROOT|DSH_HOME|WORKSPACE_HOME|ROOT:[^{}\s]+)\}\})((?:\\\\|\\|\/)[^"\s,;:}{\[\]]*)/g,
     (_m, token, rest) => token + rest.split(String.fromCharCode(92)).join('/'))
   return out
 }
@@ -155,6 +241,7 @@ export function toTokenText(text, roots) {
 /** 占位符 → 本机路径（apply 落地前调用）。 */
 export function expandTokenText(text, roots) {
   if (!text) return text
+  roots = roots || {}
   const fwd = (p) => (p ? toRepoPath(p) : '')
   let out = text
     .split(TOKENS.APP_ROOT).join(fwd(roots.appRoot))
@@ -169,7 +256,9 @@ export function expandTokenText(text, roots) {
 /** 文本里还残留哪些没配值的占位符（apply 用它决定「跳过并记 pending」）。 */
 export function missingTokens(text) {
   const found = new Set()
-  const re = /\{\{(APP_ROOT|DSH_HOME|WORKSPACE_HOME|ROOT:[A-Za-z0-9_.-]+)\}\}/g
+  // 名字放宽到「除花括号/空白之外任意字符」：用户的自选根 key 可能是中文（{{ROOT:资料}}），
+  // 只认 ASCII 会让这种占位符既不被识别、也不被跳过，最终把字面量写进目标机配置。
+  const re = /\{\{(APP_ROOT|DSH_HOME|WORKSPACE_HOME|ROOT:[^{}\s]+)\}\}/g
   let m
   while ((m = re.exec(String(text))) !== null) found.add(m[0])
   return [...found]
@@ -201,21 +290,84 @@ export function treeFingerprint(dir) {
  * 递归复制，边拷边把文本文件里的本机根换成占位符。
  * 二进制文件字节保真（不走文本读入）。
  */
+/** 浏览器剖面 / 凭据库（与 webdav.mjs 的 BLOCKED_PROFILE_SEGMENTS 保持一致）。 */
+const BLOCKED_ENGINE_SEGMENTS = new Set([
+  'browser-profiles', 'user data', 'login data', 'login data for account',
+  'cookies', 'cookies-journal', 'web data', 'web data-journal', 'secure preferences',
+  'local state', 'history', 'history-journal', 'top sites', 'current session', 'current tabs',
+])
+const PRIVATE_FILE_NAMES = new Set([
+  'config-sync-gh.json', 'config-sync-feedback-outbox.json', 'dsh-config-sync.json',
+  'config-sync-state.json', 'config-sync-roots.json', 'config-sync-scope.json',
+  'config-sync-extra.json', 'sync-notices.json', '.credentials.yaml', '.env', 'dsh-ssh-master.key',
+])
+const GH_TOKEN_RE = /gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}/
+function hasSecretLeak(name, text) {
+  const leaf = String(name || '').toLowerCase()
+  if (PRIVATE_FILE_NAMES.has(leaf) || leaf.startsWith('.env.') || /\.(pem|key|p12|pfx)$/.test(leaf)) return true
+  if (String(name || '').split('/').some((seg) => BLOCKED_ENGINE_SEGMENTS.has(String(seg).toLowerCase()))) return true
+  if (typeof text === 'string' && text) {
+    if (GH_TOKEN_RE.test(text)) return true
+    for (const envName of ['DSH_CONFIG_SYNC_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) {
+      const val = String(process.env[envName] || '').trim()
+      if (val.length >= 12 && text.includes(val)) return true
+    }
+  }
+  return false
+}
+
+/** 大文件只抽头尾嗅探：令牌一般落在配置头部或日志尾部，读整个 100MB 进内存不值得。 */
+const SECRET_SAMPLE_BYTES = 512 * 1024
+function readSampleLation(path, size) {
+  if (size <= 2 * 1024 * 1024) return readFileSync(path).toString('latin1')
+  const fd = openSync(path, 'r')
+  try {
+    const headLen = Math.min(SECRET_SAMPLE_BYTES, size)
+    const head = Buffer.alloc(headLen)
+    let read = readSync(fd, head, 0, headLen, 0)
+    const tailStart = Math.max(0, size - SECRET_SAMPLE_BYTES)
+    const tailLen = Math.min(SECRET_SAMPLE_BYTES, size - tailStart)
+    const tail = Buffer.alloc(tailLen)
+    const read2 = readSync(fd, tail, 0, tailLen, tailStart)
+    return head.subarray(0, read).toString('latin1') + tail.subarray(0, read2).toString('latin1')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/**
+ * 是否含令牌/凭据 —— **不看扩展名**。
+ * 旧实现只对 TEXT_EXTS 里的扩展名做内容扫描，其余一律当二进制直拷：无扩展名的脚本、
+ * .npmrc、netrc、deploy-config 里的 ghp_ 令牌就这样进了仓库，随后被 git 推到远端。
+ * 用 latin1 解码（码位 = 字节），二进制文件里的 ASCII 令牌同样能命中。
+ */
+function fileLooksSecret(path, size) {
+  try { return hasSecretLeak('', readSampleLation(path, size)) } catch { return false }
+}
+
 export function copyWithTokens(src, dst, roots) {
   const st = statSync(src)
   if (st.isDirectory()) {
     mkdirSync(dst, { recursive: true })
+    let files = 0, bytes = 0
     for (const e of readdirSync(src, { withFileTypes: true })) {
       if (SKIP_DIRS.has(e.name)) continue
       if (e.isSymbolicLink && e.isSymbolicLink()) continue
-      copyWithTokens(join(src, e.name), join(dst, e.name), roots)
+      // 计数必须累加：旧实现目录分支返回 {files:0}，skills/presets 这两个唯一的目录源
+      // 永远报「0 个文件 / 0 字节，变更 0 项」，而文件其实被整份重写了。
+      const r = copyWithTokens(join(src, e.name), join(dst, e.name), roots)
+      files += r.files
+      bytes += r.bytes
     }
-    return { files: 0, bytes: 0 }
+    return { files, bytes }
   }
   if (!isFile(src)) return { files: 0, bytes: 0 }
-  mkdirSync(dirname(dst), { recursive: true })
   const name = basename(src)
-  if (isBinaryName(name) || !isTextName(name)) {
+  if (hasSecretLeak(name, '')) return { files: 0, bytes: 0 }
+  if (fileLooksSecret(src, st.size)) return { files: 0, bytes: 0 }
+  const binary = isBinaryName(name) || !isTextName(name)
+  mkdirSync(dirname(dst), { recursive: true })
+  if (binary) {
     copyFileSync(src, dst)
     return { files: 1, bytes: st.size }
   }
@@ -230,10 +382,20 @@ export function copyWithExpand(src, dst, roots) {
   const st = statSync(src)
   if (st.isDirectory()) {
     mkdirSync(dst, { recursive: true })
+    let files = 0, bytes = 0
+    const skipped = []
     for (const e of readdirSync(src, { withFileTypes: true })) {
-      copyWithExpand(join(src, e.name), join(dst, e.name), roots)
+      const r = copyWithExpand(join(src, e.name), join(dst, e.name), roots)
+      files += r.files
+      bytes += r.bytes
+      if (Array.isArray(r.skipped) && r.skipped.length > 0) {
+        // 只有目录子项才加前缀：文件子项自己已经把文件名写进 skipped 了，
+        // 再拼一次就成了 "sub/a.md/a.md: …"（旧版这个前缀把路径拼重）。
+        const dirChild = typeof e.isDirectory === 'function' && e.isDirectory()
+        skipped.push(...r.skipped.map((s) => (dirChild ? `${e.name}/${s}` : s)))
+      }
     }
-    return { files: 0, bytes: 0 }
+    return { files, bytes, skipped }
   }
   if (!isFile(src)) return { files: 0, bytes: 0 }
   mkdirSync(dirname(dst), { recursive: true })
@@ -243,7 +405,15 @@ export function copyWithExpand(src, dst, roots) {
     return { files: 1, bytes: st.size }
   }
   const text = readFileSync(src, 'utf8')
+  // 占位符还没配值就跳过：把 {{ROOT:work}} 字面量写进本机配置，插件读到会当成真实路径，
+  // 报错比不写更难查（apply.ps1 里同一条不变式）。旧实现只在「单文件」分支做这个检查，
+  // skills/ presets/ 这类目录源整棵直写，同一份内容作为文件被跳过、作为目录却被写坏。
+  // 先展开、再看还剩哪些占位符（与 apply.ps1 的 Expand-TokenText → Get-MissingTokens 同序）。
+  // 反过来判（先看文本里有没有占位符）会把能展开的正常文件也跳过 —— 实测 profile 快照里的
+  // {{DSH_HOME}} 明明是能换的，却被当成「待确认路径」整份跳过，还原完 profile 里少文件。
   const out = expandTokenText(text, roots)
+  const miss = missingTokens(out)
+  if (miss.length > 0) return { files: 0, bytes: 0, skipped: [`${name}: 待确认路径 ${miss.join(', ')}`] }
   writeFileSync(dst, out, 'utf8')
   return { files: 1, bytes: Buffer.byteLength(out, 'utf8') }
 }
@@ -363,6 +533,12 @@ export function localDshHome() {
 }
 
 /** 探测本机环境（capture / status 都要用）。带进程内缓存。 */
+/** 契约判定要的 local 文档（与 probeLocal 同源，单独命名避免循环调用）。 */
+function createProbeLocal(opts) {
+  const l = probeLocal(opts)
+  return { appVersion: l.dshVersion, dshVersion: l.dshVersion, os: l.os }
+}
+
 export function probeLocal({ dshHome, appRoot, workspaceHome } = {}) {
   const home = dshHome || localDshHome()
   const ws = workspaceHome || defaultWorkspaceHome()
@@ -401,7 +577,9 @@ export function probeLocal({ dshHome, appRoot, workspaceHome } = {}) {
  */
 export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName = 'desktop' } = {}) {
   const local = probeLocal({ dshHome, appRoot, workspaceHome })
-  const roots = collectRoots(local)
+  // 用「用户确认过的根」（config-sync-roots.json）：自选目录必须变成 {{ROOT:x}}，
+  // 否则会把本机绝对路径原样带进仓库，换机后对方文件指向一个不存在的目录。
+  const roots = readSyncRoots(local.dshHome, local)
   const changed = []
   const errors = []
   let files = 0, bytes = 0
@@ -421,7 +599,13 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
     }
   }
 
-  // 1) profile：本机 profile 目录
+  // 0) 同步内容勾选（与 PS 侧同语义）：没勾的组不抓，被排除的单项不抓。
+  const scope = readSyncScope(local.dshHome)
+  const skippedByScope = []
+  const gated = (group) => !scopeGroupEnabled(scope, group)
+  const gatedItem = (group, item) => !scopeItemEnabled(scope, group, item)
+
+  // 1) profile：本机 profile 目录（必需组，钉死开启）
   const profileDir = join(local.dshHome, 'profiles', profileName)
   if (isDir(profileDir)) {
     copy(join(profileDir, 'package.json'), 'profile/package.json')
@@ -453,11 +637,18 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
     errors.push(`host-contract: ${e && e.message ? e.message : e}`)
   }
 
-  // 3) 提示词 / 技能 / 预设
-  copy(join(local.dshHome, 'AGENTS.md'), 'prompt/AGENTS.md')
-  copy(join(local.dshHome, 'prompt-inject.md'), 'prompt/prompt-inject.md')
-  copy(join(local.dshHome, 'skills'), 'skills')
-  copy(join(local.dshHome, '.agent-presets'), 'presets')
+  // 3) 提示词 / 技能 / 预设（逐组、逐项按勾选门控）
+  if (gated('prompt')) skipScopedGroup(scope, repoRoot, 'prompt', skippedByScope)
+  else {
+    if (gatedItem('prompt', 'AGENTS.md')) skippedByScope.push('prompt/AGENTS.md: 未勾选')
+    else copy(join(local.dshHome, 'AGENTS.md'), 'prompt/AGENTS.md')
+    if (gatedItem('prompt', 'prompt-inject.md')) skippedByScope.push('prompt/prompt-inject.md: 未勾选')
+    else copy(join(local.dshHome, 'prompt-inject.md'), 'prompt/prompt-inject.md')
+  }
+  if (gated('skills')) skipScopedGroup(scope, repoRoot, 'skills', skippedByScope)
+  else copy(join(local.dshHome, 'skills'), 'skills')
+  if (gated('presets')) skipScopedGroup(scope, repoRoot, 'presets', skippedByScope)
+  else copy(join(local.dshHome, '.agent-presets'), 'presets')
 
   // 4) 本机身份（不是配置，是元数据）：让别的机器知道「这份配置来自哪」
   try {
@@ -471,7 +662,7 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
     }))
   } catch { /* 元数据写失败不影响同步 */ }
 
-  return { ok: errors.length === 0, changed: [...new Set(changed)].sort(), files, bytes, errors, local }
+  return { ok: errors.length === 0, changed: [...new Set(changed)].sort(), files, bytes, errors, local, skipped: skippedByScope }
 }
 
 /**
@@ -519,10 +710,15 @@ function backupBeforeWrite(src, dst, dshHome, errorsRef) {
 
 export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName = 'desktop', dryRun = false } = {}) {
   const local = probeLocal({ dshHome, appRoot, workspaceHome })
-  const roots = collectRoots(local)
+  // 用「用户确认过的根」（config-sync-roots.json）：自选目录必须变成 {{ROOT:x}}，
+  // 否则会把本机绝对路径原样带进仓库，换机后对方文件指向一个不存在的目录。
+  const roots = readSyncRoots(local.dshHome, local)
   const written = [], skipped = [], errors = []
   let files = 0, bytes = 0
   applyBackupDir = ''
+  // 同步内容勾选：与 capture 同一套判定，别让「没勾的组」在 apply 侧又被铺回来
+  const scope = readSyncScope(local.dshHome)
+  const skippedByScope = []
 
   const pull = (srcRel, dst) => {
     const src = join(repoRoot, fromRepoPath(srcRel))
@@ -536,17 +732,19 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
         return
       }
       // 文本里若还有没配值的占位符，宁可跳过也不把字面量写进配置。
-      // 这一步必须在复制**之前**做：目录级复制会连带把带占位符的文件写出去。
+      // 目录源（skills / presets）由 copyWithExpand 在内部逐个文件判断，这里只管单文件。
       if (!isDir(src) && isTextName(src) && !isBinaryName(src)) {
-        const miss = missingTokens(readFileSync(src, 'utf8'))
+        const miss = missingTokens(expandTokenText(readFileSync(src, 'utf8'), roots))
         if (miss.length > 0) { skipped.push(`${srcRel}: 待确认路径 ${miss.join(', ')}`); return }
       }
       // 覆盖前留底：被覆盖的本机文件先拷到 backups/apply-<时间戳>/，与 PowerShell 版语义一致。
       // 不留底 = 用户没推送的本地改动被静默清掉，且无处可寻。
       backupBeforeWrite(src, dst, local.dshHome, errors)
-      const r = isDir(src) ? copyWithExpand(src, dst, roots) : copyWithExpand(src, dst, roots)
+      const r = copyWithExpand(src, dst, roots)
       files += r.files
       bytes += r.bytes
+      // 目录里被跳过的文件也要报出来，否则报告只写「已铺开 skills」，实际少了一批文件。
+      for (const s of r.skipped || []) skipped.push(`${srcRel}/${s}`)
       written.push(srcRel)
     } catch (e) {
       errors.push(`${srcRel}: ${e && e.message ? e.message : e}`)
@@ -560,12 +758,19 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
 
   pull('profile/package.json', join(profileDir, 'package.json'))
   pull('profile/cordis.patch.yml', join(profileDir, 'cordis.patch.yml'))
-  pull('prompt/AGENTS.md', join(local.dshHome, 'AGENTS.md'))
-  pull('prompt/prompt-inject.md', join(local.dshHome, 'prompt-inject.md'))
-  pull('skills', join(local.dshHome, 'skills'))
-  pull('presets', join(local.dshHome, '.agent-presets'))
+  if (!scopeGroupEnabled(scope, 'prompt')) skippedByScope.push('prompt: 未勾选同步')
+  else {
+    if (scopeItemEnabled(scope, 'prompt', 'AGENTS.md')) pull('prompt/AGENTS.md', join(local.dshHome, 'AGENTS.md'))
+    else skippedByScope.push('prompt/AGENTS.md: 未勾选')
+    if (scopeItemEnabled(scope, 'prompt', 'prompt-inject.md')) pull('prompt/prompt-inject.md', join(local.dshHome, 'prompt-inject.md'))
+    else skippedByScope.push('prompt/prompt-inject.md: 未勾选')
+  }
+  if (scopeGroupEnabled(scope, 'skills')) pull('skills', join(local.dshHome, 'skills'))
+  else skippedByScope.push('skills: 未勾选同步')
+  if (scopeGroupEnabled(scope, 'presets')) pull('presets', join(local.dshHome, '.agent-presets'))
+  else skippedByScope.push('presets: 未勾选同步')
 
-  return { ok: errors.length === 0, written, skipped, errors, files, bytes, local, backupDir: applyBackupDir }
+  return { ok: errors.length === 0, written, skipped, errors, files, bytes, local, backupDir: applyBackupDir, skippedByScope }
 }
 
 /**
@@ -604,6 +809,20 @@ export function status({ repoRoot, dshHome, appRoot, workspaceHome } = {}) {
   }
 }
 
+/**
+ * 跑一条 git 命令（跨平台：macOS / Linux 与 Windows 同一条路径，不依赖 PowerShell）。
+ * 之前引擎的 push / pull 完全没有 git 动作 —— 结果是「推送跑了但云端没变化」「拉取跑了但没下载」，
+ * 用户在非 Windows 上根本同步不了。这里补上真正的提交与推送。
+ */
+function gitRun(repoRoot, args, timeoutMs = 300000) {
+  const r = spawnSync('git', ['-C', repoRoot, ...args], { encoding: 'utf8', timeout: timeoutMs })
+  return {
+    code: r.status == null ? 1 : r.status,
+    out: String(r.stdout || '').trim(),
+    err: String(r.stderr || '').trim(),
+    error: r.error ? String(r.error.message || r.error) : '',
+  }
+}
 /** git 状态（分支 / HEAD / 领先落后 / 工作树脏度）。失败返回 null。 */
 function readGitState(repoRoot, git) {
   const run = (args) => {
@@ -681,6 +900,36 @@ export function probeAll(opts = {}) {
  * 直接 `node sync-engine.mjs` 不带子命令时打印用法，便于人工排查。
  */
 
+/** 只认识的参数；打错字时明确提示，而不是静默用默认值跑错目录。 */
+function warnUnknownArgs(args, known, usage) {
+  const extra = Object.keys(args).filter((k) => !known.includes(k))
+  if (!extra.length) return
+  console.error(`[!] 未知参数：${extra.map((k) => '-' + k).join(', ')}（已忽略；用法：${usage}）`)
+}
+
+/**
+ * 确认 repoRoot 自己就是仓库根。
+ *
+ * git 会从当前目录一路向上找 .git：如果同步仓库被放在另一个仓库的子目录里，
+ * 所有 git 操作都会落到**外层仓库**上（实测把用户 home 的 dotfiles 仓库当场撞锁）。
+ * 宁可拒绝，也不能替用户改到别的仓库。
+ */
+function ensureOwnRepo(repoRoot) {
+  const norm = (s) => String(s || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  const top = gitRun(repoRoot, ['rev-parse', '--show-toplevel'], 60000)
+  if (top.code !== 0) {
+    return { ok: false, error: `这个目录还不是 git 仓库：${repoRoot}（先在面板「云端仓库」里初始化，或换成已有仓库）` }
+  }
+  const got = String(top.out || '').trim().split(/\r?\n/).filter(Boolean).pop() || ''
+  if (!got || norm(got) !== norm(repoRoot)) {
+    return {
+      ok: false,
+      error: `这个目录不是仓库根：git 认到的是 ${got || '(空)'}；请把同步仓库放在独立目录，不要塞在别的仓库里面`,
+    }
+  }
+  return { ok: true, top: got }
+}
+
 /** 把 `a=b` / `--a b` / `-a b` 混写的参数解析成对象。 */
 function parseArgs(argv) {
   const out = {}
@@ -707,10 +956,112 @@ function readSyncSettings(dshHome) {
   }
 }
 
+/** 递归拷贝（不删目标里已有的其它文件），返回写入文件数。 */
+function copyTreeCount(from, to) {
+  if (!existsSync(from)) return 0
+  const st = statSync(from)
+  if (!st.isDirectory()) {
+    mkdirSync(dirname(to), { recursive: true })
+    copyFileSync(from, to)
+    return 1
+  }
+  let n = 0
+  mkdirSync(to, { recursive: true })
+  for (const e of readdirSync(from, { withFileTypes: true })) {
+    n += copyTreeCount(join(from, e.name), join(to, e.name))
+  }
+  return n
+}
+
+/** 插件目录：优先 <appRoot>/dsh-config-sync-*，其次 profile/node_modules 里的安装副本。 */
+function findPluginTarget({ appRoot, dshHome, profileName }) {
+  const cands = []
+  if (appRoot && isDir(appRoot)) {
+    try {
+      for (const e of readdirSync(appRoot, { withFileTypes: true })) {
+        if (e.isDirectory() && /^dsh-config-sync/.test(e.name)) cands.push(join(appRoot, e.name))
+      }
+    } catch { }
+  }
+  const nm = join(dshHome, 'profiles', profileName || 'desktop', 'node_modules', 'dsh-profile-config-sync')
+  if (isDir(nm)) cands.push(nm)
+  // 有多个候选时取最新的那份（最近安装/升级的那个）
+  cands.sort((x, y) => {
+    try { return statSync(y).mtimeMs - statSync(x).mtimeMs } catch { return 0 }
+  })
+  return cands[0] || ''
+}
+
+/**
+ * 还原「插件」或「会话」快照（-SnapshotKind plugin / session）。
+ * 与 restore.ps1 的两个分支一一对应：
+ *   plugin  → 快照内容写回插件目录（半截备份会多一层 <插件目录名>/，取其内容），当前插件先整份留底
+ *   session → 快照里的 --xxx-- 目录写回 <dshHome>/sessions，同名目录先留底
+ */
+function restoreNonProfile({ kind, snapDir, dshHome, appRoot, profileName, stamp, a }) {
+  if (kind === 'plugin') {
+    const target = String(a.PluginDir || a.pluginDir || '') || findPluginTarget({ appRoot, dshHome, profileName })
+    if (!target) {
+      console.error('找不到要回滚的插件目录：请传 -PluginDir（例如 <客户端根>/dsh-config-sync-0.1.0）')
+      return 2
+    }
+    let srcRoot = snapDir
+    let kids = readdirSync(srcRoot, { withFileTypes: true })
+    if (kids.length === 1 && kids[0].isDirectory() && /^dsh-config-sync/.test(kids[0].name)) {
+      srcRoot = join(srcRoot, kids[0].name)
+      kids = readdirSync(srcRoot, { withFileTypes: true })
+      console.log(`备份里只有一层安装目录，取其内容：${srcRoot}`)
+    }
+    if (!kids.length) {
+      console.error(`这份备份里没有任何文件：${snapDir}`)
+      return 2
+    }
+    let ver = 'unknown'
+    try { ver = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8')).version || ver } catch { }
+    const bk = join(dshHome, 'backups', `plugin-${ver}-${stamp}`)
+    console.log(`先把当前插件备份到 ${bk}（回滚错了还能再回滚回来）`)
+    copyTreeCount(target, bk)
+    let n = 0
+    for (const it of kids) n += copyTreeCount(join(srcRoot, it.name), join(target, it.name))
+    console.log(`已把插件回滚到 ${snapDir} 的内容（写入 ${n} 个顶层条目 → ${target}）`)
+    console.log(`回滚前的插件已备份：${bk}`)
+    console.log('重启客户端后生效')
+    return 0
+  }
+
+  // session
+  const dirs = readdirSync(snapDir, { withFileTypes: true }).filter((e) => e.isDirectory())
+  if (!dirs.length) {
+    console.error(`这份备份里没有会话目录（顶层应为 --xxx-- 目录）：${snapDir}`)
+    return 2
+  }
+  const sessions = join(dshHome, 'sessions')
+  const bk = join(dshHome, 'backups', `session-${stamp}`)
+  mkdirSync(sessions, { recursive: true })
+  mkdirSync(bk, { recursive: true })
+  let n = 0
+  for (const d of dirs) {
+    const existing = join(sessions, d.name)
+    if (existsSync(existing)) copyTreeCount(existing, join(bk, d.name))
+    copyTreeCount(join(snapDir, d.name), existing)
+    n += 1
+  }
+  console.log(`已把 ${n} 个会话目录写回 ${sessions}；同名目录先前的状态已备份到 ${bk}`)
+  console.log('重启客户端后可在这台机器的会话列表里看到还原后的会话')
+  return 0
+}
+
 /** 命令行主流程。返回进程退出码。 */
 export async function runCli(argv) {
   const [cmd, ...rest] = argv
   const a = parseArgs(rest)
+  // 打错参数（-BackupDirr / -RepRoot）时明确提示：静默忽略等于按默认目录跑，可能写到别处。
+  warnUnknownArgs(a, [
+    'RepoRoot', 'repoRoot', 'DshHome', 'dshHome', 'AppRoot', 'appRoot', 'WorkspaceHome', 'workspaceHome',
+    'ProfileName', 'profileName', 'Message', 'message', 'BackupDir', 'backupDir',
+    'SnapshotKind', 'snapshotKind', 'PluginDir', 'pluginDir', 'Force', 'force',
+    'AllowVersionDrift', 'allowVersionDrift',
+  ], 'node sync-engine.mjs <status|push|pull|restore> -RepoRoot <dir> -DshHome <dir>')
   const repoRoot = a.RepoRoot || a.repoRoot || process.cwd()
   const dshHome = a.DshHome || a.dshHome || localDshHome()
   const appRoot = a.AppRoot || a.appRoot || ''
@@ -738,6 +1089,8 @@ export async function runCli(argv) {
       '  -ProfileName <name>   profile 名（默认 desktop）',
       '  -Message <text>       提交说明（仅 push）',
       '  -BackupDir <dir>      还原哪份快照（仅 restore）',
+      '  -SnapshotKind <kind>  快照类型 profile|plugin|session（仅 restore，默认 profile）',
+      '  -PluginDir <dir>      插件快照回滚到哪个目录（仅 restore -SnapshotKind plugin）',
     ].join('\n'))
     return 0
   }
@@ -767,6 +1120,38 @@ export async function runCli(argv) {
       for (const e of r.errors) console.error(`  [!] ${e}`)
       console.log(`capture 完成：${r.files} 个文件 / ${r.bytes} 字节，变更 ${r.changed.length} 项`)
       if (!r.ok) return 1
+      if (!useWebdav) {
+        // git 模式：把 capture 出来的改动提交，再推到 origin。
+        // 先确认这个目录就是仓库根：否则 git 会向上找到外层仓库，改到别人的仓库上去。
+        const own = ensureOwnRepo(repoRoot)
+        if (!own.ok) { console.error(own.error); return 1 }
+        const add = gitRun(repoRoot, ['add', '-A'])
+        if (add.code !== 0) { console.error(`git add 失败：${add.err || add.error}`); return 1 }
+        const dirty = gitRun(repoRoot, ['status', '--porcelain'], 60000)
+        if (dirty.code !== 0) { console.error(`git status 失败：${dirty.err || dirty.error}`); return 1 }
+        const changed = dirty.out ? dirty.out.split(/\r?\n/).filter(Boolean).length : 0
+        if (changed > 0) {
+          const msg = String(a.Message || a.message || `sync: capture ${new Date().toISOString().slice(0, 19)} @ ${hostname()}`)
+          const commit = gitRun(repoRoot, ['commit', '-m', msg], 60000)
+          if (commit.code !== 0) { console.error(`git commit 失败：${commit.err || commit.error}`); return 1 }
+          console.log(`已提交 ${changed} 个文件：${msg}`)
+        } else {
+          console.log('没有变更需要提交')
+        }
+        const remotes = gitRun(repoRoot, ['remote'], 60000)
+        if (!remotes.out.split(/\r?\n/).includes('origin')) {
+          console.error('本机仓库没有 origin：先在面板「云端仓库」里填远端地址并保存，再推送')
+          return 1
+        }
+        const hasUpstream = gitRun(repoRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], 60000).code === 0
+        const pushed = hasUpstream ? gitRun(repoRoot, ['push']) : gitRun(repoRoot, ['push', '-u', 'origin', 'HEAD'])
+        if (pushed.code !== 0) {
+          console.error(`git push 失败：${pushed.err || pushed.error}`)
+          console.error('改动已提交在本地，修好认证/网络后重跑推送即可')
+          return 1
+        }
+        console.log(pushed.err || pushed.out || '已推送')
+      }
       if (useWebdav) {
         const up = await uploadRepo(w, repoRoot)
         for (const e of up.errors) console.error(`  [!] ${e}`)
@@ -790,6 +1175,45 @@ export async function runCli(argv) {
         console.log(`WebDAV 下载：下载 ${dn.downloaded.length} · 跳过 ${dn.skipped.length} · 冲突 ${dn.conflicts.length} · 错误 ${dn.errors.length}`)
         if (!dn.ok) return 1
       }
+      if (!useWebdav) {
+        // git 模式：先把云端拿下来。之前完全没有这一步，等于「拉取」只把**本地仓库**铺到本机，
+        // 云端有更新永远拉不下来。
+        const own = ensureOwnRepo(repoRoot)
+        if (!own.ok) { console.error(own.error); return 1 }
+        const remotes = gitRun(repoRoot, ['remote'], 60000)
+        if (!remotes.out.split(/\r?\n/).includes('origin')) {
+          console.error('本机仓库没有 origin：先在面板「云端仓库」里填远端地址并保存，再拉取')
+          return 1
+        }
+        const fetched = gitRun(repoRoot, ['fetch', 'origin', '--prune'])
+        if (fetched.code !== 0) {
+          console.error(`git fetch 失败：${fetched.err || fetched.error}`)
+          console.error('离线或认证失败时不会用旧仓库覆盖本机，已停下')
+          return 1
+        }
+        const worktree = gitRun(repoRoot, ['status', '--porcelain'], 60000).out
+        if (worktree) {
+          console.error('[!] 仓库工作区有未提交改动，跳过自动合并（先在仓库里提交或清理，再拉取）')
+        } else {
+          const merged = gitRun(repoRoot, ['merge', '--ff-only', '@{upstream}'], 120000)
+          if (merged.code !== 0) {
+            console.error(`[!] 快进合并失败：${merged.err || merged.error}（继续用当前本地仓库内容）`)
+          } else {
+            console.log(merged.out || '仓库已是最新')
+          }
+        }
+      }
+      // 宿主版本契约：与 Windows 版语义一致 —— 主版本不同直接拒绝，同主版本不同号只警告。
+      const contractDoc = readContract(repoRoot)
+      const localDoc = createProbeLocal({ dshHome, appRoot, workspaceHome })
+      const verdict = checkContract(contractDoc, localDoc)
+      if (verdict.level === 'block' && !(a.AllowVersionDrift || a.allowVersionDrift)) {
+        console.error(`宿主版本不一致（${verdict.reason}）：未改动任何文件。先把两台升到同一版，或加 -AllowVersionDrift`)
+        return 1
+      }
+      if (verdict.level === 'warn') {
+        console.error(`[!] 宿主版本不一致（${verdict.reason}）：继续同步，但会剔除实验性 bundle`)
+      }
       const r = apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName })
       for (const wItem of r.written) console.log(`  > ${wItem}`)
       for (const s of r.skipped) console.log(`  - 跳过 ${s}`)
@@ -799,24 +1223,48 @@ export async function runCli(argv) {
       return r.ok ? 0 : 1
     }
     if (cmd === 'restore') {
-      // POSIX 版还原：从仓库里的快照目录拷回 profile。
+      // POSIX 版还原：从仓库里的快照目录拷回 profile / 插件 / 会话。
       // 快照布局与 PowerShell 版一致（backups/config-<时间戳>/profile/...）。
       const snapDir = a.BackupDir || a.backupDir || ''
+      // -SnapshotKind：面板生成的还原脚本会带这个参数（profile / plugin / session）。
+      // 旧实现完全忽略它 —— 拿插件/会话快照跑 profile 还原，结果要么报「快照里没有 profile/」，
+      // 要么（布局碰巧像）把 profile 覆盖成一份插件目录。
+      const kind = String(a.SnapshotKind || a.snapshotKind || 'profile').toLowerCase()
       if (!snapDir) {
         console.error('restore 需要 -BackupDir <快照目录>')
+        return 2
+      }
+      // 拼错的快照类型不能静默当 profile：那是「以为在还原插件，实际覆盖了 profile」。
+      if (!['profile', 'plugin', 'session'].includes(kind)) {
+        console.error(`未知的快照类型：${kind}（可选 profile / plugin / session）`)
         return 2
       }
       if (!existsSync(snapDir)) {
         console.error(`快照目录不存在：${snapDir}`)
         return 2
       }
+      const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '')
+      if (kind === 'plugin' || kind === 'session') {
+        return restoreNonProfile({ kind, snapDir, dshHome, appRoot, profileName, stamp, a })
+      }
       const profileDir = join(dshHome, 'profiles', profileName)
-      const src = join(snapDir, 'profile')
-      if (!existsSync(src)) {
-        console.error(`快照里没有 profile/：${snapDir}`)
+      // 快照布局有三种，都要认：
+      //   <snap>/profile/…            —— 引擎早先的还原约定
+      //   <snap>/profiles/<name>/…    —— 引擎 apply 的备份（按 dshHome 相对路径落盘）
+      //   <snap>/package.json + …     —— PowerShell apply 的备份（平铺）
+      // 只认第一种会让「在另一台机器上还原」直接失败。
+      const layoutCandidates = [join(snapDir, 'profile'), join(snapDir, 'profiles', profileName), snapDir]
+      const FLAT_MARKERS = ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'cordis.yml', 'cordis.patch.yml', 'AGENTS.md', 'prompt-inject.md']
+      // 第一种：带 profile 目录的布局；第二种：平铺布局 —— 但必须真的含至少一个 profile 文件。
+      // 只按「是个目录」就认，会把空目录/指错的目录也当快照：先建一份无用的还原前备份，
+      // 再打印「已从 X 还原（写入 0 个文件）」，最后才报失败。
+      const src = layoutCandidates.find((d) => existsSync(join(d, 'package.json')))
+        || layoutCandidates.find((d) => d === snapDir && FLAT_MARKERS.some((f) => existsSync(join(d, f))))
+      if (!src) {
+        console.error(`快照里没有可还原的 profile（没找到 profile/ 或平铺的 package.json 等文件）：${snapDir}`)
         return 2
       }
-      const restoreBackupRoot = join(dshHome, 'backups', `restore-before-${new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '')}`)
+      const restoreBackupRoot = join(dshHome, 'backups', `restore-before-${stamp}`)
       mkdirSync(profileDir, { recursive: true })
       // 还原同样是"覆盖本机"：先把当前 profile 留底，否则还原错了没有回头路。
       for (const f of walk(profileDir)) {
@@ -825,8 +1273,27 @@ export async function runCli(argv) {
         copyFileSync(f.full, target)
       }
       // 根必须用探测值（appRoot 可能为空串）——否则 {{APP_ROOT}} 会被展开成空，写出坏路径
-      copyWithExpand(src, profileDir, collectRoots(probeLocal({ dshHome, appRoot, workspaceHome })))
-      console.log(`已从 ${snapDir} 还原 profile → ${profileDir}`)
+      if (src === snapDir) {
+        // 平铺快照：只还原 profile 的那几个文件，另外 AGENTS.md 属于 dshHome 根。
+        const profileFiles = ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'cordis.yml', 'cordis.patch.yml']
+        let restored = 0
+        for (const f of profileFiles) {
+          const s = join(snapDir, f)
+          if (!existsSync(s)) continue
+          copyFileSync(s, join(profileDir, f)); restored++
+        }
+        for (const f of ['AGENTS.md', 'prompt-inject.md']) {
+          const s = join(snapDir, f)
+          if (!existsSync(s)) continue
+          copyFileSync(s, join(dshHome, f)); restored++
+        }
+        console.log(`已从 ${snapDir} 还原 profile → ${profileDir}（平铺快照，写入 ${restored} 个文件）`)
+        console.log(`还原前的 profile 已留底：${restoreBackupRoot}`)
+        return restored > 0 ? 0 : 2
+      }
+      const exp = copyWithExpand(src, profileDir, collectRoots(probeLocal({ dshHome, appRoot, workspaceHome })))
+      console.log(`已从 ${snapDir} 还原 profile → ${profileDir}（写入 ${exp.files} 个文件）`)
+      for (const s of exp.skipped || []) console.error(`  - 跳过 ${s}`)
       console.log(`还原前的 profile 已留底：${restoreBackupRoot}`)
       return 0
     }

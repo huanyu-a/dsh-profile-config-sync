@@ -1,4 +1,4 @@
-<#
+﻿<#
 DSH 配置同步 —— 一条命令入口（把原来的「capture + git add + commit + push」和「git pull + apply」各收成一次调用）
 
 用法
@@ -48,9 +48,8 @@ if (-not $RepoRoot) { $RepoRoot = $PSScriptRoot }
 Reset-SyncNotices $DshHome $Action
 
 function Get-SyncSettings {
-  $p = Join-Path $DshHome 'dsh-config-sync.json'
-  if (-not (Test-Path -LiteralPath $p)) { return $null }
-  try { return (Get-Content -LiteralPath $p -Raw -Encoding utf8 | ConvertFrom-Json) } catch { return $null }
+  # 面板保存设置走 rename，读者可能撞上极短的占用窗口；重试逻辑放在 common 里，可被夹具直接测。
+  return (Read-JsonFileWithRetry (Join-Path $DshHome 'dsh-config-sync.json'))
 }
 
 function Test-WebdavActive($s) {
@@ -61,6 +60,12 @@ function Test-WebdavActive($s) {
 }
 
 $SyncSettings = Get-SyncSettings
+# 文件在但读不出来（占用/损坏）：默认明确报错，绝不能让「读失败」伪装成「没配 WebDAV，走 git」。
+# 但 status 是诊断命令：它本身就应该能回答「现在什么状态」，所以降级成警告、继续往下走。
+if (-not $SyncSettings -and (Test-Path -LiteralPath (Join-Path $DshHome 'dsh-config-sync.json'))) {
+  $settingsUnreadable = "读不出同步设置（文件存在但此刻读不到或解析失败）：{0}。稍后重试；反复出现请在面板里重新保存一次设置。" -f (Join-Path $DshHome 'dsh-config-sync.json')
+  if ($Action -eq 'status') { Warn $settingsUnreadable } else { Die $settingsUnreadable }
+}
 $UseWebdav = Test-WebdavActive $SyncSettings
 
 # git 位置探测统一在 dsh-sync-common.ps1 里（Get-GitExe）；WebDAV 模式不依赖 git
@@ -85,9 +90,12 @@ Say "== DSH 配置同步 / $Action =="
 Say "仓库：$RepoRoot"
 
 function Get-RepoState {
-  $branch = (& $git -C $RepoRoot rev-parse --abbrev-ref HEAD 2>$null)
-  $head = (& $git -C $RepoRoot log -1 --oneline 2>$null)
-  $dirty = @(& $git -C $RepoRoot status --porcelain 2>$null)
+  # 不能直接 `& $git ... 2>$null`：$ErrorActionPreference='Stop' 下 native 命令往 stderr 写东西
+  # 会被包成终止错误（脚本 94-98 行自己记的就是这条规律）。而空仓库上 `log -1` 必然写 fatal，
+  # 于是新 init、还没第一个 commit 时 `sync.ps1 status` 直接崩。统一走 Get-GitText（cmd 转发看退出码）。
+  $branch = (Get-GitText 'rev-parse --abbrev-ref HEAD').Text
+  $head = (Get-GitText 'log -1 --oneline').Text
+  $dirty = @((Get-GitText 'status --porcelain').Text -split "`r?`n" | Where-Object { $_ -and $_.Trim() })
   return [pscustomobject]@{ Branch = $branch; Head = $head; Dirty = $dirty.Count }
 }
 
@@ -130,7 +138,7 @@ function Write-SyncState([string]$Mode) {
       head       = $head
     }
     $text = ((($state | ConvertTo-Json -Depth 4) -replace "`r`n", "`n") + "`n")
-    [IO.File]::WriteAllText((Join-Path $DshHome 'config-sync-state.json'), $text, (New-Object Text.UTF8Encoding($false, $false)))
+    $null = Write-FileAtomic (Join-Path $DshHome 'config-sync-state.json') $text (New-Object Text.UTF8Encoding($false, $false))
   } catch {
     Warn ('写同步状态失败（不影响同步本身）：{0}' -f $_.Exception.Message)
   }
@@ -175,7 +183,7 @@ function Read-ConflictFile {
 
 function Write-ConflictFile($obj) {
   $text = ((($obj | ConvertTo-Json -Depth 8) -replace "`r`n", "`n") + "`n")
-  [IO.File]::WriteAllText((Get-ConflictPath), $text, (New-Object Text.UTF8Encoding($false, $false)))
+  Write-FileAtomic (Get-ConflictPath) $text (New-Object Text.UTF8Encoding($false, $false))
 }
 
 <#
@@ -425,6 +433,82 @@ function Restore-LocalKept($Report) {
   return $n
 }
 
+function Get-NodeExeForWebdav {
+  foreach ($c in @(
+    (Join-Path $AppRoot 'resources\runtime\primary-runtime\dependencies\node\bin\node.exe'),
+    (Join-Path $AppRoot 'resources\runtime\bin\node.exe'),
+    (Join-Path $AppRoot 'resources\runtime\node.exe')
+  )) {
+    if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+  }
+  $cmd = Get-Command node.exe -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  return $null
+}
+
+function Find-WebdavScript {
+  foreach ($c in @(
+    (Join-Path $PSScriptRoot 'webdav.mjs'),
+    (Join-Path $RepoRoot 'webdav.mjs')
+  )) {
+    if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+  }
+  return $null
+}
+
+# 往 .git\info\exclude 追加一条排除规则（幂等）。
+# 坑：Add-Content -Encoding utf8 在文件不存在时会写 UTF-8 BOM（PS 5.1 实测首字节 239,187,191），
+# BOM 紧贴第一条规则，git 就认不出 `/路径` —— 症状是「只有第一条排除永远不生效」，
+# 含令牌/超限文件每轮被 git add -A 重新收进索引，只能靠门禁每轮再 reset 兜一次。
+# 这里统一用不带 BOM 的 UTF8 追加，并把旧版本留下的 BOM 去掉。
+function Add-GitExcludeEntry([string]$RelPath) {
+  $excludeFile = Join-Path $RepoRoot '.git\info\exclude'
+  $excludeDir = Split-Path -Parent $excludeFile
+  if (-not (Test-Path -LiteralPath $excludeDir)) { New-Item -ItemType Directory -Path $excludeDir -Force | Out-Null }
+  $exLine = '/' + ([string]$RelPath).Replace([string][char]92, '/')
+  $enc = New-Object Text.UTF8Encoding($false)
+  # 注意：不能用 [IO.File]::ReadAllText —— StreamReader 会自动吃掉 UTF-8 BOM，
+  # 于是"去掉历史 BOM"那段永远不生效。必须按字节判断首三字节。
+  $bytes = if (Test-Path -LiteralPath $excludeFile) { [IO.File]::ReadAllBytes($excludeFile) } else { [byte[]]@() }
+  $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+  $cur = [Text.Encoding]::UTF8.GetString($bytes)
+  if ($cur.Length -gt 0 -and $cur[0] -eq [char]0xFEFF) { $cur = $cur.Substring(1) }
+  if ($hasBom) { [IO.File]::WriteAllText($excludeFile, $cur, $enc) }
+  if ($cur -notmatch [regex]::Escape($exLine)) {
+    [IO.File]::AppendAllText($excludeFile, $exLine + "`r`n", $enc)
+  }
+}
+
+function Invoke-WebdavAction([string]$SubCmd) {
+  $nodeExe = Get-NodeExeForWebdav
+  if (-not $nodeExe) { Die "找不到 node.exe，无法执行 WebDAV 同步（请确认客户端完整或已安装 Node.js）。" }
+  $script = Find-WebdavScript
+  if (-not $script) { Die "找不到 webdav.mjs，无法执行 WebDAV 同步。" }
+  $eap = $ErrorActionPreference
+  $eapRestored = $false
+  try {
+    $ErrorActionPreference = 'Continue'
+    if ($SubCmd -eq 'probe') {
+      $out = (& $nodeExe $script $SubCmd -DshHome $DshHome -RepoRoot $RepoRoot 2>&1 | Out-String)
+      $ErrorActionPreference = $eap
+      $eapRestored = $true
+      $line = ($out -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+      if (-not $line) { return [pscustomobject]@{ ok = $false; error = ($out.Trim()) } }
+      try { return ($line | ConvertFrom-Json) } catch { return [pscustomobject]@{ ok = $false; error = ($out.Trim()) } }
+    }
+    & $nodeExe $script $SubCmd -DshHome $DshHome -RepoRoot $RepoRoot 2>&1 | ForEach-Object {
+      $l = [string]$_
+      if ($l -and $l.Trim()) { Say ('  ' + $l.TrimEnd()) }
+    }
+    $code = $LASTEXITCODE
+  } finally {
+    # 必须 finally 恢复：以前只在线性路径上恢复，一旦 & $nodeExe 抛错或脚本被删，
+    # 整个进程后续都停在 Continue —— 后面的 Die 之外的真错误不再终止，同步会带着错误继续跑。
+    if (-not $eapRestored) { $ErrorActionPreference = $eap }
+  }
+  if ($code -ne 0) { Die ("WebDAV $SubCmd 失败（退出码 $code）。") }
+}
+
 # ---------- status ----------
 if ($Action -eq 'status') {
   if ($UseWebdav) {
@@ -443,15 +527,25 @@ if ($Action -eq 'status') {
   }
   $app = Get-HostAppVersion $AppRoot
   $contract = $null
+  $contractDoc = $null
   $cp = Join-Path $RepoRoot 'profile\host-contract.json'
   if (Test-Path -LiteralPath $cp) {
-    try { $contract = [string](Get-Content -LiteralPath $cp -Raw -Encoding utf8 | ConvertFrom-Json).appVersion } catch { $contract = $null }
+    try { $contractDoc = Get-Content -LiteralPath $cp -Raw -Encoding utf8 | ConvertFrom-Json } catch { $contractDoc = $null }
+  }
+  if ($contractDoc) {
+    # 老格式契约（缺 electronVersion / platforms）不当基准：上游时期它可能把 Electron 版本写进 appVersion，
+    # 拿它比会一直报「版本不一致」。这种契约按「待重写」处理，不吓用户。
+    if (Test-ContractStale $contractDoc $app) {
+      Warn "仓库契约需要按本机版本重写（下一次推送会重写）"
+    } else {
+      $contract = [string]$contractDoc.appVersion
+    }
   }
   if ($app -and $contract) {
     if ($app -eq $contract) { Ok "版本一致：app = $app" }
     else { Warn "版本不一致：本机 app = $app，仓库契约 = $contract（pull 会被拒绝，除非加 -AllowVersionDrift）" }
-  } else {
-    Warn ("版本信息不全：本机 app = {0}，仓库契约 = {1}" -f $app, $contract)
+  } elseif (-not $app) {
+    Warn ("读不到本机 app 版本（{0}）：无法做版本校验" -f 'resources\app\package.json / app.asar')
   }
   $pkg = Join-Path $RepoRoot 'profile\package.json'
   if (Test-Path -LiteralPath $pkg) {
@@ -571,73 +665,24 @@ function Initialize-RepoSkeleton {
 
   $contractPath = Join-Path $RepoRoot 'profile\host-contract.json'
   if (-not (Test-Path -LiteralPath $contractPath)) {
-    $ver = ''
-    $pkg = Join-Path $AppRoot 'resources\app\package.json'
-    if (Test-Path -LiteralPath $pkg) {
-      try { $ver = [string](Get-Content -LiteralPath $pkg -Raw -Encoding utf8 | ConvertFrom-Json).version } catch { }
-    }
-    if (-not $ver) {
-      $vf = Join-Path $AppRoot 'version'
-      if (Test-Path -LiteralPath $vf) { $ver = (Get-Content -LiteralPath $vf -Raw -Encoding utf8).Trim() }
-    }
+    # 版本必须取「客户端 app 版本」——Get-HostAppVersion 会读 resources\app\package.json，
+    # 读不到再从 app.asar 里解 dsh/package.json。
+    # 旧写法自己找一套回退：先 resources\app\package.json，再 <AppRoot>\version。
+    # 但这台安装根本没有 resources\app\package.json，<AppRoot>\version 是 **Electron** 版本（实测 44.7.0），
+    # 于是「首次推送」把契约写成 Electron 版本，另一台按 app 版本比对永远不一致，pull 被永久拒绝。
+    $ver = Get-HostAppVersion $AppRoot
     if ($ver) {
       $dir = Join-Path $RepoRoot 'profile'
       if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-      $obj = [ordered]@{
-        appVersion  = $ver
-        generatedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-        note        = '由 dsh-config-sync 首次推送生成（客户端版本契约）'
-      }
-      [IO.File]::WriteAllText($contractPath, ($obj | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
+      # 写现代形状（带 electronVersion）：apply.ps1 / contract.mjs 把「缺 electronVersion 的契约」判为老格式并忽略，
+      # 只写 appVersion 会让两端都以为「仓库没有契约」。
+      $text = ("{`n  `"appVersion`": `"$ver`",`n  `"electronVersion`": `"$(Get-HostElectronVersion $AppRoot)`"`n}`n" -replace "`r`n", "`n")
+      Write-FileAtomic $contractPath $text (New-Object Text.UTF8Encoding($false, $false))
       Ok "已写入版本契约：$ver"
     } else {
       Warn "读不到本机客户端版本，跳过 profile\host-contract.json（另一台 pull 时会跳过版本校验）"
     }
   }
-}
-
-function Get-NodeExeForWebdav {
-  foreach ($c in @(
-    (Join-Path $AppRoot 'resources\runtime\primary-runtime\dependencies\node\bin\node.exe'),
-    (Join-Path $AppRoot 'resources\runtime\bin\node.exe'),
-    (Join-Path $AppRoot 'resources\runtime\node.exe')
-  )) {
-    if ($c -and (Test-Path -LiteralPath $c)) { return $c }
-  }
-  $cmd = Get-Command node.exe -ErrorAction SilentlyContinue
-  if ($cmd) { return $cmd.Source }
-  return $null
-}
-
-function Find-WebdavScript {
-  foreach ($c in @(
-    (Join-Path $PSScriptRoot 'webdav.mjs'),
-    (Join-Path $RepoRoot 'webdav.mjs')
-  )) {
-    if ($c -and (Test-Path -LiteralPath $c)) { return $c }
-  }
-  return $null
-}
-
-function Invoke-WebdavAction([string]$SubCmd) {
-  $nodeExe = Get-NodeExeForWebdav
-  if (-not $nodeExe) { Die "找不到 node.exe，无法执行 WebDAV 同步（请确认客户端完整或已安装 Node.js）。" }
-  $script = Find-WebdavScript
-  if (-not $script) { Die "找不到 webdav.mjs，无法执行 WebDAV 同步。" }
-  $eap = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  $out = (& $nodeExe $script $SubCmd -DshHome $DshHome -RepoRoot $RepoRoot 2>&1 | Out-String)
-  $code = $LASTEXITCODE
-  $ErrorActionPreference = $eap
-  if ($SubCmd -eq 'probe') {
-    $line = ($out -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
-    if (-not $line) { return [pscustomobject]@{ ok = $false; error = ($out.Trim()) } }
-    try { return ($line | ConvertFrom-Json) } catch { return [pscustomobject]@{ ok = $false; error = ($out.Trim()) } }
-  }
-  foreach ($l in ($out -split "`r?`n")) {
-    if ($l -and $l.Trim()) { Say ('  ' + $l.TrimEnd()) }
-  }
-  if ($code -ne 0) { Die ("WebDAV $SubCmd 失败（退出码 $code）。") }
 }
 
 function Initialize-EmptyRepo([string]$RemoteUrl) {
@@ -758,9 +803,31 @@ if ($Action -eq 'push') {
     if ($SkipWorkspace) { $captureArgs['SkipWorkspace'] = $true }
     if ($DeepVerify) { $captureArgs['DeepVerify'] = $true }
     & (Join-Path $PSScriptRoot 'capture.ps1') @captureArgs
+    # 3 = 另一个同步动作正在进行（capture 的互斥）：整条链要原样往上传，不能压成 1，
+    # 否则 post-exit 会当失败、pull 分支还会触发自动回滚。
+    if ($LASTEXITCODE -eq 3) { Warn "另一个同步动作正在进行，本次推送跳过。"; exit 3 }
     if ($LASTEXITCODE -ne 0) { Die "capture.ps1 未正常结束，已停止（未上传）。" }
+    # 上传前防泄漏门禁：清掉任何误落入仓库的本机私有凭据文件或含 GitHub 令牌的文件
+    $runtimeSelf = @('apply.ps1', 'capture.ps1', 'dsh-sync-common.ps1', 'post-exit.ps1', 'restore.ps1', 'sync.ps1', 'webdav.mjs', 'sync-engine.mjs')
+    Get-ChildItem -LiteralPath $RepoRoot -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      $rel = $_.FullName.Substring($RepoRoot.Length).TrimStart('\', '/')
+      if (-not $rel -or $rel -like '.git\*' -or $rel -like '.git/*' -or ($runtimeSelf -contains $rel)) { return }
+      if (Test-BlockedProfilePath $rel) {
+        # 浏览器剖面 / 凭据库：与凭据不是一回事，措辞必须分开（否则用户会去查令牌）
+        Warn ("安全拦截：发现浏览器剖面 / 凭据库文件（含登录态），已从仓库剔除（绝不上传）：$rel")
+        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+      } elseif (Test-SyncExtraSecret $_.FullName $DshHome) {
+        Warn ("安全拦截：发现含令牌或本机私有凭据的文件，已从仓库剔除（绝不上传）：$rel")
+        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+      }
+    }
     Say ""
     Say "== 上传到 WebDAV =="
+    $delQueue = Join-Path $DshHome 'config-sync-delete-cloud.json'
+    if (Test-Path -LiteralPath $delQueue) {
+      Invoke-WebdavAction 'delete-paths'
+      try { Remove-Item -LiteralPath $delQueue -Force } catch { }
+    }
     Invoke-WebdavAction 'upload'
     Ok "已通过 WebDAV 推送到云端"
     Write-SyncState 'push'
@@ -840,7 +907,10 @@ if ($Action -eq 'push') {
   if ($SkipWorkspace) { $captureArgs['SkipWorkspace'] = $true }
   if ($DeepVerify) { $captureArgs['DeepVerify'] = $true }
   & (Join-Path $PSScriptRoot 'capture.ps1') @captureArgs
+  if ($LASTEXITCODE -eq 3) { Warn "另一个同步动作正在进行，本次推送跳过。"; exit 3 }
   if ($LASTEXITCODE -ne 0) { Die "capture.ps1 未正常结束，已停止（未提交）。" }
+  $delQueue = Join-Path $DshHome 'config-sync-delete-cloud.json'
+  if (Test-Path -LiteralPath $delQueue) { try { Remove-Item -LiteralPath $delQueue -Force } catch { } }
 
   Say ""
   Say "== 提交 =="
@@ -849,6 +919,50 @@ if ($Action -eq 'push') {
   # 走 Read-GitLines：中文目录名若被 quotepath 转义成 "…\347\240\264…"，连引号一起拿进
   # Test-Path -LiteralPath 就是「路径中具有非法字符」，整次同步会在这里挂掉
   $pending = @((Read-GitLines 'diff --cached --name-only').Lines)
+
+  # ---------- 令牌 / 私密凭据防泄漏门禁（提交前） ----------
+  if ($pending.Count -gt 0) {
+    $runtimeSelf = @('apply.ps1', 'capture.ps1', 'dsh-sync-common.ps1', 'post-exit.ps1', 'restore.ps1', 'sync.ps1', 'webdav.mjs', 'sync-engine.mjs')
+    $secretHits = @()
+    foreach ($rel in $pending) {
+      if ($runtimeSelf -contains ([string]$rel).Replace('\', '/')) { continue }
+      try {
+        $full = Join-Path $RepoRoot $rel
+        if (-not (Test-Path -LiteralPath $full)) { continue }
+        if (Test-SyncExtraSecret $full $DshHome) { $secretHits += [string]$rel }
+      } catch { }
+    }
+    if ($secretHits.Count -gt 0) {
+      foreach ($relPath in $secretHits) {
+        # reset 也可能因为索引被占用（.git\index.lock）往 stderr 写错；EAP=Stop 下会打断整次推送，
+        # 留下一批「全部已 staged」的半提交态。这里只告警，不终止。
+        try { & $git -C $RepoRoot reset -q -- $relPath 2>$null } catch { Warn ("从索引撤回失败（下次提交前会再撤一次）：" + $relPath) }
+        try { Add-GitExcludeEntry $relPath } catch { }
+        Warn ("安全拦截：检测到本机私有凭据或 GitHub 令牌，已阻止提交并排除：$relPath")
+      }
+      $pending = @((Read-GitLines 'diff --cached --name-only').Lines)
+    }
+  }
+
+  # ---------- 浏览器剖面 / 凭据库门禁（提交前，0.6.14） ----------
+  # 与 WebDAV 门禁共用同一份段名名单。为什么必须在这里挡：`git add -A` 会把仓库目录里
+  # 一切新文件收进索引，而**历史里的东西删不干净** —— 一旦 login data / cookies 进了提交，
+  # 后面就算删文件也只是再加一个删除提交，远端 clone 依旧拿得到。
+  if ($pending.Count -gt 0) {
+    $profileHits = @()
+    foreach ($rel in $pending) {
+      try { if (Test-BlockedProfilePath ([string]$rel)) { $profileHits += [string]$rel } } catch { }
+    }
+    if ($profileHits.Count -gt 0) {
+      foreach ($relPath in $profileHits) {
+        try { & $git -C $RepoRoot reset -q -- $relPath 2>$null } catch { Warn ("从索引撤回失败（下次提交前会再撤一次）：" + $relPath) }
+        try { Add-GitExcludeEntry $relPath } catch { }
+        Warn ("安全拦截：浏览器剖面 / 凭据库文件（含登录态），已阻止提交并排除：$relPath")
+      }
+      Warn '这些文件仍留在磁盘；它们不该离开本机。要同步某个插件的小配置，把它挪出这些目录名即可。'
+      $pending = @((Read-GitLines 'diff --cached --name-only').Lines)
+    }
+  }
 
   # ---------- 单文件上限预检（提交前） ----------
   # capture 已在源头挡掉 workspace 里 >100MB 的资料，但仓库目录里仍可能有别处来的大文件
@@ -872,19 +986,10 @@ if ($Action -eq 'push') {
       }
     }
     if ($tooLarge.Count -gt 0) {
-      $excludeFile = Join-Path $RepoRoot '.git\info\exclude'
-      $excludeDir = Split-Path -Parent $excludeFile
-      if (-not (Test-Path -LiteralPath $excludeDir)) { New-Item -ItemType Directory -Path $excludeDir -Force | Out-Null }
       foreach ($o in $tooLarge) {
         $relPath = [string]$o.Rel
-        & $git -C $RepoRoot reset -q -- $relPath 2>$null
-        $exLine = '/' + $relPath.Replace([string][char]92, '/')
-        try {
-          $cur = if (Test-Path -LiteralPath $excludeFile) { Get-Content -LiteralPath $excludeFile -Raw -Encoding utf8 } else { '' }
-          if ($cur -notmatch [regex]::Escape($exLine)) {
-            Add-Content -LiteralPath $excludeFile -Value $exLine -Encoding utf8
-          }
-        } catch { }
+        try { & $git -C $RepoRoot reset -q -- $relPath 2>$null } catch { Warn ("从索引撤回失败（下次提交前会再撤一次）：" + $relPath) }
+        try { Add-GitExcludeEntry $relPath } catch { }
         Warn ('超过单文件上限（{0:N1} MB ≥ {1:N0} MB），已从本次提交剔除：{2}' -f ($o.Bytes / 1MB), ($pushHardLimit / 1MB), $relPath)
         Add-SyncNotice -Kind 'too-large' -Path $relPath -Bytes $o.Bytes -Reason ('{0:N1} MB ≥ 单文件上限 {1:N0} MB，未提交也未推送' -f ($o.Bytes / 1MB), ($pushHardLimit / 1MB))
       }
@@ -1052,6 +1157,11 @@ if ($Action -eq 'push') {
 }
 
 # ---------- pull ----------
+# 动手前先问一句：别的同步动作在跑就整段跳过（退出码 3），别把仓库先改了再说。
+if (Test-SyncRunBusy $DshHome) {
+  Warn "另一个同步动作正在进行（同一个 DSH 目录），本次拉取没有执行。等它结束后再试一次。"
+  exit 3
+}
 if ($UseWebdav) {
   if ((Test-DshRunning) -and (-not $Force)) {
     Die "DeepSeek Harness 仍在运行。请完全退出（含托盘）后重跑，或加 -Force 强制继续。"

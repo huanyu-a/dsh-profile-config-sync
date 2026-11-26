@@ -21,6 +21,7 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs'
+import { writeFileAtomicSync } from './runtime/atomic-write.mjs'
 import { homedir, hostname, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -28,6 +29,8 @@ import { fileURLToPath } from 'node:url'
 import { runGuard, clearSessionCaches, appendGuardLog } from './runtime/tools/session-cache-guard.mjs'
 // 0.3.76：工作区显示状态（三态 + 会话独立隐藏），自包含读写 DSH 两个权威文件
 import { readView, setWorkspaceState, setSessionState } from './runtime/tools/workspace-view.mjs'
+// 0.5.2：在线推送的 CLIXML 日志清洗（单独成文件，自检可直接跑真实片段）
+import { extractLiveLogText } from './runtime/live-log.mjs'
 // 0.3.82：实时通道。拿不到 workspaceRegistry 时，这两个函数内部自动退回上面的文件写法。
 import { setWorkspaceStateLive, setSessionStateLive } from './runtime/tools/workspace-view.mjs'
 // 0.4.0：跨端（Windows / macOS / Linux）。平台差异全部收敛在 runtime/platform.mjs，
@@ -37,6 +40,7 @@ import {
   findGit, findSsh, hostNodeExe,
   hostDshNodeModules as platformHostDshNodeModules,
   isAppRoot as pfIsAppRoot, isFile as pfIsFile, platformFamily, platformLabel,
+  normalizeSyncExtraPaths,
 } from './runtime/platform.mjs'
 // 0.4.0：客户端身份（仓库里 machines/<id>.json）—— 跨端不分叉仓库，只登记「谁推的」
 import { listMachines } from './runtime/machines.mjs'
@@ -107,16 +111,82 @@ const PLUGIN_VERSION = (() => {
 // **不要**用 jsDelivr 兜清单：它对 `@main` 这类分支别名有明显缓存（实测发版后仍返回上一版清单，purge 接口也没
 // 立刻刷新），拿它当清单源会让"有新版本"晚几小时才出现，比读不到更误导人。
 // 用户自己在设置里填了清单地址时只用他那一个 —— 不掺镜像，免得"读到的其实不是他指定的源"。
-const RAW_MANIFEST_URL = 'https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/version.json'
+const UPDATE_REPO_OWNER = 'huanyu-a'
+const UPDATE_REPO_NAME = 'dsh-profile-config-sync'
+const RAW_MANIFEST_URL = `https://raw.githubusercontent.com/${UPDATE_REPO_OWNER}/${UPDATE_REPO_NAME}/main/version.json`
+const API_MANIFEST_URL = `https://api.github.com/repos/${UPDATE_REPO_OWNER}/${UPDATE_REPO_NAME}/contents/version.json?ref=main`
 const UPDATE_MANIFEST_MIRRORS = [
-  'https://gh-proxy.com/https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/version.json',
-  'https://ghfast.top/https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/version.json',
+  `https://gh-proxy.com/${RAW_MANIFEST_URL}`,
+  `https://ghfast.top/${RAW_MANIFEST_URL}`,
+  API_MANIFEST_URL,
   RAW_MANIFEST_URL,
 ]
 const UPDATE_MANIFEST_URL = RAW_MANIFEST_URL
 // 30 秒：慢链路 10 秒根本不够（raw 通的时候也要几百毫秒到十几秒不等）
 const UPDATE_FETCH_TIMEOUT = 30 * 1000
 const UPDATE_CHECK_TTL = 30 * 60 * 1000
+const GH_TOKEN_ENV_CANDIDATES = ['DSH_CONFIG_SYNC_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']
+
+const winEnvCache = new Map()
+function clearWinEnvCache() { winEnvCache.clear() }
+
+function parseEnvTokenRef(raw) {
+  const s = String(raw || '').trim()
+  if (!s) return ''
+  let m = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(s)
+  if (m) return m[1]
+  m = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(s)
+  if (m) return m[1]
+  m = /^env:([A-Za-z_][A-Za-z0-9_]*)$/i.exec(s)
+  if (m) return m[1]
+  return ''
+}
+
+function readWinEnvVar(name) {
+  if (!IS_WIN || !name) return ''
+  const now = Date.now()
+  const hit = winEnvCache.get(name)
+  if (hit && now - hit.at < 15000) return hit.value
+  let val = ''
+  const regPaths = ['HKCU\\Environment', 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment']
+  for (const regPath of regPaths) {
+    try {
+      const out = execFileSync('reg.exe', ['query', regPath, '/v', name], { windowsHide: true, encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'pipe'] })
+      const lines = String(out || '').split(/\r?\n/)
+      for (const line of lines) {
+        const m = line.match(/^\s*\S+\s+REG_(?:EXPAND_)?SZ\s+(.*)$/i)
+        if (m && m[1].trim()) { val = m[1].trim(); break }
+      }
+      if (val) break
+    } catch { }
+  }
+  winEnvCache.set(name, { value: val, at: now })
+  return val
+}
+
+function getEnvValue(name) {
+  const key = String(name || '').trim()
+  if (!key) return ''
+  const fromProc = String(process.env[key] || '').trim()
+  if (fromProc) return fromProc
+  return readWinEnvVar(key)
+}
+
+function resolveTokenSpec(spec, fallbackNames = GH_TOKEN_ENV_CANDIDATES) {
+  const raw = String(spec || '').trim()
+  const envRef = parseEnvTokenRef(raw)
+  if (envRef) {
+    return { token: getEnvValue(envRef), source: 'env', envName: envRef, rawRef: true }
+  }
+  if (raw) {
+    return { token: raw, source: 'file', envName: '', rawRef: false }
+  }
+  for (const name of (fallbackNames || [])) {
+    const v = getEnvValue(name)
+    if (v) return { token: v, source: 'env', envName: name, rawRef: false }
+  }
+  return { token: '', source: 'none', envName: '', rawRef: false }
+}
 
 /**
  * 定位客户端根目录（AppRoot）。
@@ -281,7 +351,9 @@ function backupRootOf(dshHome, settings) {
 }
 
 function writeSettings(dshHome, s) {
-  const payload = JSON.stringify({
+  // 归一化已知字段，但**以传入对象为底**：面板只提交一个开关时，不能把没说到的
+  // WebDAV 地址/账号/密码/模式（以及以后新增的键）连带清空 —— 那是数据丢失。
+  const merged = { ...(s && typeof s === 'object' ? s : {}),
     repoPath: s.repoPath || '',
     remoteUrl: s.remoteUrl || '',
     sshKey: s.sshKey || '',
@@ -299,8 +371,10 @@ function writeSettings(dshHome, s) {
     webdavUser: s.webdavUser || '',
     webdavPass: s.webdavPass || '',
     webdavDir: s.webdavDir || '',
-  }, null, 2) + '\n'
-  writeFileSync(settingsPath(dshHome), payload, 'utf8')
+  }
+  const payload = JSON.stringify(merged, null, 2) + '\n'
+  // 这份文件里有 WebDAV 密码与更新令牌：POSIX 上收紧到仅本人可读写（Windows 靠用户目录 ACL，0o600 是空操作）
+  writeFileAtomicSync(settingsPath(dshHome), payload, { mode: 0o600 })
 }
 
 /** 没配过时给一个能用的默认私钥：优先 gitee 那把，其次通用 id_ed25519。 */
@@ -1155,12 +1229,43 @@ async function inspect(config) {
     advice.push(t(`工作区有 ${dirty} 项未提交：退出 DSH 后跑「推送」会一并提交`, `${dirty} uncommitted change(s): running Push after DSH exits commits them too.`))
   }
   if (local.known && local.pending > 0) {
-    advice.push(t(
-      `本机有 ${local.pending} 个文件在上次同步之后有更新（新会话/资料之类），仓库里还没有：退出 DSH 后跑「推送」`,
-      `${local.pending} file(s) changed since the last sync (new sessions/materials) and are not in the repo yet: run Push after DSH exits.`,
-    ))
+    // 文案按「实际参与同步的类别」说：取消勾选「会话记录」后还写「新会话/资料」，
+    // 用户会以为取消勾选没生效（实测反馈）。这里只提真正会被推送的那些组，
+    // 并且按条数从多到少点名最多三类——待推送现在覆盖 12 组，只写「配置类文件」
+    // 会把「插件数据改了 3 个文件」说成配置变更，同样是错话。
+    const ranked = (Array.isArray(local.groups) ? local.groups : [])
+      .filter((g) => g && g.count > 0 && PENDING_GROUP_LABEL[g.id])
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 3)
+    const kindsZh = ranked.map((g) => PENDING_GROUP_LABEL[g.id][0]).join(' / ')
+    const kindsEn = ranked.map((g) => PENDING_GROUP_LABEL[g.id][1]).join(' / ')
+    advice.push(kindsZh
+      ? t(
+        `本机有 ${local.pending} 个文件在上次同步之后有更新（${kindsZh}${ranked.length < local.groups.length ? ' 等' : ''}），仓库里还没有：退出 DSH 后跑「推送」`,
+        `${local.pending} file(s) changed since the last sync (${kindsEn}${ranked.length < (local.groups || []).length ? ' etc.' : ''}) and are not in the repo yet: run Push after DSH exits.`,
+      )
+      : t(
+        `本机有 ${local.pending} 个文件在上次同步之后有更新，仓库里还没有：退出 DSH 后跑「推送」`,
+        `${local.pending} file(s) changed since the last sync and are not in the repo yet: run Push after DSH exits.`,
+      ))
   }
-  if (!advice.length) advice.push(t('仓库与本机一致，没有待办', 'The repo matches this machine — nothing to do.'))
+  if (!advice.length) {
+    // 「一致」这句话只有在真的扫完、且真的没变化时才成立：
+    // 从没同步过（known=false）与扫描被预算截断（truncated）都不等于「一致」。
+    if (local && local.known === false) {
+      advice.push(t('本机还没有同步记录：先推送一次，之后才知道哪些是新的', 'No sync record on this machine yet — push once, then the panel can tell what is new.'))
+    } else if (local && local.truncated) {
+      advice.push(t('待推送扫描没跑完（文件太多或超时），这次的数字可能偏小：可再刷新一次', 'The pending scan did not finish (too many files or a timeout); the count may be low — refresh again.'))
+    } else if (local && Array.isArray(local.engineGroups)) {
+      // 非 Windows：这句话只覆盖引擎真会同步的四组，不能写成「仓库与本机一致」
+      advice.push(t(
+        `这台机器走跨平台引擎，只同步 ${local.engineGroups.join(' / ')}，这几组与仓库一致（会话记录、插件数据、额外路径要 Windows 版才会同步）`,
+        `This machine uses the cross-platform engine, which syncs only ${local.engineGroups.join(' / ')}; those groups match the repo (conversations, plugin data and extra paths sync on Windows).`,
+      ))
+    } else {
+      advice.push(t('仓库与本机一致，没有待办', 'The repo matches this machine — nothing to do.'))
+    }
+  }
 
   return {
     ok: true,
@@ -1219,7 +1324,7 @@ async function inspect(config) {
       sshKeyExists: Boolean(sshKey) && isFile(sshKey),
       sshKeyFrom: settings.sshKey ? 'settings' : (sshKey ? 'default' : 'none'),
       sshConfig: isFile(join(homedir(), '.ssh', 'config')),
-      updateTokenSet: Boolean(settings.updateToken),
+      updateTokenSet: Boolean(resolveTokenSpec(settings.updateToken, settings.updateManifestUrl ? [] : GH_TOKEN_ENV_CANDIDATES).token),
       // 备份根：留空=默认。面板「还原备份」卡据此显示当前值并判断是否被改过
       backupRoot: backupRootOf(dshHome, settings),
       backupRootCustom: Boolean(settings.backupRoot),
@@ -1775,8 +1880,11 @@ const autoState = {
     ok: null,
     phase: '',
     message: '',
+    detail: '',
+    recent: [],
     log: '',
     initPush: false,
+    transport: '',
   },
 }
 
@@ -1939,7 +2047,7 @@ function psWinArg(value) {
  *    detached=false 立刻就在写日志。所以这里不 detached，而是让一个短命 powershell 用
  *    Start-Process 把真正的 post-exit 起成独立进程 —— 父进程（DSH）退出后它照样活着。
  */
-async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs = [] }) {
+async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs = [], closeRequested = false }) {
   const script = autoScript(dshHome, repo)
   if (!script) return { ok: false, error: t('插件与仓库里都没有 post-exit.ps1，无法排队', 'post-exit.ps1 is in neither the plugin nor the repo — cannot queue') }
 
@@ -1977,6 +2085,9 @@ async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs =
     // 否则排队期间（可能几小时）会一直挂着一个挡视线的空窗口。
     '-Mode', mode, '-WatchPid', String(process.pid), '-Phase', 'wait', '-DshHome', dshHome,
     '-PidFile', pidFile]
+  // 只有「插件自己请求过关闭客户端」的流程才允许守护进程在窗口消失后强杀残留进程；
+  // 被动等待（自动推送/拉取）绝不强杀 —— 否则用户把窗口收进托盘就会被静默杀掉。
+  if (closeRequested) args.push('-CloseWhenIdle')
   if (repo) args.push('-RepoRoot', repo)
   if (appRoot) args.push('-AppRoot', appRoot)
   if (restart) args.push('-Restart')
@@ -2102,11 +2213,19 @@ function readSyncState(dshHome) {
 
 /** 本机登记的工作区目录（capture 会把它们镜像进仓库，所以它们变了也算待推送）。 */
 function workspaceRoots(dshHome) {
-  const reg = readJson(join(dshHome, 'storages', 'workspace.json')) || {}
-  const list = (reg.tables && reg.tables.workspaces) || reg.workspaces || []
-  return Array.isArray(list)
-    ? list.map((w) => (w && typeof w.path === 'string' ? w.path : '')).filter(Boolean)
-    : []
+  return listWorkspaceEntries(dshHome).map((w) => w.path).filter(Boolean)
+}
+
+function encodeSessionDirName(pathStr) {
+  let out = '--'
+  for (const ch of String(pathStr || '')) {
+    const c = ch.charCodeAt(0)
+    if (c === 58) continue
+    if (c === 92 || c === 47) { out += '-'; continue }
+    if (c < 128) out += ch
+    else out += '~' + c.toString(16).toUpperCase().padStart(4, '0')
+  }
+  return out + '--'
 }
 
 // 本机待推送文件按「同步内容」的分组归类；标签与 collectScopeGroups 的 titleZh/titleEn 对齐
@@ -2126,16 +2245,26 @@ const PENDING_GROUP_LABEL = {
   other: ['其它', 'Other'],
 }
 
-function pendingGroupOf(file, dshHome, profileDir, workspacePaths) {
+function pendingGroupOf(file, dshHome, profileDir, workspacePaths, roots, settingsPaths) {
   const norm = String(file).replace(/\\/g, '/')
   const base = String(dshHome).replace(/\\/g, '/').replace(/\/+$/, '')
   const prof = String(profileDir).replace(/\\/g, '/').replace(/\/+$/, '')
+  // 设置类单文件排在最前：它们多数住在 <DshHome> 一级目录里（our-free-model / dsh-pet / task-board …），
+  // 同时也落在「插件数据」的槽里，先认成设置才不会被算到插件数据头上、也不会被 profile 前缀吞掉。
+  if (settingsPaths && settingsPaths.has(norm.toLowerCase())) return 'settings'
   if (prof && norm.startsWith(prof + '/')) return 'profile'
   if (/\/AGENTS\.md$|\/prompt-inject\.md$/i.test(norm)) return 'prompt'
   if (norm.startsWith(base + '/skills/')) return 'skills'
   if (norm.startsWith(base + '/.agent-presets/')) return 'presets'
+  if (norm.startsWith(base + '/storages/@montersy123/dsh-skill-market/data/')) return 'storages-record'
   if (norm.startsWith(base + '/mnemon/')) return 'mnemon'
   if (norm.startsWith(base + '/sessions/')) return 'conversations'
+  // 用户自己指定的根（插件数据槽 / 额外路径 / 本地插件包）先认：
+  // 额外路径很可能就指在某个工作区里，那种情况该算「额外路径」而不是「工作区资料」。
+  for (const r of roots || []) {
+    const rn = String(r.path).replace(/\\/g, '/').replace(/\/+$/, '')
+    if (rn && (norm === rn || norm.startsWith(rn + '/'))) return r.group
+  }
   for (const w of workspacePaths || []) {
     const wn = String(w).replace(/\\/g, '/').replace(/\/+$/, '')
     if (wn && norm.startsWith(wn + '/')) return 'workspace'
@@ -2167,29 +2296,171 @@ function sessionTitleOf(dshHome, sessionId) {
 function localPending(dshHome, lastSyncAt, profileName, ctx = {}) {
   const since = lastSyncAt ? Date.parse(lastSyncAt) : NaN
   if (!Number.isFinite(since)) return { known: false, pending: 0, newestAt: '', sample: [], groups: [] }
-  const skip = new Set(['node_modules', '.git', 'models', '_tmp', 'staging', 'logs', 'attachments'])
+  // 注意 attachments 不在跳过名单里：conversations 组现在把 <DshHome>\attachments 也算一块
+  // （capture 就是这么抓的），留着它会让附件永远不计入待推送。
+  const skip = new Set(['node_modules', '.git', 'models', '_tmp', 'staging', 'logs'])
   const profile = join(dshHome, 'profiles', profileName || 'desktop')
-  const workspacePaths = workspaceRoots(dshHome)
+  const appRoot = String(ctx.appRoot || '')
+  const scope = readScope(dshHome)
+  const wsEntries = listWorkspaceEntries(dshHome)
+  const wsEncToId = new Map()
+  const activeWorkspacePaths = []
+  for (const w of wsEntries) {
+    if (w.path) wsEncToId.set(encodeSessionDirName(w.path), w.id)
+    if (w.path && scopeItemEnabled(scope, 'workspace', w.id)) activeWorkspacePaths.push(w.path)
+  }
+  const workspacePaths = scopeGroupEnabled(scope, 'workspace') ? activeWorkspacePaths : []
+  // 分组归类靠这张表：便宜的配置类根（下面 stack2）按路径前缀一眼能认出来，
+  // 而插件数据 / 额外路径 / 本地插件包这类「用户自己指定的根」只能登记下来再比对。
+  const roots = []
+  // 只有「设置组真的会同步的那个文件」才算设置：关掉设置组之后，这些文件如果还落在
+  // 某个插件数据槽里，capture 会以插件数据的名义照抓，这时就该算插件数据（否则会漏报）。
+  const settingsPaths = new Set(
+    scopeGroupEnabled(scope, 'settings')
+      ? SYNC_SETTINGS_SOURCES
+        .filter((e) => scopeItemEnabled(scope, 'settings', e.id))
+        .map((e) => settingsSourcePath(dshHome, profile, e).replace(/\\/g, '/').toLowerCase())
+      : [],
+  )
+  const addRoot = (path, group, item, extra) => {
+    if (!path) return null
+    roots.push({ path, group, item: item || '', ...(extra || {}) })
+    return path
+  }
+  // ① 便宜且要紧的根（先扫完，再扫贵的）：profile / 提示 / Skills / 预设 / 台账 / 设置 / 记忆 / 会话
   const stack = [
-    join(dshHome, 'sessions'),
-    join(dshHome, 'skills'),
-    join(dshHome, '.agent-presets'),
-    join(dshHome, 'mnemon'),
-    join(dshHome, 'AGENTS.md'),
-    join(dshHome, 'prompt-inject.md'),
     join(profile, 'package.json'),
     join(profile, 'pnpm-lock.yaml'),
+    join(profile, 'pnpm-workspace.yaml'),
+    join(profile, 'cordis.yml'),
     join(profile, 'cordis.patch.yml'),
     join(profile, 'host-contract.json'),
-    ...workspaceRoots(dshHome),
   ]
+  if (scopeGroupEnabled(scope, 'prompt')) {
+    if (scopeItemEnabled(scope, 'prompt', 'AGENTS.md')) stack.push(join(dshHome, 'AGENTS.md'))
+    if (scopeItemEnabled(scope, 'prompt', 'prompt-inject.md')) stack.push(join(dshHome, 'prompt-inject.md'))
+  }
+  if (scopeGroupEnabled(scope, 'skills')) {
+    const skillsRoot = join(dshHome, 'skills')
+    for (const name of listSubDirs(skillsRoot)) {
+      if (scopeItemEnabled(scope, 'skills', name)) stack.push(join(skillsRoot, name))
+    }
+  }
+  if (scopeGroupEnabled(scope, 'presets')) {
+    const presetsRoot = join(dshHome, '.agent-presets')
+    for (const name of listSubDirs(presetsRoot)) {
+      if (scopeItemEnabled(scope, 'presets', name)) stack.push(join(presetsRoot, name))
+    }
+  }
+  // 技能市场台账：capture 抓的是这两个 fixed 文件，面板的待推送也只看这两个
+  if (scopeGroupEnabled(scope, 'storages-record')) {
+    const ledgerDir = join(dshHome, 'storages', '@montersy123', 'dsh-skill-market', 'data')
+    for (const [file, id] of [['installed.json', 'skill-market-installed.json'], ['panel.json', 'skill-market-panel.json']]) {
+      if (scopeItemEnabled(scope, 'storages-record', id)) stack.push(join(ledgerDir, file))
+    }
+  }
+  // 插件设置与工作流：与 collectScopeGroups / capture 的 Get-SyncSettingsMap 同一份清单（14 条）
+  if (scopeGroupEnabled(scope, 'settings')) {
+    for (const entry of SYNC_SETTINGS_SOURCES) {
+      if (!scopeItemEnabled(scope, 'settings', entry.id)) continue
+      stack.push(settingsSourcePath(dshHome, profile, entry))
+    }
+  }
+  // 记忆数据：capture 读的是 <AppRoot>\mnemon（不是 <DshHome>\mnemon，这里以前写错过）
+  if (scopeGroupEnabled(scope, 'mnemon') && appRoot) {
+    const mnemonRoot = join(appRoot, 'mnemon')
+    addRoot(mnemonRoot, 'mnemon', 'mnemon')
+    stack.push(mnemonRoot)
+  }
+  // ② 贵的根（会话、工作区、插件数据、额外路径、本地插件包）：扫描预算有限，
+  //    它们必须排在便宜的配置类之后，否则工作区里两万个文件会把 skills/profile 挤出去，
+  //    面板就报「配置没变」而其实配置变了。
+  const deferred = []
+  let extraCfg = null
+  try { extraCfg = readExtraConfig(dshHome) } catch { extraCfg = null }
+  if (scopeGroupEnabled(scope, 'conversations')) {
+    // conversations 组在 capture 里是四块（sessions / attachments / projcache / policies），
+    // 以前待推送只数 sessions：往附件里丢一张图、或某个会话的 projcache 更新，
+    // 面板照样说「仓库与本机一致」，一推却动了文件。
+    const sessRoot = join(dshHome, 'sessions')
+    const skipSessIds = new Set()
+    for (const dirName of listSubDirs(sessRoot)) {
+      if (/default-workspace/i.test(dirName)) continue
+      const wsId = wsEncToId.get(dirName)
+      if (wsId && !scopeItemEnabled(scope, 'conversations', wsId)) {
+        for (const sid of listSubDirs(join(sessRoot, dirName))) skipSessIds.add(sid)
+        continue
+      }
+      deferred.push(join(sessRoot, dirName))
+    }
+    const attachRoot = join(dshHome, 'attachments')
+    if (existsSync(attachRoot)) {
+      addRoot(attachRoot, 'conversations', 'attachments')
+      deferred.push(attachRoot)
+    }
+    // projcache / policies：第一段是会话 id（形如 <sid>.json），按被取消勾选的会话逐个筛掉
+    for (const [root, item] of [
+      [join(dshHome, 'storages', 'session_projcache', 'sessions'), 'projcache'],
+      [join(dshHome, 'storages', 'vision_router_session_policy', 'policies'), 'policies'],
+    ]) {
+      if (!existsSync(root)) continue
+      addRoot(root, 'conversations', item, { skipSessionIds: skipSessIds })
+      deferred.push(root)
+    }
+  }
+  deferred.push(...workspacePaths)
+  // 本地插件包：capture 把 link: 挂进来的插件目录打成 zip，所以源目录就是待推送的判据
+  if (scopeGroupEnabled(scope, 'local-plugins')) {
+    try {
+      const pkg = readJson(join(profile, 'package.json')) || {}
+      const deps = pkg.dependencies || {}
+      for (const [name, spec] of Object.entries(deps)) {
+        if (typeof spec !== 'string' || !spec.startsWith('link:')) continue
+        const target = spec.slice(5)
+        const leaf = String(target).split(/[\\/]+/).filter(Boolean).pop() || name
+        if (!scopeItemEnabled(scope, 'local-plugins', leaf)) continue
+        if (!isDir(target)) continue
+        addRoot(target, 'local-plugins', leaf)
+        deferred.push(target)
+      }
+    } catch { /* link 目标读不出来就不算，反正 push 时还会再判一次 */ }
+  }
+  // 插件数据：槽清单与面板「插件数据」组一致（都是 <DshHome> 一级目录去掉 skipDirs 与隐藏目录），
+  // 但这里**不调 listPluginDataSlots**：那个函数会把每个槽整个数一遍文件，
+  // 而待推送扫描本来就要走一遍，数两遍纯粹浪费（browser-profiles 这种槽就几千个文件）。
+  if (extraCfg && scopeGroupEnabled(scope, 'plugin-data') && extraCfg.pluginData.enabled !== false) {
+    const skipDirs = new Set(extraCfg.pluginData.skipDirs || [])
+    let entries = []
+    try { entries = readdirSync(dshHome, { withFileTypes: true }) } catch { entries = [] }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue
+      if (skipDirs.has(e.name)) continue
+      if (e.name.startsWith('.')) continue
+      // 浏览器剖面/凭据库一律不扫（哪怕用户规则里删掉了这条跳过项）
+      if (isBlockedProfilePath(e.name)) continue
+      if (!scopeItemEnabled(scope, 'plugin-data', e.name)) continue
+      addRoot(join(dshHome, e.name), 'plugin-data', e.name)
+      deferred.push(join(dshHome, e.name))
+    }
+  }
+  // 额外路径：用户自己登记的 src（文件或目录），逐个按条目勾选
+  if (extraCfg && scopeGroupEnabled(scope, 'extra') && extraCfg.extra.enabled !== false) {
+    for (const p of extraCfg.extra.paths || []) {
+      if (!p || !p.src) continue
+      if (!scopeItemEnabled(scope, 'extra', p.id)) continue
+      addRoot(p.src, 'extra', p.id)
+      deferred.push(p.src)
+    }
+  }
+  // unshift 而不是 push：pop() 从尾部取，贵的根要排在数组前部才会最后被扫到
+  stack.unshift(...deferred)
   // 有仓库对应物的单文件：路径 → 仓库里的那份。只有这些才值得读内容比对。
   const repoRoot = String(ctx.repo || '')
   const mirrored = new Map()
   if (repoRoot) {
     mirrored.set(join(dshHome, 'AGENTS.md'), join(repoRoot, 'prompt', 'AGENTS.md'))
     mirrored.set(join(dshHome, 'prompt-inject.md'), join(repoRoot, 'prompt', 'prompt-inject.md'))
-    for (const f of ['package.json', 'pnpm-lock.yaml', 'cordis.patch.yml', 'host-contract.json']) {
+    for (const f of ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'cordis.yml', 'cordis.patch.yml', 'host-contract.json']) {
       mirrored.set(join(profile, f), join(repoRoot, 'profile', f))
     }
   }
@@ -2202,12 +2473,46 @@ function localPending(dshHome, lastSyncAt, profileName, ctx = {}) {
   // 每组保留具体明细名称（会话记录名 / 本机 profile 文件名 …），供面板展开查看
   const groupItems = new Map()
   const DETAIL_CAP = 50
+  // 用户自定的根（插件数据槽 / 额外路径 / 本地插件包）里 capture 还会按规则过滤：
+  // 插件数据与额外路径走 config-sync-extra.json 的 exclude 名单与单文件上限，本地插件包固定跳过
+  // .git / node_modules / releases / .cache。待推送计数必须同样过滤，否则「被排除的 .db 一直在变」
+  // 会让面板永远建议推送（插件自己的 sqlite 每次写入都会更新 mtime）。
+  const normRoots = roots.map((r) => ({
+    group: r.group,
+    base: String(r.path).replace(/\\/g, '/').replace(/\/+$/, ''),
+    skipSessionIds: r.skipSessionIds || null,
+    rules: (r.group === 'plugin-data' || r.group === 'extra') && extraCfg
+      ? { cfg: extraCfg, dirs: dirHasRules(extraCfg) }
+      : r.group === 'local-plugins' ? { cfg: null, segs: new Set(['.git', 'node_modules', 'releases', '.cache']) } : null,
+  }))
+  const ownerOf = (p) => {
+    const n = String(p).replace(/\\/g, '/')
+    for (const r of normRoots) {
+      if (n === r.base || n.startsWith(r.base + '/')) return r
+    }
+    return null
+  }
   while (stack.length && scanned < 20000 && Date.now() < deadline) {
     const cur = stack.pop()
     let st
     try { st = statSync(cur) } catch { continue }
+    const owner = ownerOf(cur)
+    // 浏览器剖面 / 凭据库的路径段：capture 永远不会抓（Test-BlockedProfilePath 硬拦），
+    // 待推送也不该数——否则浏览器一跑，几千个缓存/登录态文件就永远显示「待推送」。
+    if (owner && (owner.group === 'plugin-data' || owner.group === 'extra') && isBlockedProfilePath(relative(owner.base, String(cur).replace(/\\/g, '/')))) continue
+    // projcache / policies：第一段是会话 id（<sid>.json），被取消勾选的工作区里的会话整块不抓
+    if (owner && owner.skipSessionIds && owner.skipSessionIds.size) {
+      const head = relative(owner.base, String(cur).replace(/\\/g, '/')).split('/')[0] || ''
+      const sid = head.replace(/\.[^.]+$/, '')
+      if (owner.skipSessionIds.has(head) || owner.skipSessionIds.has(sid)) continue
+    }
     if (st.isDirectory()) {
       if (skip.has(basename(cur))) continue
+      const leaf = basename(cur).toLowerCase()
+      if (owner && owner.rules) {
+        if (owner.rules.dirs && owner.rules.dirs.some((re) => re.test(basename(cur)))) continue
+        if (owner.rules.segs && owner.rules.segs.has(leaf)) continue
+      }
       let entries = []
       try { entries = readdirSync(cur) } catch { continue }
       for (const e of entries) stack.push(join(cur, e))
@@ -2215,6 +2520,11 @@ function localPending(dshHome, lastSyncAt, profileName, ctx = {}) {
     }
     scanned++
     if (st.mtimeMs > since) {
+      // 被 capture 的规则排除掉的文件永远进不了仓库，不该算成「待推送」
+      if (owner && owner.rules && owner.rules.cfg) {
+        const rel = relative(owner.base, String(cur).replace(/\\/g, '/'))
+        if (extraSkipReason(rel, st.size, owner.rules.cfg)) continue
+      }
       // 镜像文件的 mtime 更新可能只是宿主重写占位符：内容归一后一致就不算待推送
       const twin = mirrored.get(cur)
       if (twin && isFile(twin)) {
@@ -2224,7 +2534,10 @@ function localPending(dshHome, lastSyncAt, profileName, ctx = {}) {
       }
       pending++
       if (st.mtimeMs > newest) newest = st.mtimeMs
-      const gid = pendingGroupOf(cur, dshHome, profile, workspacePaths)
+      const gid = pendingGroupOf(cur, dshHome, profile, workspacePaths, roots, settingsPaths)
+      // 非 Windows 走的是 runtime\sync-engine.mjs：它只抓 profile / 提示 / Skills / 预设。
+      // 在这台机器上把会话记录、插件数据、额外路径也算成「待推送」，等于承诺一件永远不会发生的事。
+      if (ENGINE_SYNCED_GROUPS && !ENGINE_SYNCED_GROUPS.has(gid)) { pending--; continue }
       groupCount.set(gid, (groupCount.get(gid) || 0) + 1)
       // 会话文件显示会话标题而不是目录 ID；其余显示父目录/文件名
       let label = `${basename(dirname(cur))}/${basename(cur)}`
@@ -2260,6 +2573,8 @@ function localPending(dshHome, lastSyncAt, profileName, ctx = {}) {
     groups,
     profileName: profileName || 'desktop',
     truncated: scanned >= 20000 || Date.now() >= deadline,
+    // 非 Windows 时只统计引擎真会同步的四组，把这件事说出来（面板会显示，不让用户以为别的组也在同步）
+    engineGroups: ENGINE_SYNCED_GROUPS ? [...ENGINE_SYNCED_GROUPS] : null,
   }
 }
 
@@ -2408,7 +2723,13 @@ async function handleSettings(req, res, config) {
 
     // 新仓库路径一落盘，后面的 git remote 要对它做，别用改之前解析出来的旧仓库。
     const repo = repoPath || (resolveRepo(config?.repoPath, dshHome).repo || '')
-    writeSettings(dshHome, { repoPath, remoteUrl, sshKey, autoPull, autoPush, autoRestart, updateToken, updateManifestUrl, backupRoot, defaultWorkspace, cacheGuard })
+    // 以「磁盘上的原始 JSON」为底：用户这次没提交的字段（尤其 webdav* / syncMode）必须原样留下。
+    const rawBefore = readJson(file) || {}
+    writeSettings(dshHome, {
+      ...rawBefore,
+      repoPath, remoteUrl, sshKey, autoPull, autoPush, autoRestart,
+      updateToken, updateManifestUrl, backupRoot, defaultWorkspace, cacheGuard,
+    })
 
     const changed = {
       repoPath: before.repoPath !== repoPath,
@@ -2572,16 +2893,16 @@ function resolveTgzUrl(manifest, manifestUrl = UPDATE_MANIFEST_URL) {
   return ''
 }
 
-async function fetchManifest(url, timeoutMs = UPDATE_FETCH_TIMEOUT) {
+async function fetchManifest(url, timeoutMs = UPDATE_FETCH_TIMEOUT, headers = {}) {
   if (typeof fetch !== 'function') throw new Error(t('当前运行环境没有 fetch，无法检查更新', 'fetch is unavailable in this runtime — cannot check for updates'))
   const seconds = Math.round(timeoutMs / 1000)
   const ctrl = typeof AbortController === 'function' ? new AbortController() : null
   let timedOut = false
   const timer = ctrl ? setTimeout(() => { timedOut = true; try { ctrl.abort() } catch { } }, timeoutMs) : null
   try {
-    const res = await fetch(url, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined })
+    const res = await fetch(url, { cache: 'no-store', headers, signal: ctrl ? ctrl.signal : undefined })
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status}${res.status === 403 ? t('（私有仓库要填只读令牌）', ' (a read-only token is required for private repos)') : ''}`)
+      throw new Error(`HTTP ${res.status}${(res.status === 401 || res.status === 403 || res.status === 404) ? t('（若为私有仓库，需配置只读令牌或环境变量）', ' (if private, configure a read-only token or env var)') : ''}`)
     }
     const json = await res.json()
     if (!json || !json.version) throw new Error(t('version.json 里没有 version 字段', 'version.json has no "version" field'))
@@ -2595,17 +2916,66 @@ async function fetchManifest(url, timeoutMs = UPDATE_FETCH_TIMEOUT) {
   }
 }
 
+/** 仅向直连官方域传令牌（绝不把令牌发给第三方反代 gh-proxy / ghfast）。 */
+function authHeadersForUrl(url, token) {
+  try {
+    const u = new URL(url)
+    const host = u.hostname.toLowerCase()
+    if (host === 'api.github.com') {
+      const headers = {
+        Accept: u.pathname.includes('/contents/') ? 'application/vnd.github.raw+json' : 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': PACKAGE_ID,
+      }
+      if (token) headers.Authorization = `Bearer ${token}`
+      return headers
+    }
+    if (token && (host === 'raw.githubusercontent.com' || host === 'github.com' || host.endsWith('.github.com'))) {
+      return { Authorization: `Bearer ${token}`, 'User-Agent': PACKAGE_ID }
+    }
+  } catch { }
+  return {}
+}
+
+function isGithubUrl(url) {
+  try {
+    const host = new URL(String(url || '')).hostname.toLowerCase()
+    return host === 'github.com' || host.endsWith('.github.com') || host === 'raw.githubusercontent.com' || host === 'api.github.com'
+  } catch { return false }
+}
+
+/** 解析更新检查/下载用的令牌：自定义非 GitHub 地址不自动借用本机 GitHub 登录态。 */
+async function resolveUpdateToken(settings, customUrl = '') {
+  const custom = String(customUrl || '').trim()
+  const spec = resolveTokenSpec(settings.updateToken, custom && !isGithubUrl(custom) ? [] : GH_TOKEN_ENV_CANDIDATES)
+  if (spec.token) return spec
+  if (custom && !isGithubUrl(custom)) return spec
+  const cred = await credFromGitCredential()
+  if (cred.token) return { token: cred.token, source: 'git-credential', envName: '', rawRef: false }
+  const cliTok = await tokenFromGhCli()
+  if (cliTok) return { token: cliTok, source: 'gh-cli', envName: '', rawRef: false }
+  return spec
+}
+
 /**
- * 读清单：自定义地址只用它自己；没配则按 UPDATE_MANIFEST_MIRRORS 依次试，第一个成功的就用。
+ * 读清单：自定义地址只用它自己；没配则按候选源依次试，第一个成功的就用。
+ * 有令牌时把 GitHub API 放在最前面（私有库第三方反代必 404、直连 raw 常超时，API 几百毫秒直达）。
  * 全失败时把每个源各自的失败原因汇总抛出 —— 面板上一眼能看出是超时、HTTP 状态还是解析失败。
  */
 async function fetchManifestAuto(targetUrl, token = '', timeoutMs = UPDATE_FETCH_TIMEOUT) {
   const custom = String(targetUrl || '').trim()
-  const candidates = custom ? [custom] : UPDATE_MANIFEST_MIRRORS.slice()
+  const candidates = custom
+    ? [custom]
+    : (token
+      ? [API_MANIFEST_URL, ...UPDATE_MANIFEST_MIRRORS.filter((u) => u !== API_MANIFEST_URL)]
+      : UPDATE_MANIFEST_MIRRORS.slice())
   const tried = []
   for (const cand of candidates) {
     try {
-      const manifest = await fetchManifest(withAccessToken(cand, token), timeoutMs)
+      const headers = authHeadersForUrl(cand, token)
+      // 有令牌且走直连 GitHub 域时改用 Authorization Header，绝不把令牌拼进第三方反代 URL
+      const reqUrl = Object.keys(headers).length ? cand : withAccessToken(cand, token)
+      const manifest = await fetchManifest(reqUrl, timeoutMs, headers)
       tried.push({ url: cand, ok: true })
       return { manifest, url: cand, tried }
     } catch (error) {
@@ -2627,11 +2997,15 @@ async function fetchManifestAuto(targetUrl, token = '', timeoutMs = UPDATE_FETCH
  * 注意 API 的 raw 端点不吃"分支写进路径"，分支要单独给 ref：
  *   https://gitee.com/<owner>/<repo>/raw/<branch>/<path>
  * → https://gitee.com/api/v5/repos/<owner>/<repo>/raw/<path>?ref=<branch>&access_token=…
- * 公开库不填令牌时保持原样，行为跟以前一致。
+ * 公开库与第三方反代（gh-proxy / ghfast）不拼入令牌，避免泄露给中间代理。
  */
 function withAccessToken(url, token) {
   const raw = String(url || '')
   if (!token) return raw
+  try {
+    const host = new URL(raw).hostname.toLowerCase()
+    if (host !== 'gitee.com' && !host.endsWith('.gitee.com')) return raw
+  } catch { return raw }
   let target = raw
   const m = /^https:\/\/gitee\.com\/([^/]+)\/([^/]+)\/raw\/([^/]+)\/(.+)$/.exec(raw.split('?')[0])
   if (m) target = `https://gitee.com/api/v5/repos/${m[1]}/${m[2]}/raw/${m[4]}?ref=${encodeURIComponent(m[3])}`
@@ -2665,9 +3039,10 @@ async function checkUpdate({ force = false, url = '', token = '' } = {}) {
   return updateState
 }
 
-function updatePayload(state, settings = {}) {
+function updatePayload(state, settings = {}, resolvedToken = null) {
   const remote = state.manifest
   const custom = String(settings.updateManifestUrl || '')
+  const resolvedUpd = resolvedToken || resolveTokenSpec(settings.updateToken, custom ? [] : GH_TOKEN_ENV_CANDIDATES)
   const installed = state.liveInstall || null
   // 装好了但进程还在跑旧代码 = 需要重启；重启后 PLUGIN_VERSION 追上来，这条自然消失
   const restartRequired = Boolean(installed && compareVersion(installed.version, PLUGIN_VERSION) > 0)
@@ -2679,7 +3054,10 @@ function updatePayload(state, settings = {}) {
       manifestUrl: custom || UPDATE_MANIFEST_MIRRORS[0],
       manifestUrlIsDefault: !custom,
       manifestSources: custom ? [] : UPDATE_MANIFEST_MIRRORS.slice(),
-      tokenSet: Boolean(settings.updateToken),
+      tokenSet: Boolean(resolvedUpd.token),
+      tokenSaved: Boolean(settings.updateToken && !parseEnvTokenRef(settings.updateToken)),
+      tokenSource: resolvedUpd.source,
+      tokenEnv: resolvedUpd.envName,
     },
     remote: remote ? {
       version: String(remote.version || ''),
@@ -2727,7 +3105,36 @@ function updatePayload(state, settings = {}) {
  * 候选地址逐个试（raw 常常不通，反代在前面兜着），全失败时把每个源的原因汇总抛出。
  * 返回 { ok, file, size, sha256, url } 或 { ok:false, error }
  */
-async function downloadPackage({ urls, sha256, version, dshHome }) {
+/** 私有 GitHub Release 资产必须通过 API + Accept: application/octet-stream 取，重定向后剥掉 Authorization。 */
+async function fetchGithubReleaseAsset(url, token, timeoutMs = 120 * 1000) {
+  const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/releases\/download\/([^/]+)\/([^/?#]+)/i.exec(String(url || ''))
+  if (!m || !token) return null
+  const [, owner, repo, tag, assetName] = m
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(tag)}`
+  const apiHeaders = { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': PACKAGE_ID, Authorization: `Bearer ${token}` }
+  const relRes = await fetch(apiUrl, { cache: 'no-store', headers: apiHeaders, signal: AbortSignal.timeout(timeoutMs) })
+  if (!relRes.ok) throw new Error(`GitHub Release API HTTP ${relRes.status}`)
+  const rel = await relRes.json()
+  const asset = (Array.isArray(rel && rel.assets) ? rel.assets : []).find((a) => a && a.name === decodeURIComponent(assetName))
+  if (!asset || !asset.url) throw new Error(t(`Release ${tag} 里找不到资产 ${assetName}`, `Asset ${assetName} not found in release ${tag}`))
+  const assetRes = await fetch(asset.url, {
+    cache: 'no-store',
+    redirect: 'manual',
+    headers: { Accept: 'application/octet-stream', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': PACKAGE_ID, Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  if (assetRes.status >= 300 && assetRes.status < 400) {
+    const loc = assetRes.headers.get('location')
+    if (!loc) throw new Error(`HTTP ${assetRes.status}`)
+    const s3Res = await fetch(loc, { cache: 'no-store', signal: AbortSignal.timeout(timeoutMs) })
+    if (!s3Res.ok) throw new Error(`HTTP ${s3Res.status}`)
+    return Buffer.from(await s3Res.arrayBuffer())
+  }
+  if (!assetRes.ok) throw new Error(`HTTP ${assetRes.status}`)
+  return Buffer.from(await assetRes.arrayBuffer())
+}
+
+async function downloadPackage({ urls, sha256, version, dshHome, token = '' }) {
   if (typeof fetch !== 'function') return { ok: false, error: t('当前运行环境没有 fetch，无法下载更新包', 'fetch is unavailable in this runtime — cannot download the update package') }
   const dir = join(dshHome, 'update-staging')
   try { mkdirSync(dir, { recursive: true }) } catch { }
@@ -2738,16 +3145,24 @@ async function downloadPackage({ urls, sha256, version, dshHome }) {
     const url = String(rawUrl || '').trim()
     if (!url) continue
     try {
-      const ctrl = typeof AbortController === 'function' ? new AbortController() : null
-      const timer = ctrl ? setTimeout(() => { try { ctrl.abort() } catch { } }, 120 * 1000) : null
-      let res
-      try {
-        res = await fetch(url, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined })
-      } finally {
-        if (timer) clearTimeout(timer)
+      let buf = null
+      if (token && /^https:\/\/github\.com\/[^/]+\/[^/]+\/releases\/download\//i.test(url)) {
+        try { buf = await fetchGithubReleaseAsset(url, token) } catch { buf = null }
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const buf = Buffer.from(await res.arrayBuffer())
+      if (!buf) {
+        const ctrl = typeof AbortController === 'function' ? new AbortController() : null
+        const timer = ctrl ? setTimeout(() => { try { ctrl.abort() } catch { } }, 120 * 1000) : null
+        const headers = authHeadersForUrl(url, token)
+        const reqUrl = Object.keys(headers).length ? url : withAccessToken(url, token)
+        let res
+        try {
+          res = await fetch(reqUrl, { cache: 'no-store', headers, signal: ctrl ? ctrl.signal : undefined })
+        } finally {
+          if (timer) clearTimeout(timer)
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        buf = Buffer.from(await res.arrayBuffer())
+      }
       if (!buf.length) throw new Error(t('下载到的文件是空的', 'the downloaded file is empty'))
       const hash = createHash('sha256').update(buf).digest('hex')
       if (want && hash !== want) throw new Error(t(`sha256 不一致（拿到 ${hash}）`, `sha256 mismatch (got ${hash})`))
@@ -2814,23 +3229,29 @@ async function handleUpdate(req, res, config) {
   const dshHome = config?.dshHome || process.env.DSH_HOME || join(homedir(), '.dsh')
   const settings = readSettings(dshHome)
   // 清单地址允许被设置覆盖：换镜像/自建仓库、或本地搭测试服务时不改动插件源码。
-  // 留空 = 用内置候选列表（jsDelivr 优先、raw 兜底）
+  // 留空 = 用内置候选列表（GitHub API / gh-proxy / ghfast / raw）
   const manifestUrl = String(settings.updateManifestUrl || '')
-  const updateToken = String(settings.updateToken || '')
   try {
     if (req.method === 'GET') {
-      sendJson(res, 200, updatePayload(await checkUpdate({ url: manifestUrl, token: updateToken }), settings))
+      const resolvedUpd = await resolveUpdateToken(settings, manifestUrl)
+      sendJson(res, 200, updatePayload(await checkUpdate({ url: manifestUrl, token: resolvedUpd.token }), settings, resolvedUpd))
       return
     }
     if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: 'GET or POST only' }); return }
     if (!originAllowed(req)) { sendJson(res, 403, { ok: false, error: 'cross-origin request rejected' }); return }
+    // 先读 body 再解析令牌：读 body 之前不能有 await，否则请求流可能已经被读空/结束，
+    // 事件监听挂晚了就永远等不到 'end'（实测：把令牌解析提到前面会让所有 POST 一直挂住）。
     const raw = await readBody(req)
     const body = raw.trim() ? JSON.parse(raw) : {}
     const action = String(body.action || 'check')
+    const resolvedUpd = await resolveUpdateToken(settings, manifestUrl)
+    const updateToken = resolvedUpd.token
 
     if (action === 'check') {
-      const state = await checkUpdate({ force: true, url: manifestUrl, token: updateToken })
-      sendJson(res, 200, { ok: !state.error, action, ...updatePayload(state, settings) })
+      clearWinEnvCache()
+      const refreshedUpd = await resolveUpdateToken(settings, manifestUrl)
+      const state = await checkUpdate({ force: true, url: manifestUrl, token: refreshedUpd.token })
+      sendJson(res, 200, { ok: !state.error, action, ...updatePayload(state, settings, refreshedUpd) })
       return
     }
 
@@ -2846,12 +3267,12 @@ async function handleUpdate(req, res, config) {
       // 同一个版本已经下好就不重复下（DSH 一直开着时用户可能点第二次）
       const prev = updateState.prepared
       if (prev && prev.version === String(remote.version) && isFile(prev.file)) {
-        sendJson(res, 200, { ok: true, action, prepared: prev, ...updatePayload(state, settings) })
+        sendJson(res, 200, { ok: true, action, prepared: prev, ...updatePayload(state, settings, resolvedUpd) })
         return
       }
       const urls = resolveTgzCandidates(remote, state.url)
       if (!urls.length) throw new Error(t('version.json 里没有给 tgz 下载地址', 'version.json gives no tgz download URL'))
-      const got = await downloadPackage({ urls, sha256: String(remote.sha256 || ''), version: String(remote.version), dshHome })
+      const got = await downloadPackage({ urls, sha256: String(remote.sha256 || ''), version: String(remote.version), dshHome, token: updateToken })
       if (!got.ok) throw new Error(String(got.error || t('下载失败', 'download failed')))
       updateState.prepared = {
         version: String(remote.version),
@@ -2861,7 +3282,7 @@ async function handleUpdate(req, res, config) {
         at: Date.now(),
         url: got.url,
       }
-      sendJson(res, 200, { ok: true, action, prepared: updateState.prepared, ...updatePayload(state, settings) })
+      sendJson(res, 200, { ok: true, action, prepared: updateState.prepared, ...updatePayload(state, settings, resolvedUpd) })
       return
     }
 
@@ -2884,6 +3305,7 @@ async function handleUpdate(req, res, config) {
         appRoot,
         dshHome,
         restart: true,
+        closeRequested: true,
         extraArgs: [
           '-PluginDir', PLUGIN_DIR,
           '-UpdateTgz', prepared.file,
@@ -2895,7 +3317,7 @@ async function handleUpdate(req, res, config) {
       autoState.pending = { mode: 'update', at: Date.now(), version: String(prepared.version), restart: true, watcherPid: started.pid, installFrom: prepared.file }
       const closed = closeDsh()
       autoState.pending.closeRequested = closed
-      sendJson(res, 200, { ok: true, action, started: true, pending: autoState.pending, closeRequested: closed, ...updatePayload(await checkUpdate({ force: false, url: manifestUrl, token: updateToken }), settings) })
+      sendJson(res, 200, { ok: true, action, started: true, pending: autoState.pending, closeRequested: closed, ...updatePayload(await checkUpdate({ force: false, url: manifestUrl, token: updateToken }), settings, resolvedUpd) })
       return
     }
 
@@ -2920,7 +3342,7 @@ async function handleUpdate(req, res, config) {
       }
       // 注意 hasUpdate 仍是 true：进程里跑的还是旧代码，重启后 PLUGIN_VERSION 才追上来。
       // 面板靠 restartRequired 换成「已装好，重启生效」
-      sendJson(res, 200, { ok: true, action, installed: updateState.liveInstall, ...updatePayload(state, settings) })
+      sendJson(res, 200, { ok: true, action, installed: updateState.liveInstall, ...updatePayload(state, settings, resolvedUpd) })
       return
     }
 
@@ -2948,7 +3370,7 @@ async function handleUpdate(req, res, config) {
       if (!tgz) throw new Error(t('version.json 里没有给 tgz 下载地址', 'version.json gives no tgz download URL'))
       const notes = String((langStore.getStore() === 'en' ? (remote.notesEn || remote.notes) : remote.notes) || '').trim()
       const yes = await askConfirm(
-        t('更新「配置同步」插件', 'Update the Config Sync plugin'),
+        t('更新「配置备份与同步」插件', 'Update the Config Backup & Sync plugin'),
         t(
           `把插件从 ${PLUGIN_VERSION} 更新到 ${remote.version}？`
           + (notes ? `\n\n${notes}` : '')
@@ -2958,7 +3380,7 @@ async function handleUpdate(req, res, config) {
           + '\n\nSteps: exit DSH → download and verify the package → back up the old version → install over it → relaunch automatically.',
         ),
       )
-      if (!yes) { sendJson(res, 200, { ok: true, action, cancelled: true, ...updatePayload(state, settings) }); return }
+      if (!yes) { sendJson(res, 200, { ok: true, action, cancelled: true, ...updatePayload(state, settings, resolvedUpd) }); return }
 
       const repo = resolveRepo(config?.repoPath, dshHome).repo || ''
       const appRoot = resolveAppRoot(config?.appRoot) || ''
@@ -2968,6 +3390,7 @@ async function handleUpdate(req, res, config) {
         appRoot,
         dshHome,
         restart: true,
+        closeRequested: true,
         extraArgs: [
           '-PluginDir', PLUGIN_DIR,
           '-UpdateVersion', String(remote.version),
@@ -3074,6 +3497,14 @@ function countEntries(dir) {
   }
 }
 
+/**
+ * 这台机器上的同步执行体实际会抓的组。
+ * Windows 走 sync.ps1（12 组）；macOS/Linux 走 runtime\sync-engine.mjs，它只抓
+ * profile（4 个文件）/ prompt / skills / presets —— 别的组在那台机器上根本不会被同步。
+ * null 表示「全部组」，非 Windows 时是白名单。
+ */
+const ENGINE_SYNCED_GROUPS = IS_WIN ? null : new Set(['profile', 'prompt', 'skills', 'presets'])
+
 /** profile 目录：优先 desktop，其次 profiles 下唯一的那一个 */
 function resolveProfileDir(dshHome) {
   const desktop = join(dshHome, 'profiles', 'desktop')
@@ -3132,17 +3563,91 @@ const EXTRA_HARD_MAX_BYTES = 104857600
 const EXTRA_DEFAULT_SKIP_DIRS = [
   'profiles', 'skills', '.agent-presets', 'storages', 'sessions', 'attachments', 'logs', 'backups',
   'update-staging', 'electron', 'dsh-runtimes', 'dsh-market', '.dsh-plugin-market', 'dsh-session-manager',
-  'im', 'node_modules',
+  'browser-profiles', 'im', 'node_modules',
 ]
 const EXTRA_DEFAULT_EXCLUDE = [
   '*.db', '*.db-*', '*.db3', '*.sqlite', '*.sqlite3', '*.sqlite-*', '*.db-shm', '*.db-wal',
   '*.node', '*.exe', '*.dll', '*.asar', '*.pak', '*.bin', '*.iso', '*.img',
   '*.zip', '*.7z', '*.rar', '*.tar', '*.gz', '*.tgz', '*.mp4', '*.mkv', '*.avi',
   '*.log', '*.log.*', '*.tmp', '*.bak', '*.bak-*', '*.old', '*.orig', '*.swp',
+  '*.env', '.env*', 'config-sync-gh.json', 'config-sync-feedback-outbox.json', 'dsh-config-sync.json', 'dsh-ssh-master.key',
   'api-key', '*.pem', '*.key', '*.p12', '*.pfx', '*.crt',
   '*cache*', '*token*', '*secret*', '*credential*', '*password*', '*vault*',
+  'browser-profiles', 'User Data', 'Login Data', 'Cookies', 'Web Data', 'Local State',
   'node_modules', '.git', '.cache', '__pycache__', '.venv',
 ]
+
+/**
+ * 安全必需项：用户自己的 config-sync-extra.json 不允许把它们去掉。
+ * 与 runtime\dsh-sync-common.ps1 的 $SyncExtraMandatorySkipDirs / $SyncExtraMandatoryExcludes 同一份名单。
+ *
+ * 起因（本机实测）：exclude / skipDirs 是「整份替换」语义，用户早先存下的 50 条旧快照会让
+ * 0.6.12 新增的 browser-profiles 规则整条失效 —— 那目录里有 3,696 个文件 / 268MB，含密码库与登录态。
+ * 0.6.15 在 PowerShell 侧补了这条，JS 侧（面板规则 / 待推送扫描）一直没补：
+ * 于是待推送会把 browser-profiles 里几千个文件的 mtime 变动算成「待推送」，而 capture 根本不会抓它们
+ * —— 面板永远消不掉，退出自动推送也每次白跑。
+ */
+const EXTRA_MANDATORY_SKIP_DIRS = ['browser-profiles']
+const EXTRA_MANDATORY_EXCLUDES = ['browser-profiles', 'User Data', 'Login Data', 'Cookies', 'Web Data', 'Local State']
+
+/**
+ * 浏览器剖面 / 凭据库的路径段黑名单：与 PS 的 $SyncBlockedProfileSegments、webdav.mjs 的
+ * BLOCKED_PROFILE_SEGMENTS 一致。按**路径段**判定，深层嵌套（User Data\Default\Login Data）也拦得住。
+ */
+const BLOCKED_PROFILE_SEGMENTS = new Set([
+  'browser-profiles', 'user data', 'login data', 'login data for account',
+  'cookies', 'cookies-journal', 'web data', 'web data-journal', 'secure preferences',
+  'local state', 'history', 'history-journal', 'top sites', 'current session', 'current tabs',
+])
+
+/**
+ * 把安全必需项补进 cfg（就地修改），返回补了哪些，便于面板/日志说出来。
+ * 读配置要用、保存前也要用：POST 拿用户提交的名单覆盖掉之后，
+ * 如果只在读的时候补，用户一保存就又把它删掉了（实测就是这样丢的）。
+ */
+function topUpExtraMandatory(cfg) {
+  if (!cfg || !cfg.pluginData) return { skipDirs: [], exclude: [] }
+  const addedSkip = EXTRA_MANDATORY_SKIP_DIRS.filter((x) => !(cfg.pluginData.skipDirs || []).includes(x))
+  const addedExcl = EXTRA_MANDATORY_EXCLUDES.filter((x) => !(cfg.pluginData.exclude || []).includes(x))
+  if (addedSkip.length) cfg.pluginData.skipDirs = [...(cfg.pluginData.skipDirs || []), ...addedSkip]
+  if (addedExcl.length) cfg.pluginData.exclude = [...(cfg.pluginData.exclude || []), ...addedExcl]
+  return { skipDirs: addedSkip, exclude: addedExcl }
+}
+
+function isBlockedProfilePath(rel) {
+  const s = String(rel || '')
+  if (!s) return false
+  for (const seg of s.split(/[\\/]+/)) {
+    if (seg && BLOCKED_PROFILE_SEGMENTS.has(seg.toLowerCase())) return true
+  }
+  return false
+}
+
+/**
+ * 「插件设置与工作流」组的源清单 —— 必须与 runtime\dsh-sync-common.ps1 的 Get-SyncSettingsMap 一致。
+ * 以前 JS 只写了 4 条，capture 却抓 14 条：面板少列了 10 个文件，用户既看不到也勾不掉它们。
+ * 每条 { id, rel }：rel 是相对 <DshHome> 的路径；profileRel 表示相对 profile 目录。
+ */
+const SYNC_SETTINGS_SOURCES = [
+  { id: 'our-free-model.json', rel: ['our-free-model', 'settings.json'] },
+  { id: 'comfyui-workflows.json', rel: ['data', 'dsh-comfyui', 'workflows.json'] },
+  { id: 'dsh-pet-main-config.jsonc', rel: ['dsh-pet', 'main-config.jsonc'] },
+  { id: 'dsh-market-state.json', profileRel: ['.dsh-market', 'state.json'] },
+  { id: 'dsh-pet-memory.json', rel: ['dsh-pet', 'memory.json'] },
+  { id: 'our-free-model-picks.json', rel: ['our-free-model', 'picks.json'] },
+  { id: 'dsh-im-interface-language.json', rel: ['integrations', 'dsh-im', 'interface-language.json'] },
+  { id: 'dsh-qq-config.json', rel: ['integrations', 'dsh-qq', 'config.json'] },
+  { id: 'dsh-qq-workspaces.json', rel: ['integrations', 'dsh-qq', 'workspaces.json'] },
+  { id: 'redteam-preset-declare.json', rel: ['redteam', 'preset-declare.json'] },
+  { id: 'task-board-ledger.json', rel: ['task-board', 'ledger-v2.json'] },
+  { id: 'task-board-scheduler.json', rel: ['task-board', 'scheduler-v2.json'] },
+  { id: 'dsh-workspaces.json', rel: ['storages', 'workspace.json'] },
+  { id: 'workspace-archives.json', rel: ['dsh-session-manager', 'workspace-archives.v1.json'] },
+]
+
+function settingsSourcePath(dshHome, profileDir, entry) {
+  return entry.profileRel ? join(profileDir, ...entry.profileRel) : join(dshHome, ...entry.rel)
+}
 
 function extraConfigPath(dshHome) { return join(dshHome, EXTRA_CONFIG_NAME) }
 
@@ -3180,6 +3685,12 @@ function readExtraConfig(dshHome) {
       }
     }
   } catch { /* 坏了就按默认规则走，不让面板整页读不出来 */ }
+  // 安全必需项补齐（与 PowerShell 的 Get-SyncExtraConfig 同一步）：用户文件可以改别的，
+  // 但这些名字必须留着。补齐了要能让面板说出来（missingMandatory），不静默改用户的口径。
+  const added = topUpExtraMandatory(cfg)
+  if (added.skipDirs.length || added.exclude.length) {
+    cfg.pluginData.missingMandatory = { skipDirs: added.skipDirs, exclude: added.exclude }
+  }
   return cfg
 }
 
@@ -3198,7 +3709,7 @@ function saveExtraConfig(dshHome, cfg) {
       paths: (cfg.extra.paths || []).map((x) => ({ id: x.id, src: x.src, label: x.label || x.id })),
     },
   }
-  writeFileSync(p, JSON.stringify(out, null, 2) + '\n', 'utf8')
+  writeFileAtomicSync(p, JSON.stringify(out, null, 2) + '\n')
   return p
 }
 
@@ -3308,14 +3819,11 @@ function collectScopeGroups(dshHome, appRoot) {
     descZh: '技能市场的安装台账与面板状态', descEn: 'Skill-market install ledger and panel state',
     items: ledger.map((f) => ({ id: f.id, label: f.id })) })
 
-  const settingsFiles = [
-    { id: 'our-free-model.json', src: join(dshHome, 'our-free-model', 'settings.json') },
-    { id: 'comfyui-workflows.json', src: join(dshHome, 'data', 'dsh-comfyui', 'workflows.json') },
-    { id: 'dsh-pet-main-config.jsonc', src: join(dshHome, 'dsh-pet', 'main-config.jsonc') },
-    { id: 'dsh-market-state.json', src: join(profileDir, '.dsh-market', 'state.json') },
-  ].filter((x) => existsSync(x.src))
+  const settingsFiles = SYNC_SETTINGS_SOURCES
+    .map((x) => ({ id: x.id, src: settingsSourcePath(dshHome, profileDir, x) }))
+    .filter((x) => existsSync(x.src))
   groups.push({ id: 'settings', titleZh: '插件设置与工作流', titleEn: 'Plugin settings & workflows',
-    descZh: '免付费模型设置、ComfyUI 工作流库、桌宠配置、插件市场状态', descEn: 'Free-model settings, ComfyUI workflows, desktop-pet config, market state',
+    descZh: '免付费模型设置、ComfyUI 工作流库、桌宠配置、插件市场状态等插件自己的小配置', descEn: 'Small per-plugin configs such as free-model settings, ComfyUI workflows, desktop-pet config and market state',
     items: settingsFiles.map((x) => ({ id: x.id, label: x.id })) })
 
   const mnemonDir = appRoot ? join(appRoot, 'mnemon') : ''
@@ -3393,7 +3901,14 @@ async function handleScope(req, res, config) {
     if (!originAllowed(req)) { sendJson(res, 403, { ok: false, error: 'cross-origin request rejected' }); return }
     const raw = await readBody(req)
     const body = raw.trim() ? JSON.parse(raw) : {}
-    const groupsIn = body && typeof body.groups === 'object' && body.groups ? body.groups : {}
+    // 空 POST（或只发了 deleteCloud 的残缺请求）一律拒绝：groups 缺省会得到 {}，
+    // 下面 writeScope 就会把文件改写成「全部默认」，等于用户点一下就把所有排除项清空。
+    // 合法清空必须显式传 groups:{}（面板保存时永远带全量 groups）。
+    if (!body || typeof body !== 'object' || !body.groups || typeof body.groups !== 'object') {
+      sendJson(res, 400, { ok: false, error: '请求体缺少 groups（清空同步范围请显式传 groups:{}）' })
+      return
+    }
+    const groupsIn = body.groups
     // 排除项只认「本机当前真实存在、且允许单独排除」的条目：
     // 拖着一堆早就不存在的 id 会让用户以后勾不回来（看不见却一直挡着同步）。
     const allowed = {}
@@ -3439,20 +3954,30 @@ async function handleScope(req, res, config) {
  */
 function conflictPath(dshHome) { return join(dshHome, 'sync-conflicts.json') }
 
+const CONFLICT_MISSING = null
+
+/** 读冲突清单：没有 → null；有但坏了 → { broken:true, error }（不能再统一当「没有」）。 */
 function readConflicts(dshHome) {
   const p = conflictPath(dshHome)
-  if (!isFile(p)) return null
+  if (!isFile(p)) return CONFLICT_MISSING
+  let text = ''
+  try { text = readFileSync(p, 'utf8') } catch (error) {
+    return { broken: true, error: `读不到清单文件：${String((error && error.message) || error)}` }
+  }
   try {
-    const obj = JSON.parse(readFileSync(p, 'utf8'))
-    if (!obj || !Array.isArray(obj.items)) return null
+    const obj = JSON.parse(text)
+    if (!obj || typeof obj !== 'object') return { broken: true, error: '清单不是 JSON 对象' }
+    if (!Array.isArray(obj.items)) return { broken: true, error: '清单缺少 items 数组' }
     return obj
-  } catch { return null }
+  } catch (error) {
+    return { broken: true, error: `清单解析失败：${String((error && error.message) || error)}` }
+  }
 }
 
 function writeConflicts(dshHome, obj) {
   const p = conflictPath(dshHome)
   mkdirSync(dirname(p), { recursive: true })
-  writeFileSync(p, JSON.stringify(obj, null, 2) + '\n', 'utf8')
+  writeFileAtomicSync(p, JSON.stringify(obj, null, 2) + '\n')
   return p
 }
 
@@ -3497,28 +4022,23 @@ async function handleExtraConfig(req, res, config) {
     if (src.extra && typeof src.extra === 'object') {
       if (typeof src.extra.enabled === 'boolean') cur.extra.enabled = src.extra.enabled
       if (Array.isArray(src.extra.paths)) {
-        const used = new Set()
-        const paths = []
-        for (const p of src.extra.paths) {
-          if (!p || typeof p.src !== 'string' || !p.src.trim()) continue
-          const abs = p.src.trim().replace(/\//g, '\\')
-          if (!/^[A-Za-z]:\\/.test(abs) && !abs.startsWith('\\\\')) continue
-          const base = (typeof p.label === 'string' && p.label.trim())
-            ? p.label.trim()
-            : (typeof p.id === 'string' && p.id.trim() ? p.id.trim() : basename(abs))
-          let id = String(base).replace(/[\\/:*?"<>|\s]+/g, '-').replace(/^-+|-+$/g, '') || 'extra'
-          if (!isAbsolute(abs)) continue
-          let n = 2
-          const root = id
-          while (used.has(id.toLowerCase())) { id = `${root}-${n++}` }
-          used.add(id.toLowerCase())
-          paths.push({ id, src: abs, label: base })
+        // 校验搬进 runtime/platform.mjs（按 win32 / posix 分档），被拒的路径要整批报错：
+        // 静默丢弃 = 用户的自选目录一条都没存进去，面板却显示保存成功。
+        const norm = normalizeSyncExtraPaths(src.extra.paths)
+        if (norm.dropped.length) {
+          throw new Error(t(
+            `这些路径不是绝对路径（或有盘符/分隔符问题），整批未保存：${norm.dropped.join('、')}`,
+            `These paths are not absolute (or have a bad drive/separator), so nothing was saved: ${norm.dropped.join(', ')}`,
+          ))
         }
-        cur.extra.paths = paths
+        cur.extra.paths = norm.paths
       }
     }
+    // 保存前再补一次安全必需项：上面刚用用户提交的名单整份覆盖过，
+    // 不补就等于「用户点一次保存，browser-profiles 规则被删掉」（实测丢过一次）。
+    const added = topUpExtraMandatory(cur)
     const p = saveExtraConfig(dshHome, cur)
-    sendJson(res, 200, { ok: true, path: p, config: readExtraConfig(dshHome) })
+    sendJson(res, 200, { ok: true, path: p, mandatoryRestored: added, config: readExtraConfig(dshHome) })
   } catch (error) {
     sendJson(res, 400, { ok: false, error: String((error && error.message) || error) })
   }
@@ -3530,6 +4050,18 @@ async function handleConflict(req, res, config) {
     if (req.method === 'GET') {
       const obj = readConflicts(dshHome)
       if (!obj) { sendJson(res, 200, { ok: true, exists: false, path: conflictPath(dshHome) }); return }
+      // 清单坏了也要让面板看见：否则界面显示「没有冲突」，用户以为一切正常
+      if (obj.broken) {
+        sendJson(res, 200, {
+          ok: true,
+          exists: true,
+          broken: true,
+          error: obj.error,
+          path: conflictPath(dshHome),
+          at: '', head: '', remoteHead: '', backupDir: '', items: [],
+        })
+        return
+      }
       const items = obj.items.map((it) => ({
         path: String(it.path || ''),
         kind: String(it.kind || ''),
@@ -3559,6 +4091,13 @@ async function handleConflict(req, res, config) {
     if (!originAllowed(req)) { sendJson(res, 403, { ok: false, error: 'cross-origin request rejected' }); return }
     const raw = await readBody(req)
     const body = raw.trim() ? JSON.parse(raw) : {}
+    // 重置不需要清单可读：删文件本身幂等，坏清单也得能从面板清掉（以前这里先 throw，界面无法自救）
+    if (body.action === 'reset') {
+      try { unlinkSync(conflictPath(dshHome)) } catch { }
+      sendJson(res, 200, { ok: true, cleared: true })
+      return
+    }
+
     const obj = readConflicts(dshHome)
     if (!obj) {
       throw new Error(t(
@@ -3566,16 +4105,20 @@ async function handleConflict(req, res, config) {
         'No pending conflict list (one is created automatically when a pull is blocked)',
       ))
     }
-
-    if (body.action === 'reset') {
-      try { unlinkSync(conflictPath(dshHome)) } catch { }
-      sendJson(res, 200, { ok: true, cleared: true })
-      return
+    if (obj.broken) {
+      throw new Error(t(
+        `冲突清单损坏（${obj.error}），已保留原文件；可以先点「重置」丢弃它，下次拉取会重新生成`,
+        `The conflict list is corrupted (${obj.error}); the file was kept. Use Reset to discard it; a new one is created on the next blocked pull`,
+      ))
     }
 
     if (body.action === 'restore') {
       const rel = String(body.path || '').trim()
       if (!rel) throw new Error(t('没有指定要还原的文件', 'No file was given to restore'))
+      // 清单是引擎/脚本写的，但来源终究是仓库路径：还原时再挡一道越界，别把文件写出仓库。
+      if (/^[\\/]/.test(rel) || /^[A-Za-z]:/.test(rel) || rel.split(/[\\/]/).some((seg) => seg === '..')) {
+        throw new Error(t(`这个路径会写出仓库，拒绝还原：${rel}`, `This path escapes the repo and was refused: ${rel}`))
+      }
       const side = body.side === 'cloud' ? 'cloud' : 'local'
       // 还原落到「当时发生冲突的那个仓库」（清单里记着），而不是此刻设置里的路径：
       // 用户之后改过 repoPath 也不会把副本写进另一个仓库。
@@ -3673,7 +4216,9 @@ function startLivePush({ repo, dshHome, appRoot, settings }) {
   if (autoState.livePush.running) {
     return { alreadyRunning: true, livePush: { ...autoState.livePush } }
   }
+  const reqLang = langStore.getStore() || 'zh'
   const initPush = repoPhase(repo) !== 'ok'
+  const transport = webdavActive(settings) ? 'webdav' : 'git'
   const logsDir = join(dshHome, 'logs')
   try { if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true }) } catch { }
   const d = new Date()
@@ -3693,9 +4238,25 @@ function startLivePush({ repo, dshHome, appRoot, settings }) {
       ...(appRoot ? [`AppRoot = ${psQuote(appRoot)}`] : []),
       `Force = $true`,
     ].join('; ')
-    const psCmd = `[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; $a = @{ ${psArgs} }; & ${psQuote(syncScript)} @a; exit $LASTEXITCODE`
+    // PowerShell 5.1 脚本发生 ParseException 或终止错误时 $LASTEXITCODE 可能仍为 0，
+    // 所以必须同时检查 $? 与 try/catch，否则崩溃会被当成 exit 0 假绿。
+    const psCmd = [
+      '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)',
+      '$OutputEncoding = [Console]::OutputEncoding',
+      "$ErrorActionPreference = 'Stop'",
+      'try {',
+      `  $a = @{ ${psArgs} }`,
+      `  & ${psQuote(syncScript)} @a`,
+      '  if (-not $?) { if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE } else { exit 1 } }',
+      '  if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
+      '  exit 0',
+      '} catch {',
+      '  [Console]::Error.WriteLine(($_ | Out-String))',
+      '  exit 1',
+      '}',
+    ].join('; ')
     cmd = powershellExe()
-    cmdArgs = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(psCmd, 'utf16le').toString('base64')]
+    cmdArgs = ['-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(psCmd, 'utf16le').toString('base64')]
   } else {
     const engine = [join(pluginRoot(), 'runtime', 'sync-engine.mjs'), join(repo, 'sync-engine.mjs')].find((p) => isFile(p))
     if (!engine) throw new Error(t('找不到 sync-engine.mjs，无法在线推送', 'sync-engine.mjs not found — cannot run live push'))
@@ -3712,36 +4273,85 @@ function startLivePush({ repo, dshHome, appRoot, settings }) {
     message: initPush
       ? t('正在后台初始化推送（不关闭 DSH）…', 'Initializing push in background (DSH stays open)…')
       : t('正在后台抓取并推送（不关闭 DSH）…', 'Capturing and pushing in background (DSH stays open)…'),
+    detail: '',
+    recent: [],
     log: logFile,
     initPush,
+    transport,
   }
 
   const tail = []
-  const appendLog = (chunk) => {
-    const text = String(chunk || '')
-    try { writeFileSync(logFile, text, { flag: 'a' }) } catch { }
+  let sawFatalOutput = false
+  // CLIXML 清洗细节（为什么这样判、踩过什么坑）见 runtime/live-log.mjs 的文件头。
+  const extractUsefulText = (raw, fromStderr) => extractLiveLogText(raw, fromStderr)
+
+  // 日志上限：同步流程会按文件刷进度，病态情况下能刷到几十 MB。
+  // 超过上限后只更新面板进度、不再写盘（面板照旧能看最近几行）。
+  const LOG_MAX_BYTES = 8 * 1024 * 1024
+  let logBytes = 0
+  try { if (existsSync(logFile)) logBytes = statSync(logFile).size } catch { }
+  let logTruncated = false
+  const recentWritten = []
+
+  const appendLog = (chunk, fromStderr = false) => {
+    const text = extractUsefulText(chunk, fromStderr)
+    if (!text.trim()) return
+    // Write-Host 出来的同一行会同时出现在 stdout 与 stderr（CLIXML），
+    // 清洗后两条通道都能读出正文 → 日志里同一句话连写两遍（实测「另一台机器执行…」重复）。
+    // 用最近 24 行做去重窗口，跨块也生效。
+    const keep = []
     for (const rawLine of text.split(/\r?\n/)) {
-      const line = rawLine.trim()
-      if (!line) continue
-      tail.push(line)
-      if (tail.length > 50) tail.shift()
-      if (/==\s*初始化仓库/.test(line)) {
-        autoState.livePush.phase = 'init'
-        autoState.livePush.message = t('正在初始化仓库骨架…', 'Initializing repo skeleton…')
-      } else if (/==\s*抓取|capture/.test(line)) {
-        autoState.livePush.phase = 'capture'
-        autoState.livePush.message = t('正在抓取本机配置与会话…', 'Capturing local config and sessions…')
-      } else if (/==\s*提交/.test(line)) {
-        autoState.livePush.phase = 'commit'
-        autoState.livePush.message = t('正在提交本机变更…', 'Committing local changes…')
-      } else if (/==\s*上传到 WebDAV|WebDAV 上传|==\s*推送/.test(line)) {
-        autoState.livePush.phase = 'upload'
-        autoState.livePush.message = t('正在上传到云端…', 'Uploading to cloud…')
+      if (!rawLine.trim()) continue
+      const key = rawLine.trim()
+      if (recentWritten.includes(key)) continue
+      recentWritten.push(key)
+      if (recentWritten.length > 24) recentWritten.shift()
+      keep.push(rawLine)
+    }
+    if (!keep.length) return
+    const outText = keep.join('\n')
+    const bytes = Buffer.byteLength(outText)
+    if (logBytes < LOG_MAX_BYTES) {
+      try { writeFileSync(logFile, `${outText}\n`, { flag: 'a' }); logBytes += bytes } catch { }
+      if (logBytes >= LOG_MAX_BYTES && !logTruncated) {
+        logTruncated = true
+        try { writeFileSync(logFile, `\n[日志已截断：本次输出超过 ${Math.round(LOG_MAX_BYTES / 1048576)} MB，后续只更新面板进度]\n`, { flag: 'a' }) } catch { }
       }
     }
+    if (/ParserError|FullyQualifiedErrorId|CommandNotFoundException|\+\s+CategoryInfo\s*:/i.test(outText)) sawFatalOutput = true
+    langStore.run(reqLang, () => {
+      for (const rawLine of outText.split(/\r?\n/)) {
+        const line = rawLine.trim()
+        if (!line) continue
+        tail.push(line)
+        if (tail.length > 50) tail.shift()
+        autoState.livePush.detail = line
+        autoState.livePush.recent = tail.slice(-5)
+        if (/==\s*初始化仓库/.test(line)) {
+          autoState.livePush.phase = 'init'
+          autoState.livePush.message = t('正在初始化仓库骨架…', 'Initializing repo skeleton…')
+        } else if (/==\s*DSH 配置同步\s*\/\s*capture|==\s*抓取|==\s*归档|==\s*工作区|\bcapture\b/i.test(line)) {
+          autoState.livePush.phase = 'capture'
+          const convOn = scopeGroupEnabled(readScope(dshHome), 'conversations')
+          autoState.livePush.message = convOn
+            ? t('正在抓取本机配置与会话…', 'Capturing local config and sessions…')
+            : t('正在抓取本机配置…', 'Capturing local config…')
+        } else if (/==\s*提交/.test(line)) {
+          autoState.livePush.phase = 'commit'
+          autoState.livePush.message = t('正在提交本机变更…', 'Committing local changes…')
+        } else if (/==\s*上传到 WebDAV|上传扫描：|上传进度：|WebDAV 上传|==\s*推送/.test(line)) {
+          autoState.livePush.phase = 'upload'
+          if (/上传进度：/.test(line)) {
+            autoState.livePush.message = line
+          } else {
+            autoState.livePush.message = t('正在上传到云端…', 'Uploading to cloud…')
+          }
+        }
+      }
+    })
   }
 
-  const finish = async (ok, errText) => {
+  const finish = (ok, errText, opts = {}) => langStore.run(reqLang, async () => {
     clearWebdavProbeCache()
     if (ok) {
       try {
@@ -3768,25 +4378,33 @@ function startLivePush({ repo, dshHome, appRoot, settings }) {
       finishedAt: Date.now(),
       ok,
       phase: ok ? 'done' : 'error',
-      message: ok
-        ? (initPush
-          ? t('初始化推送完成（未关闭 DSH）', 'Initialize push completed (DSH stayed open)')
-          : t('推送完成（未关闭 DSH）', 'Push completed (DSH stayed open)'))
-        : (errText || t('推送失败，详见日志', 'Push failed — see log')),
+      message: opts.skipped
+        ? t('跳过：另一个同步动作正在进行（不是故障）', 'Skipped: another sync is already running (not a failure)')
+        : ok
+          ? (initPush
+            ? t('初始化推送完成（未关闭 DSH）', 'Initialize push completed (DSH stayed open)')
+            : t('推送完成（未关闭 DSH）', 'Push completed (DSH stayed open)'))
+          : (errText || t('推送失败，详见日志', 'Push failed — see log')),
+      skipped: Boolean(opts.skipped),
     }
-  }
+  })
 
   const child = spawn(cmd, cmdArgs, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
-  child.stdout.on('data', appendLog)
-  child.stderr.on('data', appendLog)
+  child.stdout.on('data', (c) => appendLog(c, false))
+  child.stderr.on('data', (c) => appendLog(c, true))
   child.once('error', (e) => {
     const msg = String((e && e.message) || e)
     appendLog(`\n[error] ${msg}\n`)
     finish(false, msg)
   })
   child.once('exit', async (code) => {
-    if (code !== 0) {
-      const errLine = [...tail].reverse().find((l) => /\[X\]|失败|error|fatal:/i.test(l)) || tail[tail.length - 1] || `exit ${code}`
+    // 3 是 capture/apply 的「另一个同步动作正在进行」：什么都没做，但也不是故障。
+    // 按失败处理会让面板变红，还会从 tail 里随便挑一行当原因（实测会挑到「接着执行（二选一）」）。
+    if (code === 3) { finish(true, null, { skipped: true }); return }
+    if (code !== 0 || sawFatalOutput) {
+      const errLine = [...tail].reverse().find((l) => /\[X\]|失败|error|fatal:|ParserError|UnexpectedToken/i.test(l))
+        || tail[tail.length - 1]
+        || `exit ${code}`
       finish(false, errLine)
       return
     }
@@ -3808,12 +4426,12 @@ function startLivePush({ repo, dshHome, appRoot, settings }) {
     if (!IS_WIN) {
       try {
         const head = (await git(repo, ['log', '-1', '--format=%h'])) || ''
-        writeFileSync(join(dshHome, STATE_NAME), JSON.stringify({
+        writeFileAtomicSync(join(dshHome, STATE_NAME), JSON.stringify({
           lastSyncAt: new Date().toISOString(),
           mode: 'push',
           repo,
           head: head.trim(),
-        }, null, 2) + '\n', 'utf8')
+        }, null, 2) + '\n')
       } catch { }
     }
     finish(true, '')
@@ -3904,9 +4522,10 @@ async function handleAuto(req, res, config) {
       const extraArgs = ['-BackupDir', snap.dir]
       if (snap.kind !== 'profile') extraArgs.push('-SnapshotKind', snap.kind)
       if (snap.kind === 'plugin') extraArgs.push('-PluginDir', PLUGIN_ROOT)
+      const closeNow = body.closeNow !== false
       const started = await spawnWatcher({
         mode: 'restore', repo, appRoot, dshHome, restart,
-        extraArgs,
+        extraArgs, closeRequested: closeNow,
       })
       if (!started.ok) throw new Error(started.error)
       autoState.pending = { mode: 'restore', at: Date.now(), restart, watcherPid: started.pid, closeRequested: false, backupDir: snap.dir, snapshotKind: snap.kind }
@@ -3931,7 +4550,8 @@ async function handleAuto(req, res, config) {
       if (mode === 'push' && repoPhase(repo) !== 'ok') await ensurePushAllowed(repo, settings)
       // 拉取/推送做完都把客户端拉回来（用户要求"完成后自动启动 dsh"），仍受 autoRestart 开关约束
       const restart = body.restart !== false && settings.autoRestart !== false
-      const started = await spawnWatcher({ mode, repo, appRoot, dshHome, restart })
+      const closeNow = body.closeNow !== false
+      const started = await spawnWatcher({ mode, repo, appRoot, dshHome, restart, closeRequested: closeNow })
       if (!started.ok) throw new Error(started.error)
       autoState.pending = { mode, at: Date.now(), restart, watcherPid: started.pid, closeRequested: false }
       // 用户明确要求"现在就同步"：排队后请求客户端退出（不带 /F，走正常关闭，配置能存下来）
@@ -4006,7 +4626,8 @@ function scheduleAutoStart(config) {
           ),
         )
         if (yes) {
-          const started = await spawnWatcher({ mode: 'pull', repo, appRoot, dshHome, restart: settings.autoRestart })
+          // 用户点了确认，插件随后自己关客户端 → 允许守护进程在窗口消失后清残留
+          const started = await spawnWatcher({ mode: 'pull', repo, appRoot, dshHome, restart: settings.autoRestart, closeRequested: true })
           if (started.ok) {
             autoState.pending = { mode: 'pull', at: Date.now(), restart: settings.autoRestart, watcherPid: started.pid, closeRequested: true }
             closeDsh()
@@ -4490,15 +5111,39 @@ async function handleWebdav(req, res, config) {
     return
   }
 
-  // 上传/下载都要动本机文件：没有仓库目录就没意义，先明确报错
+  // 上传/下载都要动本机文件，但两者的前提不同：
+  //   upload   必须有内容（空目录没东西可传）
+  //   download 恰恰要把空目录填满 —— 新机器首次拉取就是这个场景，不能拒
   const repo = resolveRepo(config?.repoPath, dshHome).repo
-  if (!repo || !isDir(repo)) {
-    sendJson(res, 400, { ok: false, error: '本机仓库目录不存在（先在「本机仓库」卡里设置路径）' })
+  if (!repo) {
+    sendJson(res, 400, { ok: false, error: '还没有设置本机仓库目录（先在「本机仓库」卡里设置路径）' })
     return
   }
-  if (!isRepoDir(repo) && !isDir(join(repo, 'machines'))) {
-    sendJson(res, 400, { ok: false, error: `这个目录不像同步仓库：${repo}` })
-    return
+  const repoLooksReal = isRepoDir(repo) || isDir(join(repo, 'machines'))
+  if (action === 'upload') {
+    if (!isDir(repo)) {
+      sendJson(res, 400, { ok: false, error: '本机仓库目录不存在（先在「本机仓库」卡里设置路径）' })
+      return
+    }
+    if (!repoLooksReal) {
+      sendJson(res, 400, { ok: false, error: `这个目录不像同步仓库：${repo}` })
+      return
+    }
+  }
+  if (action === 'download') {
+    // 不存在就建；空目录放行；非空又不像仓库才拒（防止把配置铺到别人的目录里）
+    if (!isDir(repo)) {
+      try { mkdirSync(repo, { recursive: true }) } catch (e) {
+        sendJson(res, 400, { ok: false, error: `建不了本机仓库目录：${String((e && e.message) || e)}` })
+        return
+      }
+    }
+    let entries = []
+    try { entries = readdirSync(repo).filter((n) => !n.startsWith('.')) } catch { entries = [] }
+    if (entries.length > 0 && !repoLooksReal) {
+      sendJson(res, 400, { ok: false, error: `这个目录不像同步仓库：${repo}` })
+      return
+    }
   }
 
   if (action === 'upload') {
@@ -4636,12 +5281,8 @@ async function handleRoots(req, res, config) {
       confirmed: [],
       updatedAt: new Date().toISOString(),
     }
-    const rawCustom = input.custom && typeof input.custom === 'object' ? input.custom : (prev.custom || {})
-    for (const [k, v] of Object.entries(rawCustom)) {
-      const key = String(k || '').trim()
-      const val = String(v == null ? '' : v).trim()
-      if (key && val) next.custom[key] = val
-    }
+    const rawCustom = Object.prototype.hasOwnProperty.call(input, 'custom') ? input.custom : (prev.custom || {})
+    next.custom = normalizeCustomRoots(rawCustom)
     // 校验：三个根都不能空、必须是绝对路径。目录不存在只提示不拒 —— 新机器上目标目录常常还没建。
     const warns = []
     for (const key of ['appRoot', 'dshHome', 'workspaceHome']) {
@@ -4669,7 +5310,7 @@ async function handleRoots(req, res, config) {
     next.confirmed = [...confirmed]
 
     mkdirSync(dirname(rootsPathOf(dshHome)), { recursive: true })
-    writeFileSync(rootsPathOf(dshHome), `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+    writeFileAtomicSync(rootsPathOf(dshHome), `${JSON.stringify(next, null, 2)}\n`)
     // 根都确认了，待确认清单就没意义了：清掉，下次拉取不再拦
     try { if (existsSync(pendingPathOf(dshHome))) unlinkSync(pendingPathOf(dshHome)) } catch { }
 
@@ -4688,6 +5329,67 @@ async function handleRoots(req, res, config) {
 }
 
 /**
+ * 归一化「自选目录」。三种形状都认：
+ *   { 名字: '绝对路径' }                 —— 真实文件 / 面板发送的形状
+ *   [ { name|key: '名字', path: '绝对路径' } ] —— 数组形状（手工编辑或旧文件）
+ *   [ '绝对路径', ... ]                  —— 纯路径数组，名字取目录名
+ * 返回对象映射；形状完全无法识别时抛一条人能看懂的错。
+ */
+function normalizeCustomRoots(raw) {
+  const out = {}
+  const leafKey = (v) => String(v).replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || ''
+  const put = (name, value) => {
+    const key = String(name || '').trim() || leafKey(value)
+    const val = String(value == null ? '' : value).trim()
+    if (key && val) out[key] = val
+  }
+  if (Array.isArray(raw)) {
+    raw.forEach((item, i) => {
+      if (item == null) return
+      if (typeof item === 'string') { put('', item); return }
+      if (typeof item === 'object') {
+        const path = item.path ?? item.value ?? item.dir ?? ''
+        const name = item.name ?? item.key ?? item.id ?? ''
+        if (!String(path || '').trim()) {
+          throw new Error(t(
+            `自选目录第 ${i + 1} 项没有 path 字段（应为 { name, path } 或纯路径字符串）`,
+            `Custom folder entry #${i + 1} has no path field (expected { name, path } or a plain path string)`,
+          ))
+        }
+        put(name, path)
+        return
+      }
+      throw new Error(t(
+        `自选目录第 ${i + 1} 项看不懂：${typeof item}（应为 { name, path } 或纯路径字符串）`,
+        `Custom folder entry #${i + 1} is not understood: ${typeof item} (expected { name, path } or a plain path string)`,
+      ))
+    })
+    return out
+  }
+  if (raw && typeof raw === 'object') {
+    for (const [k, v] of Object.entries(raw)) {
+      if (v && typeof v === 'object') {
+        const nested = v.path ?? v.value ?? v.dir ?? ''
+        if (!String(nested || '').trim()) {
+          throw new Error(t(
+            `自选目录「${k}」没有 path 字段（应为 { name, path } 或纯路径字符串）`,
+            `Custom folder "${k}" has no path field (expected { name, path } or a plain path string)`,
+          ))
+        }
+        put(k, nested)
+        continue
+      }
+      put(k, v)
+    }
+    return out
+  }
+  if (raw == null || raw === '') return out
+  throw new Error(t(
+    `自选目录格式不对：应为 { 名字: 路径 } 或数组`,
+    `Custom folders must be an object map or an array`,
+  ))
+}
+/**
  * 问题反馈：落成仓库里的 feedback\<时间戳>-<id>.json，再 git add/commit/push 到云端。
  * 为什么用文件而不是 Issue：不依赖 API 令牌，另一台机器拉取后同样能在面板里看到；
  * 推送失败也不回滚本地文件（先把反馈留住，等网络好了下次推送会带上）。
@@ -4696,7 +5398,16 @@ async function handleRoots(req, res, config) {
 // 面板里提交 → 直接建 issue（label=feedback，正文附环境块）；列表读 issue（含 open/closed）；
 // 点「已解决」就 PATCH 成 closed。网络不通时先进本机待发队列，下次点「补发」再建 issue。
 
-const GH_DEFAULT_REPO = 'huanyu-a/dsh-profile-config-sync'
+const GH_DEFAULT_REPO = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(join(PLUGIN_DIR, 'package.json'), 'utf8'))
+    const raw = String((pkg && pkg.repository && (pkg.repository.url || pkg.repository)) || '')
+    const m = raw.match(/github\.com[/:]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?(?:[#?/]|$)/i)
+    if (m && m[1]) return m[1]
+  } catch { }
+  return 'huanyu-a/dsh-profile-config-sync'
+})()
+const LEGACY_UPSTREAM_REPOS = new Set(['QcWyGm/dsh-config-sync-plugin', 'QcWyGm/dsh-config-sync'])
 const GH_FEEDBACK_LABEL = 'feedback'
 
 /** 当前插件版本（读自己的 package.json；读不到就空串，不抛）。 */
@@ -4710,11 +5421,18 @@ function pluginVersion() {
 function ghPathOf(dshHome) { return join(dshHome, 'config-sync-gh.json') }
 function outboxPathOf(dshHome) { return join(dshHome, 'config-sync-feedback-outbox.json') }
 
+function normalizeGhRepo(raw) {
+  const s = String(raw || '').trim()
+  if (!s || LEGACY_UPSTREAM_REPOS.has(s)) return GH_DEFAULT_REPO
+  return s
+}
+
 function readGh(dshHome) {
   const j = readJson(ghPathOf(dshHome)) || {}
   return {
     token: String(j.token || ''),
-    repo: String(j.repo || GH_DEFAULT_REPO),
+    tokenEnv: String(j.tokenEnv || '').trim(),
+    repo: normalizeGhRepo(j.repo),
     login: String(j.login || ''),
     updatedAt: String(j.updatedAt || ''),
   }
@@ -4724,11 +5442,15 @@ function writeGh(dshHome, o) {
   const f = ghPathOf(dshHome)
   try { mkdirSync(dirname(f), { recursive: true }) } catch { }
   const prev = readGh(dshHome)
+  const hasToken = Object.prototype.hasOwnProperty.call(o || {}, 'token')
+  const hasTokenEnv = Object.prototype.hasOwnProperty.call(o || {}, 'tokenEnv')
+  const hasLogin = Object.prototype.hasOwnProperty.call(o || {}, 'login')
   const body = {
-    token: String(o.token || ''),
-    repo: String(o.repo || GH_DEFAULT_REPO),
+    token: hasToken ? String(o.token || '') : prev.token,
+    tokenEnv: hasTokenEnv ? String(o.tokenEnv || '').trim() : prev.tokenEnv,
+    repo: normalizeGhRepo((o && o.repo) || prev.repo),
     // 令牌没换就沿用之前认出来的账号，免得每轮都调 /user
-    login: String(o.login || prev.login || ''),
+    login: hasLogin ? String(o.login || '') : prev.login,
     updatedAt: new Date().toISOString(),
   }
   writeFileSync(f, `${JSON.stringify(body, null, 2)}\n`, 'utf8')
@@ -4747,38 +5469,86 @@ function writeOutbox(dshHome, items) {
   return f
 }
 
-/** 从本机 git 凭据里取一次 GitHub 令牌：用户平时 push 过，这里就不用再填。 */
-function tokenFromGitCredential() {
+/** 从本机 git 凭据里取 GitHub 令牌与用户名：用户平时 push 过，这里就不用再填。 */
+function credFromGitCredential() {
   return new Promise((resolve) => {
     let p = null
     try {
       p = spawn(resolveGitExe(), ['credential', 'fill'], { windowsHide: true })
-    } catch { resolve(''); return }
+    } catch { resolve({ token: '', username: '' }); return }
     let out = ''
-    const timer = setTimeout(() => { try { p.kill() } catch { } resolve('') }, 8000)
+    const timer = setTimeout(() => { try { p.kill() } catch { } resolve({ token: '', username: '' }) }, 8000)
     p.stdout.on('data', (d) => { out += String(d) })
-    p.on('error', () => { clearTimeout(timer); resolve('') })
+    p.on('error', () => { clearTimeout(timer); resolve({ token: '', username: '' }) })
     p.on('close', () => {
       clearTimeout(timer)
-      const m = out.match(/password=([^\r\n]+)/)
-      resolve(m ? m[1].trim() : '')
+      const pm = out.match(/password=([^\r\n]+)/)
+      const um = out.match(/username=([^\r\n]+)/)
+      resolve({ token: pm ? pm[1].trim() : '', username: um ? um[1].trim() : '' })
     })
     try { p.stdin.write('protocol=https\nhost=github.com\n\n'); p.stdin.end() } catch { }
   })
 }
 
-/** 有存下来的令牌就用它，没有就向 git 凭据要一次并落盘（本机私有、不进仓库）。 */
+function tokenFromGitCredential() {
+  return credFromGitCredential().then((c) => c.token)
+}
+
+/** 从本机 GitHub CLI（gh auth token）读取登录令牌，作为 git credential 的补充。 */
+function tokenFromGhCli() {
+  return new Promise((resolve) => {
+    let p = null
+    try {
+      p = spawn(IS_WIN ? 'gh.exe' : 'gh', ['auth', 'token'], { windowsHide: true })
+    } catch { resolve(''); return }
+    let out = ''
+    const timer = setTimeout(() => { try { p.kill() } catch { } resolve('') }, 4000)
+    p.stdout.on('data', (d) => { out += String(d) })
+    p.on('error', () => { clearTimeout(timer); resolve('') })
+    p.on('close', (code) => {
+      clearTimeout(timer)
+      resolve(code === 0 ? String(out || '').trim() : '')
+    })
+  })
+}
+
+/**
+ * 令牌读取顺序（绝不把环境变量或凭据助手的令牌写进同步仓库）：
+ *   1. config-sync-gh.json 里显式绑定的环境变量名 tokenEnv（实时读取，不落盘明文）；
+ *   2. config-sync-gh.json 里保存的令牌（若写成 $VAR / ${VAR} / env:VAR 也按环境变量实时解析）；
+ *   3. 本机常见环境变量（DSH_CONFIG_SYNC_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN，不落盘）；
+ *   4. 本机 git 凭据（git credential fill，仅放内存使用，不落盘）；
+ *   5. 本机 GitHub CLI（gh auth token，仅放内存使用，不落盘）。
+ */
 async function ghToken(config, dshHome) {
   const g = readGh(dshHome)
-  if (g.token) return g
-  const auto = await tokenFromGitCredential()
-  if (!auto) return g
-  writeGh(dshHome, { ...g, token: auto })
-  return { ...g, token: auto }
+  if (g.tokenEnv) {
+    return { ...g, token: getEnvValue(g.tokenEnv), source: 'env', envName: g.tokenEnv, tokenSaved: false, credLogin: '' }
+  }
+  if (g.token) {
+    const refEnv = parseEnvTokenRef(g.token)
+    if (refEnv) {
+      return { ...g, token: getEnvValue(refEnv), source: 'env', envName: refEnv, tokenSaved: false, credLogin: '' }
+    }
+    return { ...g, source: 'file', envName: '', tokenSaved: true, credLogin: '' }
+  }
+  for (const name of GH_TOKEN_ENV_CANDIDATES) {
+    const v = getEnvValue(name)
+    if (v) return { ...g, token: v, source: 'env', envName: name, tokenSaved: false, credLogin: '' }
+  }
+  const cred = await credFromGitCredential()
+  if (cred.token) {
+    return { ...g, token: cred.token, source: 'git-credential', envName: '', tokenSaved: false, credLogin: cred.username || '' }
+  }
+  const ghCliTok = await tokenFromGhCli()
+  if (ghCliTok) {
+    return { ...g, token: ghCliTok, source: 'gh-cli', envName: '', tokenSaved: false, credLogin: cred.username || '' }
+  }
+  return { ...g, source: 'none', envName: '', tokenSaved: false, credLogin: cred.username || '' }
 }
 
 async function ghApi(pathname, options = {}) {
-  const { method = 'GET', token, body } = options
+  const { method = 'GET', token, body, timeoutMs = 15000 } = options
   const url = pathname.startsWith('http') ? pathname : `https://api.github.com${pathname}`
   const headers = {
     Accept: 'application/vnd.github+json',
@@ -4792,11 +5562,28 @@ async function ghApi(pathname, options = {}) {
     headers['Content-Type'] = 'application/json; charset=utf-8'
     init.body = JSON.stringify(body)
   }
-  const res = await fetch(url, init)
-  const raw = await res.text()
-  let json = null
-  try { json = raw ? JSON.parse(raw) : null } catch { json = null }
-  return { ok: res.ok, status: res.status, json, text: raw }
+  let timer = null
+  try {
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      init.signal = AbortSignal.timeout(timeoutMs)
+    } else if (typeof AbortController !== 'undefined') {
+      const ac = new AbortController()
+      init.signal = ac.signal
+      timer = setTimeout(() => ac.abort(), timeoutMs)
+    }
+    const res = await fetch(url, init)
+    const raw = await res.text()
+    let json = null
+    try { json = raw ? JSON.parse(raw) : null } catch { json = null }
+    return { ok: res.ok, status: res.status, networkError: false, json, text: raw }
+  } catch (err) {
+    const causeMsg = err && err.cause && err.cause.message ? String(err.cause.message) : ''
+    const baseMsg = String((err && err.message) || err || 'fetch failed')
+    const msg = causeMsg && !baseMsg.includes(causeMsg) ? `${baseMsg}: ${causeMsg}` : baseMsg
+    return { ok: false, status: 0, networkError: true, json: { message: msg }, text: msg }
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 function issueToItem(it) {
@@ -4848,16 +5635,22 @@ function ownerOf(repo) {
   return String(repo || '').split('/')[0] || ''
 }
 
-/** 令牌属于谁（GET /user）。结果缓存在 gh.json 里，不每轮都问。 */
+const ghIdentityCache = new Map()
+/** 令牌属于谁（GET /user）。按令牌哈希放内存缓存，不依赖落盘的旧账号。 */
 async function ghIdentity(token, dshHome, known) {
-  if (known) return known
+  if (!token) return ''
+  const key = createHash('sha256').update(String(token)).digest('hex')
+  if (ghIdentityCache.has(key)) return ghIdentityCache.get(key) || ''
   const r = await ghApi('/user', { token })
   const login = r.ok && r.json ? String(r.json.login || '') : ''
   if (login) {
-    const g = readGh(dshHome)
-    writeGh(dshHome, { ...g, login })
+    ghIdentityCache.set(key, login)
+    if (isFile(ghPathOf(dshHome)) && known !== login) {
+      try { writeGh(dshHome, { login }) } catch { }
+    }
+    return login
   }
-  return login
+  return String(known || '')
 }
 
 /**
@@ -5124,13 +5917,16 @@ async function handleFeedback(req, res, config) {
 
   if (req.method === 'GET') {
     try {
+      if (url.searchParams.get('refresh') === '1') clearWinEnvCache()
       const g = await ghToken(config, dshHome)
       const outbox = readOutbox(dshHome)
       const owner = ownerOf(g.repo)
-      const login = g.token ? await ghIdentity(g.token, dshHome, g.login) : ''
+      const login = g.token ? await ghIdentity(g.token, dshHome, g.login || g.credLogin || '') : ''
+      const envCandidates = GH_TOKEN_ENV_CANDIDATES.filter((n) => Boolean(getEnvValue(n)))
       const base = {
         ok: true,
         repo: g.repo,
+        defaultRepo: GH_DEFAULT_REPO,
         label: GH_FEEDBACK_LABEL,
         owner,
         login,
@@ -5138,13 +5934,18 @@ async function handleFeedback(req, res, config) {
         canClose: !!(login && owner && login.toLowerCase() === owner.toLowerCase()),
         connected: false,
         readAnon: false,
-        tokenSaved: !!g.token,
+        tokenPresent: Boolean(g.token),
+        tokenSaved: Boolean(g.tokenSaved),
+        tokenSource: g.source || (g.token ? 'file' : 'none'),
+        tokenEnv: g.envName || g.tokenEnv || '',
+        envCandidates,
         items: [],
+        counts: { open: 0, closed: 0, total: 0 },
         outbox: outbox.map((x) => ({ title: String(x.title || ''), createdAt: String(x.createdAt || '') })),
         version: pluginVersion(),
         ghFile: ghPathOf(dshHome),
       }
-      // 读：有令牌先带令牌（自己的账号、限额 5000/小时），失败或没令牌就退回匿名（公开仓库 60 次/小时）
+      // 读：有令牌先带令牌（自己的账号、限额 5000/小时）；网络本身不通时不重复打匿名请求，仅 HTTP 401/403 才退回匿名
       const attempts = g.token ? [g.token, ''] : ['']
       let lastError = ''
       for (const tok of attempts) {
@@ -5162,12 +5963,15 @@ async function handleFeedback(req, res, config) {
             items,
             counts,
             note: !tok
-              ? t('匿名读取（公开仓库，不限令牌；上限 60 次/小时），提交和关单需要令牌', 'Anonymous read (public repo, no token needed; 60 requests/hour). Submitting and closing need a token.')
+              ? (g.token
+                ? t(`当前令牌认证未通过（${lastError || '401'}），已退回匿名读取；请点「换令牌」或重新登录 GitHub`, `Token auth failed (${lastError || '401'}); fell back to anonymous read. Re-auth or update token.`)
+                : t('匿名读取（公开仓库，不限令牌；上限 60 次/小时），提交和关单需要令牌', 'Anonymous read (public repo, no token needed; 60 requests/hour). Submitting and closing need a token.'))
               : '',
           })
           return
         } catch (error) {
           lastError = String((error && error.message) || error)
+          if (tok && /^0\s/.test(lastError)) break
         }
       }
       sendJson(res, 200, { ...base, error: lastError || t('读不到 issue 列表', 'Cannot read the issue list') })
@@ -5185,21 +5989,77 @@ async function handleFeedback(req, res, config) {
     const payload = raw.trim() ? JSON.parse(raw) : {}
     const g = await ghToken(config, dshHome)
 
-    // 1) 存令牌（填一次就够了；顺手用一次只读接口验证）
+    // 1) 存令牌 / 绑定环境变量 / 换反馈仓库（用一次只读接口验证；绑定环境变量时绝不落盘令牌值）
     if (action === 'token') {
-      const token = String(payload.token || '').trim()
+      clearWinEnvCache()
       const repo = String(payload.repo || g.repo || GH_DEFAULT_REPO).trim() || GH_DEFAULT_REPO
-      if (!token) throw new Error(t('令牌是空的', 'The token is empty'))
-      const probe = await ghApi(`/repos/${repo}`, { token })
+      if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+        throw new Error(t('仓库格式不对，应为 owner/repo', 'Invalid repo format — expected owner/repo'))
+      }
+      if (payload.clearToken === true) {
+        writeGh(dshHome, {
+          token: '',
+          tokenEnv: payload.clearEnv === true ? '' : undefined,
+          repo,
+          login: '',
+        })
+        const next = await ghToken(config, dshHome)
+        const me = next.token ? await ghIdentity(next.token, dshHome, next.credLogin || '') : ''
+        const owner = ownerOf(repo)
+        sendJson(res, 200, {
+          ok: true,
+          cleared: true,
+          connected: Boolean(next.token),
+          tokenPresent: Boolean(next.token),
+          repo,
+          tokenSource: next.source || 'none',
+          tokenEnv: next.envName || next.tokenEnv || '',
+          tokenSaved: Boolean(next.tokenSaved),
+          login: me,
+          owner,
+          canClose: !!(me && owner && me.toLowerCase() === owner.toLowerCase()),
+        })
+        return
+      }
+      const rawToken = String(payload.token || '').trim()
+      const explicitEnv = String(payload.tokenEnv || '').trim()
+      const envName = explicitEnv || parseEnvTokenRef(rawToken)
+      let verifyToken = ''
+      let saveFields = { repo }
+      if (envName) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
+          throw new Error(t('环境变量名格式不对（仅支持字母、数字和下划线）', 'Invalid env var name (letters, digits and underscores only)'))
+        }
+        verifyToken = getEnvValue(envName)
+        if (!verifyToken) {
+          throw new Error(t(`本机环境变量 ${envName} 为空，请先设置它后再保存`, `Local environment variable ${envName} is empty — set it first`))
+        }
+        // 只存变量名，绝不把令牌值写进 config-sync-gh.json
+        saveFields = { token: '', tokenEnv: envName, repo }
+      } else if (rawToken) {
+        verifyToken = rawToken
+        saveFields = { token: rawToken, tokenEnv: '', repo }
+      } else if (g.token) {
+        // 只改 repo（保留当前已有的环境变量 / 凭据 / 已存令牌）
+        verifyToken = g.token
+        saveFields = { repo }
+      } else {
+        throw new Error(t('请输入令牌或环境变量名（如 $GITHUB_TOKEN）', 'Enter a token or an environment variable reference (e.g. $GITHUB_TOKEN)'))
+      }
+      const probe = await ghApi(`/repos/${repo}`, { token: verifyToken })
       if (!probe.ok) throw new Error(`${probe.status} ${String((probe.json && probe.json.message) || '').slice(0, 160) || '令牌或仓库不对'}`)
-      const me = await ghIdentity(token, dshHome)
-      writeGh(dshHome, { token, repo, login: me })
+      const me = await ghIdentity(verifyToken, dshHome)
+      writeGh(dshHome, { ...saveFields, login: me })
       const owner = ownerOf(repo)
       sendJson(res, 200, {
         ok: true,
         connected: true,
+        tokenPresent: true,
         repo,
         saved: ghPathOf(dshHome),
+        tokenSource: envName ? 'env' : (rawToken ? 'file' : (g.source || 'file')),
+        tokenEnv: envName || g.envName || '',
+        tokenSaved: Boolean(rawToken || (!envName && g.tokenSaved)),
         login: me,
         owner,
         canClose: !!(me && owner && me.toLowerCase() === owner.toLowerCase()),

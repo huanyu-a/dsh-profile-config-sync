@@ -52,7 +52,13 @@ function Resolve-AppRoot([string]$explicit) {
   if ($explicit) { $cands += $explicit }
   $cands += @('D:\DeepSeekHarness', 'D:\DSH', 'G:\DSH', 'G:\DeepSeekHarness', 'C:\DeepSeekHarness')
   foreach ($c in $cands) {
-    if (Test-Path -LiteralPath (Join-Path $c 'resources\app\package.json')) { return $c }
+    if (-not $c) { continue }
+    # 不要用 Join-Path：探测列表里带着不存在的盘（这台机器没有 G:），
+    # PS 5.1 的 Join-Path 会当场抛 DriveNotFoundException，而脚本开头把
+    # $ErrorActionPreference 设成了 Stop —— 于是「还原」在第一步就崩，什么都没做。
+    # 字符串拼接不碰盘符校验，Test-Path 也再兜一层 SilentlyContinue。
+    $probe = ($c.TrimEnd('\') + '\resources\app\package.json')
+    if (Test-Path -LiteralPath $probe -ErrorAction SilentlyContinue) { return $c }
   }
   if ($explicit) { return $explicit }
   return 'D:\DeepSeekHarness'
@@ -218,8 +224,20 @@ if ($FromCommit) {
   $gitExe = Get-GitExe
   if (-not $gitExe) { Die "找不到 git，无法按提交还原。请安装 Git 或改用 -BackupDir。" }
   # 注意：不能用 "{0}^{commit}" -f ，`{commit}` 会被当成格式占位符 → "Error formatting a string"
-  & $gitExe -C $RepoRoot rev-parse --verify ($FromCommit + '^{commit}') 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { Die "git 里找不到提交：$FromCommit" }
+  # 也不能裸跑：$ErrorActionPreference='Stop' 下 native 的 stderr 会被包成终止错误，
+  # 提交号无效时 git 写 "fatal: Needed a single revision"，异常先抛出，下面那句提示永远不会显示。
+  $verifyCode = -1
+  $eapVerify = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    & $gitExe -C $RepoRoot rev-parse --verify ($FromCommit + '^{commit}') 2>&1 | Out-Null
+    $verifyCode = $LASTEXITCODE
+  } catch {
+    $verifyCode = 1
+  } finally {
+    $ErrorActionPreference = $eapVerify
+  }
+  if ($verifyCode -ne 0) { Die "git 里找不到提交：$FromCommit" }
   $mode = 'git'
   Say "来源：git 提交 $FromCommit 的 profile\"
 } else {
@@ -261,6 +279,7 @@ if (-not $DryRun) {
     $src = Join-Path $ProfileDir $f
     if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $safety $f) -Force; $n++ }
   }
+  # HomeFiles（AGENTS.md 等）：两套备份布局都落在快照根，直接按同名取
   foreach ($f in $HomeFiles) {
     $src = Join-Path $DshHome $f
     if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $safety $f) -Force; $n++ }
@@ -270,21 +289,41 @@ if (-not $DryRun) {
 }
 
 # ---------- 3. 还原 profile 配置 ----------
+# 仓库里的 profile 文件可能有占位符（capture 会把本机绝对路径换成 {{ROOT:*}} 之类）：
+# 写回本机前必须展开，否则另一台机器的 profile 里会留下裸 {{DSH_HOME}}，宿主解析直接 fatal。
+$profileRoots = Get-SyncRoots $DshHome $AppRoot $WorkspaceHome
 if ($mode -eq 'git') {
   foreach ($f in $ProfileFiles) {
     if ($DryRun) { Say "  将写入 profile\$f（取自 $FromCommit）"; continue }
     $raw = (& $gitExe -C $RepoRoot show ($FromCommit + ':profile/' + $f)) -join "`n"
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($raw)) { Warn "提交 $FromCommit 里没有 profile\$f，跳过"; continue }
-    Write-TextPreserveBom (Join-Path $ProfileDir $f) ($raw + "`n")
+    $expandedRaw = Expand-TokenText $raw $profileRoots
+    Write-TextPreserveBom (Join-Path $ProfileDir $f) ($expandedRaw + "`n")
     Ok "已写回 profile\$f"
   }
 } else {
   $restored = 0
+  # 快照布局有两种，都要认：
+  #   config-<stamp>/package.json …              —— PowersShell apply 的备份（平铺）
+  #   apply-<stamp>/profiles/<name>/package.json —— 引擎（macOS/Linux）apply 的备份（按 dshHome 相对路径）
+  # 只认平铺会让「把另一台机器上的快照还原到这台」直接失败。
+  $profileSourceDir = $BackupDir
+  foreach ($cand in @((Join-Path $BackupDir 'profile'), (Join-Path $BackupDir ('profiles' + [IO.Path]::DirectorySeparatorChar + $ProfileName)))) {
+    if (Test-Path -LiteralPath (Join-Path $cand 'package.json')) { $profileSourceDir = $cand; break }
+  }
+  if ($profileSourceDir -ne $BackupDir) { Say "  快照布局：引擎备份（$profileSourceDir）" }
   foreach ($f in $ProfileFiles) {
-    $src = Join-Path $BackupDir $f
+    $src = Join-Path $profileSourceDir $f
     if (-not (Test-Path -LiteralPath $src)) { Warn "快照里没有 $f，跳过（该文件保持现状）"; continue }
     if ($DryRun) { Say "  将写回 profile\$f"; continue }
-    Copy-Item -LiteralPath $src -Destination (Join-Path $ProfileDir $f) -Force
+    # 快照里可能是占位符形态（另一台机器 capture 的仓库-derived 快照），写回前必须展开：
+    # 直接 Copy-Item 等于把 {{DSH_HOME}} 这类裸串铺进本机 profile，宿主解析 YAML 会 fatal。
+    $dstF = Join-Path $ProfileDir $f
+    Copy-Item -LiteralPath $src -Destination $dstF -Force
+    $rawSnap = Read-TextPreserveBom $dstF
+    if ($rawSnap -match '\{\{(APP_ROOT|DSH_HOME|WORKSPACE_HOME|ROOT:[A-Za-z0-9_.\-]+)\}\}') {
+      Write-TextPreserveBom $dstF (Expand-TokenText $rawSnap $profileRoots)
+    }
     $restored++
   }
   if (-not $DryRun -and $restored -eq 0) { Die "快照里一个 profile 文件都没有，$BackupDir 可能不是 apply 生成的备份点。" }
@@ -292,9 +331,20 @@ if ($mode -eq 'git') {
 
   foreach ($f in $HomeFiles) {
     $src = Join-Path $BackupDir $f
+    # 仓库布局把提示词放在 prompt\ 下（apply 备份是平铺在快照根）。
+    # 只认平铺会让「把同步仓库当快照还原」静默地什么都没做 —— 用户以为还原成功，提示词却没回来。
+    if (-not (Test-Path -LiteralPath $src)) {
+      $alt = Join-Path (Join-Path $BackupDir 'prompt') $f
+      if (Test-Path -LiteralPath $alt) { $src = $alt }
+    }
     if (-not (Test-Path -LiteralPath $src)) { continue }
     if ($DryRun) { Say "  将写回 $f"; continue }
-    Copy-Item -LiteralPath $src -Destination (Join-Path $DshHome $f) -Force
+    $dstHome = Join-Path $DshHome $f
+    Copy-Item -LiteralPath $src -Destination $dstHome -Force
+    $rawHome = Read-TextPreserveBom $dstHome
+    if ($rawHome -match '\{\{(APP_ROOT|DSH_HOME|WORKSPACE_HOME|ROOT:[A-Za-z0-9_.\-]+)\}\}') {
+      Write-TextPreserveBom $dstHome (Expand-TokenText $rawHome $profileRoots)
+    }
     Ok "已写回 $f"
   }
 
@@ -315,11 +365,29 @@ if ($mode -eq 'git') {
       $cnt = 0
       Get-ChildItem -LiteralPath $bkSettings -File -Force | Where-Object { $_.Name -ne '__backup_manifest.json' } | ForEach-Object {
         $prop = if ($bkManifest) { $bkManifest.PSObject.Properties[$_.Name] } else { $null }
-        $rel = if ($prop) { [string]$prop.Value } else { $_.Name }
+        $rel = if ($prop) { [string]$prop.Value } else { [string]$_.Name }
+        # 没有备份清单时不能一律丢到 ~/.dsh 根：settings\dsh-workspaces.json 的真实位置是
+        # ~/.dsh\storages\workspace.json，丢到根目录等于 DSH 读不到、工作区全部"消失"。
+        # 用 capture/apply 同一份映射表反查真实位置。
+        if (-not $prop) {
+          $leafName = [string]$_.Name
+          foreach ($mm in (Get-SyncSettingsMap $DshHome $ProfileName)) {
+            if ((Split-Path -Leaf $mm.Repo) -eq $leafName) {
+              $rel = ([string]$mm.Src).Substring(([string]$DshHome).TrimEnd('\').Length).TrimStart('\')
+              break
+            }
+          }
+        }
         $dest = Join-Path $DshHome $rel
         $destDir = Split-Path -Parent $dest
         if ($destDir -and -not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
         Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
+        # 同步仓库里的设置文件带占位符（实测 dsh-workspaces.json 里有 {{ROOT:userHome}}、{{DSH_HOME}}）：
+        # 逐字节拷进 ~/.dsh 会让 DSH 读到字面量占位符当路径，工作区直接失效。
+        $rawSet = Read-TextPreserveBom $dest
+        if ($rawSet -match '\{\{(APP_ROOT|DSH_HOME|WORKSPACE_HOME|ROOT:[A-Za-z0-9_.\-]+)\}\}') {
+          Write-TextPreserveBom $dest (Expand-TokenText $rawSet $profileRoots)
+        }
         $cnt++
       }
       Ok "已写回 settings 下 $cnt 个插件设置文件到各自原位"

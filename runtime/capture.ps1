@@ -54,6 +54,12 @@ $ErrorActionPreference = 'Stop'
 if (-not $RepoRoot) { $RepoRoot = $PSScriptRoot }
 . (Join-Path $PSScriptRoot 'dsh-sync-common.ps1')
 
+# 并发保护：同一 DSH 目录同时只允许一个同步动作（面板按钮 + 自动 watcher 很容易撞车）
+if (-not (Lock-SyncRun $DshHome '抓取')) {
+  Warn "另一个同步动作正在进行（同一个 DSH 目录），本次 抓取 没有执行。等它结束后再试一次。"
+  exit 3
+}
+
 function Get-NormalizedHash($path) {
   # 文本文件按"去掉 CRLF/LF 差异后的内容"比较，避免换行转换制造假变更；归档文件按原始字节比较
   $ext = [IO.Path]::GetExtension($path).ToLower()
@@ -369,6 +375,8 @@ function Sync-ConversationCapture {
   $dirRemap = @{}      # 本机编码目录名 → 仓库稳定目录名
   $cwdToken = @{}      # 仓库稳定目录名 → 归一后的 cwd 占位符（让仓库内容与机器无关）
   $skipSessDirs = @{}  # 被“同步内容”取消勾选的工作区目录名（其会话不抓、也不入库）
+  $skipSessionIds = @{}
+  $keepSessionIds = @{}
   if (Test-Path -LiteralPath $sessSrc) {
     foreach ($d in @(Get-ChildItem -LiteralPath $sessSrc -Directory -Force | Sort-Object Name)) {
       if (Test-DefaultWorkspaceDir $d.Name) {
@@ -378,9 +386,13 @@ function Sync-ConversationCapture {
       }
       if ($wsEncToId.ContainsKey($d.Name) -and -not (Test-SyncItemEnabled $Scope 'conversations' ([string]$wsEncToId[$d.Name]))) {
         $skipSessDirs[$d.Name] = $true
+        foreach ($sd in @(Get-ChildItem -LiteralPath $d.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+          $skipSessionIds[$sd.Name] = $true
+        }
         Warn ('跳过（未勾选同步）该工作区的会话：{0}' -f $d.Name)
         if (Test-SyncDeleteCloud $Scope) {
           $repoDir = Get-RepoSessionDirName 'ws' $wsEncToId[$d.Name] $d.Name
+          Add-SyncDeleteCloudPrefix ('conversations/sessions/' + $repoDir)
           $t = Join-Path $convDir ('sessions' + [string][char]92 + $repoDir)
           if (Test-Path -LiteralPath $t) {
             Remove-Item -LiteralPath $t -Recurse -Force
@@ -388,6 +400,9 @@ function Sync-ConversationCapture {
           }
         }
         continue
+      }
+      foreach ($sd in @(Get-ChildItem -LiteralPath $d.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+        $keepSessionIds[$sd.Name] = $true
       }
       if ($wsEncToId.ContainsKey($d.Name)) {
         $repoDir = Get-RepoSessionDirName 'ws' $wsEncToId[$d.Name] $d.Name
@@ -428,6 +443,7 @@ function Sync-ConversationCapture {
     $changed.Add('conversations/session-index.json') | Out-Null
   }
 
+  foreach ($kid in @($keepSessionIds.Keys)) { if ($skipSessionIds.ContainsKey($kid)) { $skipSessionIds.Remove($kid) } }
   # 2) 四块数据镜像，全部字节保真（SHA256 判差异，Copy-Item 原样拷）
   #    sessions 块的相对路径第一段是本机编码目录名，写进仓库前换成稳定名（见 Get-RepoSessionDirName）
   $blocks = @(
@@ -452,6 +468,10 @@ function Sync-ConversationCapture {
       if (Test-DefaultWorkspaceDir $parts[0]) { continue }
       # 该工作区的会话被取消勾选：整块不抓（目录名保持本机编码，绝不能原样入库）
       if ($b.Remap -and $skipSessDirs.ContainsKey($parts[0])) { continue }
+      if (-not $b.Remap -and ($b.Dst -eq 'session_projcache' -or $b.Dst -eq 'vision_router_session_policy')) {
+        $sidPart = [IO.Path]::GetFileNameWithoutExtension($parts[0])
+        if ($skipSessionIds.ContainsKey($sidPart)) { continue }
+      }
       if ($b.Remap -and $dirRemap.ContainsKey($parts[0])) { $parts[0] = $dirRemap[$parts[0]] }
       $rel = ($parts -join '\')
       $srcRels[$rel] = $f
@@ -538,7 +558,9 @@ function Sync-ConversationCapture {
   #    对不上工作区的 passthrough 目录不动（那种目录在 B 机本来也认不出）。
   if ($cwdToken.Count -gt 0) {
     $spec = [ordered]@{ home = $convDir; dirs = $cwdToken } | ConvertTo-Json -Depth 4 -Compress
-    $specPath = Join-Path ([IO.Path]::GetTempPath()) ('dsh-repo-cwd-{0}.json' -f $stamp)
+    # 文件名必须唯一：面板手动推送与退出后自动推送可能同时跑，固定名会互相覆盖 spec，
+    # 且 554 行的清理会把对方正要用的文件删掉（会话头就漏归一了）。
+    $specPath = Join-Path ([IO.Path]::GetTempPath()) ('dsh-repo-cwd-{0}-{1}.json' -f (Get-Date -Format 'yyyyMMddHHmmssfff'), $PID)
     [IO.File]::WriteAllText($specPath, $spec, (New-Object Text.UTF8Encoding($false)))
     # 辅助脚本优先用「脚本自己旁边」的那份（仓库可能是个刚 clone 下来、还没铺 tools 的副本）
     $helper = Join-Path $PSScriptRoot 'tools\fix-session-cwd.mjs'
@@ -546,8 +568,25 @@ function Sync-ConversationCapture {
     if (Test-Path -LiteralPath $helper) {
       $nodeExe = Join-Path $AppRoot 'resources\runtime\primary-runtime\dependencies\node\bin\node.exe'
       if (-not (Test-Path -LiteralPath $nodeExe)) { $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source }
-      & $nodeExe $helper $specPath *>&1 | ForEach-Object { if ($_ -and ([string]$_).Trim()) { Say ('  ' + ([string]$_).Trim()) } }
-      if ($LASTEXITCODE -ne 0) { Warn '仓库会话头 cwd 归一时有文件失败（上面有原因），那几个会话可能带着本机路径入库' }
+      if (-not $nodeExe) {
+        # & $null 会抛「管道元素中的 & 后面的表达式生成无效的对象」并终止抓取（PS 5.1 实测）。
+        Warn ('找不到 node.exe，跳过仓库会话头归一（仓库里会存本机路径）：' + $helper)
+      } else {
+        # native 命令往 stderr 写东西时，$ErrorActionPreference='Stop' 会把它包成终止错误（PS 5.1 实测：
+        # helper 里的 console.error 只要响一次，整次抓取就断在这里）。临时降级，finally 恢复。
+        $eapCwd = $ErrorActionPreference
+        $cwdCode = -1
+        try {
+          $ErrorActionPreference = 'Continue'
+          & $nodeExe $helper $specPath *>&1 | ForEach-Object { if ($_ -and ([string]$_).Trim()) { Say ('  ' + ([string]$_).Trim()) } }
+          $cwdCode = $LASTEXITCODE
+        } catch {
+          Say ('  会话头归一调用异常：' + $_.Exception.Message)
+        } finally {
+          $ErrorActionPreference = $eapCwd
+        }
+        if ($cwdCode -ne 0) { Warn '仓库会话头 cwd 归一时有文件失败（上面有原因），那几个会话可能带着本机路径入库' }
+      }
     } else {
       Warn ('找不到 {0}，跳过仓库会话头归一（仓库里会继续存本机路径）' -f $helper)
     }
@@ -581,7 +620,44 @@ foreach ($d in @('profile', 'prompt', 'skills', 'presets', 'local-plugins', 'sto
   if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
 }
 
+# 清掉仓库里历史遗留的浏览器剖面 / 凭据库文件。
+# 旧版本把 <DshHome>\plugin-data\browser-profiles 整棵抓进过仓库（本机 3,696 个文件 / 297MB，
+# 含 Login Data 与 Cookies）。现在抓取规则已经不收，但**仓库里那份还在** —— 下一次
+# git add -A 或 WebDAV 上传就会把它送出去。所以每次 capture 顺手清一遍，并如实报条数。
+function Remove-BlockedRepoFiles([string]$root) {
+  if (-not (Test-Path -LiteralPath $root)) { return 0 }
+  $removed = 0
+  # 只回收「因为删文件才变空」的目录，且**绝不动**仓库顶层的骨架目录（profile/prompt/skills…）
+  # —— 早期版本在这里踩过：把所有空目录都删掉，紧接着写 profile\package.json 就报
+  # DirectoryNotFoundException，整次抓取中断。
+  $touched = New-Object System.Collections.Generic.HashSet[string]
+  $all = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)
+  foreach ($f in $all) {
+    $rel = Get-RelPath $root $f.FullName
+    if (Test-BlockedProfilePath $rel) {
+      $parent = $f.DirectoryName
+      try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed++; if ($parent) { [void]$touched.Add($parent) } } catch { }
+    }
+  }
+  foreach ($d in @($touched | Sort-Object { $_.Length } -Descending)) {
+    $cur = $d
+    while ($cur -and $cur.Length -gt $root.Length) {
+      if (-not (Test-Path -LiteralPath $cur)) { $cur = [IO.Path]::GetDirectoryName($cur); continue }
+      if ([IO.Path]::GetDirectoryName($cur).TrimEnd('\', '/') -eq $root.TrimEnd('\', '/')) { break }
+      if (@(Get-ChildItem -LiteralPath $cur -Force -ErrorAction SilentlyContinue).Count -gt 0) { break }
+      try { Remove-Item -LiteralPath $cur -Force -ErrorAction Stop } catch { break }
+      $cur = [IO.Path]::GetDirectoryName($cur)
+    }
+  }
+  if ($removed -gt 0) {
+    Warn ("仓库里有 $removed 个浏览器剖面/凭据库文件（旧版本抓的），已删除；它们不该离开本机。")
+  }
+  return $removed
+}
+
 $changed = New-Object System.Collections.Generic.List[string]
+# 抓取前先清理（在 profile/prompt 组之前做，免得刚写进去又被删）
+[void](Remove-BlockedRepoFiles $RepoRoot)
 
 # -WorkspaceOnly：只抓工作区 + 会话（B 机没装 DSH 也能先还原资料），抓完直接给提交指引并结束
 if ($WorkspaceOnly) {
@@ -671,6 +747,24 @@ function CopyTracked($src, $dst, $label) {
   Ok ("更新 " + $label)
 }
 
+# 文本文件的「令牌化」复制：把本机根路径换成 {{APP_ROOT}} / {{DSH_HOME}} / {{WORKSPACE_HOME}} / {{ROOT:x}} 再入库。
+# 为什么单独一个函数：CopyTracked 是原样复制（profile 里的 link 路径另有 Convert-AppRootText 处理），
+# 而 prompt/AGENTS.md 里写的往往是「工作区在 D:\...」这类绝对路径 —— 原样入库后，另一台机器拉下来
+# 看到的是上一台机器的路径。JS 引擎（macOS/Linux）一直是令牌化的，这里补齐，两边口径一致。
+function CopyTrackedTokenized($src, $dst, $label, $roots) {
+  $mine = Get-TrackedText $src
+  $tokenText = ConvertTo-TokenText $mine.Text $roots
+  if (Test-Path -LiteralPath $dst) {
+    if ((Get-RepoText $dst) -ceq $tokenText) {
+      Say ("  =  " + $label + "（无变化）")
+      return
+    }
+  }
+  [IO.File]::WriteAllText($dst, $tokenText, (New-Object Text.UTF8Encoding($mine.Bom, $false)))
+  $changed.Add($label) | Out-Null
+  Ok ("更新 " + $label)
+}
+
 if (Test-SyncGroupEnabled $Scope 'profile') {
 # 1) profile 配置
 # package.json 里的 link: 指向的是「本机客户端的绝对路径」，入库存成 {{APP_ROOT}}/ 前缀。
@@ -684,6 +778,10 @@ foreach ($dirName in @('dsh-our-free-model-2.8.0', 'dsh-purge-1.1.92')) {
   $pkgRaw = [regex]::Replace($pkgRaw, $pattern, ('link:' + $AppRootToken + '/' + $dirName), 'IgnoreCase')
 }
 if ($pkgRaw) {
+  # link: 也可能指向 userHome 下的本地插件（实测：@local/dsh-personal → C:/Users/<user>/AppData/Local/dsh-personal）。
+  # 只归一 appRoot 会让这条路径原样入库，另一台机器 pnpm install 直接失败。
+  $pkgRoots = Get-SyncRoots $DshHome $AppRoot $WorkspaceHome
+  $pkgRaw = ConvertTo-TokenText $pkgRaw $pkgRoots
   $norm = $pkgRaw -replace "`r`n", "`n"
   $dst = Join-Path $RepoRoot 'profile\package.json'
   $existing = $null
@@ -691,14 +789,21 @@ if ($pkgRaw) {
   if ($null -ne $existing -and $existing -eq $norm) {
     Say "  =  profile\package.json（无变化）"
   } else {
-    [IO.File]::WriteAllText($dst, $norm, (New-Object Text.UTF8Encoding($false, $false)))
+    Write-FileAtomic $dst $norm (New-Object Text.UTF8Encoding($false, $false))
     $changed.Add('profile\package.json') | Out-Null
     Ok "更新 profile\package.json（link 路径已归一为 $AppRootToken）"
   }
 }
 foreach ($f in @('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'cordis.yml', 'cordis.patch.yml')) {
   $src = Join-Path $ProfileDir $f
-  if (Test-Path -LiteralPath $src) { CopyTracked $src (Join-Path $RepoRoot "profile\$f") "profile\$f" }
+  # 这 4 个文件里会有「本机绝对路径」（实测 cordis.patch.yml 里 path: C:\Users\<user>\bin\pwsh7.cmd）。
+  # 原样拷会把那台机器的路径搬到另一台，那边没有这个文件 → 工具起不来。
+  # 所以入库前把根路径换成占位符（{{APP_ROOT}} / {{DSH_HOME}} / {{WORKSPACE_HOME}} / {{ROOT:*}}），
+  # restore / apply 写回本机时再展开。非路径内容逐字节不变。
+  if (Test-Path -LiteralPath $src) {
+    $rootSet = Get-SyncRoots $DshHome $AppRoot $WorkspaceHome
+    CopyTrackedTokenized $src (Join-Path $RepoRoot "profile\$f") "profile\$f" $rootSet
+  }
   elseif (Test-Path -LiteralPath (Join-Path $RepoRoot "profile\$f")) {
     Warn "本机缺少 profile\$f，仓库里保留的是上一次的副本（该机器 apply 时会把它铺过来）"
   }
@@ -713,13 +818,21 @@ if (-not $hostAppVersion) {
   Warn "读不到 app 版本（$AppRoot\resources\app\package.json），跳过 host-contract.json"
 } else {
   $contractText = ("{`n  `"appVersion`": `"$hostAppVersion`",`n  `"electronVersion`": `"$(Get-HostElectronVersion $AppRoot)`"`n}`n")
-  $existing = $null
+  $existingDoc = $null
   if (Test-Path -LiteralPath $contractPath) {
-    try { $existing = [string](Get-Content -LiteralPath $contractPath -Raw -Encoding utf8 | ConvertFrom-Json).appVersion } catch { $existing = $null }
+    try { $existingDoc = Get-Content -LiteralPath $contractPath -Raw -Encoding utf8 | ConvertFrom-Json } catch { $existingDoc = $null }
   }
-  if ($existing -and ($existing -ne $hostAppVersion)) {
-    Warn "仓库契约 app = $existing，本机 app = $hostAppVersion（不一致，契约保持不变；对齐后再 capture）"
-  } else {
+  $existing = if ($existingDoc) { [string]$existingDoc.appVersion } else { $null }
+  # 老规矩是「已存在且不同 → 保持不变」，本意是防止较旧那台把契约拉低；
+  # 但它同时让错误值永远卡住：上游手写的契约把 Electron 版本塞进 appVersion（实测 44.7.0），
+  # 于是每次 capture 都只告警不改写，另一台 apply 永远判「两端不是同一版」而拒绝同步。
+  # 现在交给 Test-ContractStale 判：老格式/更旧的契约重写，更新的契约保留。
+  # 版本相同也走「按现状写一遍」的分支（相同内容不会产生 diff，只是把形状补齐成现代格式）。
+  $stale = Test-ContractStale $existingDoc $hostAppVersion
+  if ($stale -or ($existing -eq $hostAppVersion)) {
+    if ($stale -and $existing -and ($existing -ne $hostAppVersion)) {
+      Warn "仓库契约 app = $existing，本机 app = $hostAppVersion：按本机版本重写契约（旧值不可信或更旧）"
+    }
     $norm = $contractText -replace "`r`n", "`n"
     $now = if (Test-Path -LiteralPath $contractPath) { ([IO.File]::ReadAllText($contractPath) -replace "`r`n", "`n") } else { '' }
     if ($now -ceq $norm) {
@@ -729,6 +842,8 @@ if (-not $hostAppVersion) {
       $changed.Add('profile\host-contract.json') | Out-Null
       Ok "写入 profile\host-contract.json（app = $hostAppVersion）"
     }
+  } else {
+    Warn "仓库契约 app = $existing，本机 app = $hostAppVersion（契约更新，保持不变；对齐后再 capture）"
   }
 }
 
@@ -739,13 +854,35 @@ if (Test-SyncGroupEnabled $Scope 'prompt') {
 foreach ($f in @('AGENTS.md', 'prompt-inject.md')) {
   if (-not (Test-SyncItemEnabled $Scope 'prompt' $f)) { Skip-SyncItem $Scope $RepoRoot 'prompt' $f ("prompt\" + $f); continue }
   $src = Join-Path $DshHome $f
-  if (Test-Path -LiteralPath $src) { CopyTracked $src (Join-Path $RepoRoot "prompt\$f") "prompt\$f" }
+  # 提示文件里常写绝对路径（工作区在哪个盘）：入库前换成占位符，落地时按本机根展开
+  if (Test-Path -LiteralPath $src) { CopyTrackedTokenized $src (Join-Path $RepoRoot "prompt\$f") "prompt\$f" (Get-SyncRoots $DshHome $AppRoot $WorkspaceHome) }
   elseif (Test-Path -LiteralPath (Join-Path $RepoRoot "prompt\$f")) {
     Warn "本机缺少 prompt\$f，仓库里保留的是上一次的副本"
   }
 }
 
 } else { Skip-SyncGroup $Scope $RepoRoot 'prompt' }
+
+# 目录型内容（skills / presets）逐文件过凭据闸门。
+# 旧写法是 Copy-Item -Recurse 整树直拷：`.env`、含 ghp_ 令牌的脚本会原样落进仓库工作区，
+# 只剩提交前那道扫描兜底，而那道兜底本身有「>8MB / 含 NUL 直接放行」的旁路。
+# 这里先挡一次，被挡下的写进日志让用户知道少了什么。
+function Copy-SyncTreeFiltered([string]$SrcDir, [string]$DstDir, [string]$Label) {
+  if (Test-Path -LiteralPath $DstDir) { Remove-Item -LiteralPath $DstDir -Recurse -Force }
+  New-Item -ItemType Directory -Path $DstDir -Force | Out-Null
+  Get-ChildItem -LiteralPath $SrcDir -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    $rel = Get-RelPath $SrcDir $_.FullName
+    if (-not $rel) { return }
+    if (Test-SyncExtraSecret $_.FullName $DshHome) {
+      Warn ($Label + ' 跳过含凭据/私密文件：' + $rel)
+      return
+    }
+    $outFile = Join-Path $DstDir $rel
+    $outParent = Split-Path -Parent $outFile
+    if ($outParent -and -not (Test-Path -LiteralPath $outParent)) { New-Item -ItemType Directory -Path $outParent -Force | Out-Null }
+    Copy-Item -LiteralPath $_.FullName -Destination $outFile -Force
+  }
+}
 
 # 3) Skills（镜像）
 if (Test-SyncGroupEnabled $Scope 'skills') {
@@ -756,8 +893,7 @@ if (Test-Path -LiteralPath $skillsSrc) {
     if (-not (Test-SyncItemEnabled $Scope 'skills' $_.Name)) { Skip-SyncItem $Scope $RepoRoot 'skills' $_.Name ("skills\" + $_.Name); return }
     $dstDir = Join-Path $skillsDst $_.Name
     if (-not (Test-Path -LiteralPath $dstDir)) { $changed.Add("skills\$($_.Name)") | Out-Null }
-    if (Test-Path -LiteralPath $dstDir) { Remove-Item -LiteralPath $dstDir -Recurse -Force }
-    Copy-Item -LiteralPath $_.FullName -Destination $dstDir -Recurse -Force
+    Copy-SyncTreeFiltered $_.FullName $dstDir ('skills\' + $_.Name)
     NormalizeTree $dstDir
   }
   $count = (Get-ChildItem -LiteralPath $skillsSrc -Directory -Force | Measure-Object).Count
@@ -783,8 +919,7 @@ if (Test-Path -LiteralPath $presetSrc) {
   Get-ChildItem -LiteralPath $presetSrc -Directory -Force | ForEach-Object {
     if (-not (Test-SyncItemEnabled $Scope 'presets' $_.Name)) { Skip-SyncItem $Scope $RepoRoot 'presets' $_.Name ("presets\" + $_.Name); return }
     $dstDir = Join-Path $presetDst $_.Name
-    if (Test-Path -LiteralPath $dstDir) { Remove-Item -LiteralPath $dstDir -Recurse -Force }
-    Copy-Item -LiteralPath $_.FullName -Destination $dstDir -Recurse -Force
+    Copy-SyncTreeFiltered $_.FullName $dstDir ('presets\' + $_.Name)
     NormalizeTree $dstDir
   }
   Ok "已抓取 Agent 预设：$((Get-ChildItem -LiteralPath $presetSrc -Directory -Force | Select-Object -ExpandProperty Name) -join ', ')"
@@ -816,22 +951,7 @@ if (Test-SyncGroupEnabled $Scope 'settings') {
   Save-SyncRoots $DshHome $roots | Out-Null
   Ok ('路径根：appRoot=' + $roots.appRoot + '；dshHome=' + $roots.dshHome + '；workspaceHome=' + $roots.workspaceHome + '（已写入 config-sync-roots.json）')
 
-  $settingsMap = @(
-    @{ Repo = 'settings\our-free-model.json';        Src = (Join-Path $DshHome 'our-free-model\settings.json');                          Label = 'our-free-model 插件设置' },
-    @{ Repo = 'settings\comfyui-workflows.json';     Src = (Join-Path $DshHome 'data\dsh-comfyui\workflows.json');                    Label = 'ComfyUI 工作流库' },
-    @{ Repo = 'settings\dsh-pet-main-config.jsonc';  Src = (Join-Path $DshHome 'dsh-pet\main-config.jsonc');                          Label = '桌宠配置' },
-    @{ Repo = 'settings\dsh-market-state.json';      Src = (Join-Path $DshHome ("profiles\" + $ProfileName + '\.dsh-market\state.json')); Label = '插件市场状态' },
-    @{ Repo = 'settings\dsh-pet-memory.json';        Src = (Join-Path $DshHome 'dsh-pet\memory.json');                                Label = '桌宠记忆' },
-    @{ Repo = 'settings\our-free-model-picks.json';  Src = (Join-Path $DshHome 'our-free-model\picks.json');                          Label = 'our-free-model 收藏' },
-    @{ Repo = 'settings\dsh-im-interface-language.json'; Src = (Join-Path $DshHome 'integrations\dsh-im\interface-language.json');   Label = 'dsh-im 界面语言' },
-    @{ Repo = 'settings\dsh-qq-config.json';         Src = (Join-Path $DshHome 'integrations\dsh-qq\config.json');                    Label = 'QQ 集成配置' },
-    @{ Repo = 'settings\dsh-qq-workspaces.json';     Src = (Join-Path $DshHome 'integrations\dsh-qq\workspaces.json');                Label = 'QQ 集成工作区' },
-    @{ Repo = 'settings\redteam-preset-declare.json'; Src = (Join-Path $DshHome 'redteam\preset-declare.json');                        Label = '红队预设声明' },
-    @{ Repo = 'settings\task-board-ledger.json';     Src = (Join-Path $DshHome 'task-board\ledger-v2.json');                          Label = '任务板台账' },
-    @{ Repo = 'settings\task-board-scheduler.json';  Src = (Join-Path $DshHome 'task-board\scheduler-v2.json');                       Label = '任务板调度' },
-    @{ Repo = 'settings\dsh-workspaces.json';        Src = (Join-Path $DshHome 'storages\workspace.json');                            Label = 'DSH 工作区登记' },
-    @{ Repo = 'settings\workspace-archives.json';    Src = (Join-Path $DshHome 'dsh-session-manager\workspace-archives.v1.json');     Label = 'DSH 工作区隐藏状态' }
-  )
+  $settingsMap = Get-SyncSettingsMap $DshHome $ProfileName
   foreach ($m in $settingsMap) {
     if (-not (Test-SyncItemEnabled $Scope 'settings' ($m.Repo -replace '^settings\\', ''))) {
       Skip-SyncItem $Scope $RepoRoot 'settings' $m.Repo $m.Repo
@@ -839,6 +959,10 @@ if (Test-SyncGroupEnabled $Scope 'settings') {
     }
     if (-not (Test-Path -LiteralPath $m.Src)) {
       Warn ("本机没有 " + $m.Label + " 的源文件，跳过：" + $m.Src)
+      continue
+    }
+    if (Test-SyncExtraSecret $m.Src $DshHome) {
+      Warn ("设置文件含令牌或凭据，已跳过不进仓库：" + $m.Repo)
       continue
     }
     $txt = [IO.File]::ReadAllText($m.Src)
@@ -915,7 +1039,29 @@ if ($PackLocalPlugins) {
     $tgzPath = Join-Path $RepoRoot "local-plugins\$dirName.tgz"
     if (Test-Path -LiteralPath $tgzPath) { Remove-Item -LiteralPath $tgzPath -Force }
     if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-    Compress-Archive -LiteralPath $linkPath -DestinationPath $zipPath -CompressionLevel Optimal -Force
+    $stageRoot = Join-Path ([IO.Path]::GetTempPath()) ("dsh-lp-" + [guid]::NewGuid().ToString('N'))
+    $stagePlugin = Join-Path $stageRoot $dirName
+    try {
+      New-Item -ItemType Directory -Path $stagePlugin -Force | Out-Null
+      $skipSegs = @('.git', 'node_modules', 'releases', '.cache')
+      Get-ChildItem -LiteralPath $linkPath -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $rel = Get-RelPath $linkPath $_.FullName
+        if (-not $rel) { return }
+        $segs = @($rel -split '[\\/]' | Where-Object { $_ })
+        if ($segs | Where-Object { $skipSegs -contains $_.ToLowerInvariant() }) { return }
+        if (Test-SyncExtraSecret $_.FullName $DshHome) {
+          Warn ("本地插件 $dirName 跳过含凭据/私密文件：$rel")
+          return
+        }
+        $dst = Join-Path $stagePlugin $rel
+        $dDir = Split-Path -Parent $dst
+        if (-not (Test-Path -LiteralPath $dDir)) { New-Item -ItemType Directory -Path $dDir -Force | Out-Null }
+        Copy-Item -LiteralPath $_.FullName -Destination $dst -Force
+      }
+      Compress-Archive -LiteralPath $stagePlugin -DestinationPath $zipPath -CompressionLevel Optimal -Force
+    } finally {
+      if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
     $changed.Add("local-plugins\$dirName.zip") | Out-Null
     $ver = '?'
     $p = Join-Path $linkPath 'package.json'
@@ -970,7 +1116,7 @@ function CopyTrackedTokens($src, $dst, $label, $roots) {
   if (Test-Path -LiteralPath $dst) {
     if ((Get-RepoText $dst) -ceq $text) { Say ("  =  " + $label + "（无变化）"); return }
   }
-  [IO.File]::WriteAllText($dst, $text, (New-Object Text.UTF8Encoding($hasBom, $false)))
+  Write-FileAtomic $dst $text (New-Object Text.UTF8Encoding($hasBom, $false))
     $changed.Add($label) | Out-Null
   Ok ("更新 " + $label)
 }
@@ -1093,11 +1239,15 @@ if (-not (Test-SyncGroupEnabled $Scope 'extra') -or $ExtraCfg.extra.enabled -eq 
       }
       Ok ('额外路径 ' + $p.id + '：目录，' + $nFiles + ' 个文件')
     } else {
-      $itemDst = Join-Path $exDst ($p.id + (Split-Path -Extension $srcPath))
+      $itemDst = Join-Path $exDst ($p.id + [IO.Path]::GetExtension($srcPath))
       if ((Test-Path -LiteralPath $itemDst) -and (Get-Item -LiteralPath $itemDst -Force).PSIsContainer) { Remove-Item -LiteralPath $itemDst -Recurse -Force }
-      if (Test-SyncExtraSecret $srcPath) {
-        # 你自己加进来的路径：尊重设置照抓，但提醒一句（进仓库就等于进了远端历史）
-        Warn ('额外路径 ' + $p.id + '：文件内容含凭据（accessToken / apiKey / password 等），建议别同步；本次仍按你的设置抓取')
+      if (Test-SyncExtraSecret $srcPath $DshHome) {
+        Warn ('额外路径 ' + $p.id + '：文件为本机私有或含令牌/凭据，已强制跳过不进仓库（若仓库此前存在副本请手动清理）')
+        if (Test-Path -LiteralPath $itemDst) {
+          Remove-Item -LiteralPath $itemDst -Force -ErrorAction SilentlyContinue
+          $changed.Add('extra\' + (Split-Path -Leaf $itemDst) + '（拦截删除）') | Out-Null
+        }
+        continue
       }
       CopyTrackedTokens $srcPath $itemDst ('extra\' + (Split-Path -Leaf $itemDst)) $exRoots
       $nFiles = 1; $nBytes = (Get-Item -LiteralPath $srcPath).Length
@@ -1253,5 +1403,6 @@ function Write-OutsideRootReport {
 }
 
 Write-OutsideRootReport
+Save-SyncDeleteCloudQueue $DshHome
 
 exit 0

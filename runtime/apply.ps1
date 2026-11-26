@@ -1,4 +1,4 @@
-<#
+﻿<#
  DSH 配置同步 —— 应用脚本（把本仓库的配置还原到当前电脑）
 
 用法
@@ -59,6 +59,12 @@ $ErrorActionPreference = 'Stop'
 if (-not $RepoRoot) { $RepoRoot = $PSScriptRoot }
 . (Join-Path $PSScriptRoot 'dsh-sync-common.ps1')
 
+# 并发保护：同一 DSH 目录同时只允许一个同步动作（面板按钮 + 自动 watcher 很容易撞车）
+if (-not (Lock-SyncRun $DshHome '还原')) {
+  Warn "另一个同步动作正在进行（同一个 DSH 目录），本次 还原 没有执行。等它结束后再试一次。"
+  exit 3
+}
+
 if (-not $NoResetNotices) { Reset-SyncNotices $DshHome 'pull' } else { Set-SyncNoticeContext $DshHome 'pull' }
 
 # 客户端可能被卸载重装到别的盘：传进来的 -AppRoot 先校验，对不上就自动定位（注册表 → 常见位置）。
@@ -81,11 +87,21 @@ function Expand-AppRoot([string]$text, [string]$rootFwd) {
   # 宿主解析 YAML 直接 fatal；pnpm-lock.yaml 也会和 package.json 的 specifier 对不上）
   if ($text.Contains($AppRootToken)) { $text = $text.Replace($AppRootToken, $rootFwd) }
   if ($text.Contains($WorkspaceHomeToken)) {
-    $wsFwd = $WorkspaceHome.Replace('\\', '/').TrimEnd('/')
+    # 注意：PS 单引号里 '\\' 是「两个反斜杠」字面量（不是转义），只替换连续双斜杠，
+    # 单个 \ 原样留下 —— 展开进 .json 就成了非法 JSON 转义。统一走 common 的正斜杠转换。
+    $wsFwd = (ConvertTo-FwdPath $WorkspaceHome).TrimEnd('/')
     $text = $text.Replace($WorkspaceHomeToken, $wsFwd)
   }
   # 再兜底老仓库里没迁移过的盘符绝对路径
   return (Convert-AppRootText $text $AppRoot $rootFwd)
+}
+
+# 整表展开：先走 AppRoot 老盘符兜底（历史仓库里可能有裸的盘符路径），再把所有占位符换成本机值。
+# 只用 Expand-AppRoot 会漏掉 {{DSH_HOME}} / {{ROOT:*}} —— 实测 apply 后 cordis.patch.yml 里
+# 还留着 {{ROOT:userHome}}/bin/pwsh7.cmd，工具路径变成字面量占位符，起不来。
+function Expand-AllTokens([string]$text, [string]$rootFwd) {
+  $t = Expand-AppRoot $text $rootFwd
+  return (Expand-TokenText $t (Get-SyncRoots $DshHome $AppRoot $WorkspaceHome))
 }
 
 function Expand-AppRootFile([string]$path, [string]$rootFwd) {
@@ -366,7 +382,7 @@ function Sync-WorkspaceApply {
   $regText = (($newReg | ConvertTo-Json -Depth 12) -replace "`r`n", "`n") + "`n"
   $regParent = Split-Path -Parent $registryDst
   if (-not (Test-Path -LiteralPath $regParent)) { New-Item -ItemType Directory -Path $regParent -Force | Out-Null }
-  [IO.File]::WriteAllText($registryDst, $regText, (New-Object Text.UTF8Encoding($false, $false)))
+    Write-FileAtomic $registryDst $regText (New-Object Text.UTF8Encoding($false, $false))
   Ok ('工作区登记表已' + $(if ($ReplaceWorkspaceRegistry) { '整份覆盖' } else { '按 ID 合并' }) + " → $registryDst（$($plan.Count) 个工作区）")
 
   # 登记了工作区、但仓库里没有它的资料目录时（例如「Gitee同步」这种空工作区），
@@ -631,7 +647,7 @@ function Sync-ConversationApply {
   if ($cwdMap.Count -gt 0 -or $projMap.Count -gt 0) {
     $specPath = Join-Path ([IO.Path]::GetTempPath()) ('dsh-session-cwd-{0}.json' -f $stamp)
     $specJson = [ordered]@{ home = $DshHome; dirs = $cwdMap; projcache = $projMap } | ConvertTo-Json -Depth 4 -Compress
-    [IO.File]::WriteAllText($specPath, $specJson, (New-Object Text.UTF8Encoding($false)))
+      Write-FileAtomic $specPath $specJson (New-Object Text.UTF8Encoding($false))
     $helper = $cwdHelper
     # 结果落文件而不是抓 stdout：执行器可能是客户端自带的 Electron（GUI 子系统，stdout 抓不到）
     $resultPath = Join-Path ([IO.Path]::GetTempPath()) ('dsh-session-cwd-{0}.out.json' -f $stamp)
@@ -729,22 +745,7 @@ if (-not (Test-Path -LiteralPath $ProfileDir)) {
 
 # 需要跨机一致的插件设置 / 工作流：仓库路径 → 本机路径
 # 0.3.30 起扩到各插件自己的配置；文件里存的是占位符，落到本机前统一展开
-$settingsMap = @(
-  @{ Repo = 'settings\our-free-model.json';        Src = (Join-Path $DshHome 'our-free-model\settings.json');                    Label = 'our-free-model 插件设置' },
-  @{ Repo = 'settings\comfyui-workflows.json';     Src = (Join-Path $DshHome 'data\dsh-comfyui\workflows.json');                  Label = 'ComfyUI 工作流库' },
-  @{ Repo = 'settings\dsh-pet-main-config.jsonc';  Src = (Join-Path $DshHome 'dsh-pet\main-config.jsonc');                        Label = '桌宠配置' },
-  @{ Repo = 'settings\dsh-market-state.json';      Src = (Join-Path $ProfileDir '.dsh-market\state.json');                       Label = '插件市场状态' },
-  @{ Repo = 'settings\dsh-pet-memory.json';        Src = (Join-Path $DshHome 'dsh-pet\memory.json');                              Label = '桌宠记忆' },
-  @{ Repo = 'settings\our-free-model-picks.json';  Src = (Join-Path $DshHome 'our-free-model\picks.json');                        Label = 'our-free-model 收藏' },
-  @{ Repo = 'settings\dsh-im-interface-language.json'; Src = (Join-Path $DshHome 'integrations\dsh-im\interface-language.json'); Label = 'dsh-im 界面语言' },
-  @{ Repo = 'settings\dsh-qq-config.json';         Src = (Join-Path $DshHome 'integrations\dsh-qq\config.json');                  Label = 'QQ 集成配置' },
-  @{ Repo = 'settings\dsh-qq-workspaces.json';     Src = (Join-Path $DshHome 'integrations\dsh-qq\workspaces.json');              Label = 'QQ 集成工作区' },
-  @{ Repo = 'settings\redteam-preset-declare.json'; Src = (Join-Path $DshHome 'redteam\preset-declare.json');                      Label = '红队预设声明' },
-  @{ Repo = 'settings\task-board-ledger.json';     Src = (Join-Path $DshHome 'task-board\ledger-v2.json');                        Label = '任务板台账' },
-  @{ Repo = 'settings\task-board-scheduler.json';  Src = (Join-Path $DshHome 'task-board\scheduler-v2.json');                     Label = '任务板调度' },
-  @{ Repo = 'settings\dsh-workspaces.json';        Src = (Join-Path $DshHome 'storages\workspace.json');                          Label = 'DSH 工作区登记' },
-  @{ Repo = 'settings\workspace-archives.json';    Src = (Join-Path $DshHome 'dsh-session-manager\workspace-archives.v1.json');   Label = 'DSH 工作区隐藏状态' }
-)
+$settingsMap = Get-SyncSettingsMap $DshHome $ProfileName
 
 # ---------- 0.5 宿主版本契约（一切动作之前先校验） ----------
 # 为什么要在最前面校验：
@@ -757,12 +758,28 @@ $settingsMap = @(
 $contractPath = Join-Path $RepoRoot 'profile\host-contract.json'
 $hostAppVersion = Get-HostAppVersion $AppRoot
 $contractVersion = $null
+# 三种「没有可用契约」的原因要分开说，否则面板/日志会把「老格式」误报成「仓库缺文件」——
+# 同一句措辞描述两种情形，用户会以为仓库坏了。
+$contractState = 'missing'   # missing | legacy | ok
 if (Test-Path -LiteralPath $contractPath) {
-  try { $contractVersion = [string](Get-Content -LiteralPath $contractPath -Raw -Encoding utf8 | ConvertFrom-Json).appVersion } catch { $contractVersion = $null }
+  try {
+    $contractDoc = Get-Content -LiteralPath $contractPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $cNames = @($contractDoc.PSObject.Properties.Name)
+    # 老格式契约（上游手写：只有 appVersion/generatedAt/note，appVersion 常被填成 Electron 版本）
+    # 不能拿来判「两端是否同版本」，否则一次工具链错位就永久拦住所有拉取。
+    if (($cNames -contains 'electronVersion') -or ($cNames -contains 'platforms')) {
+      $contractVersion = [string]$contractDoc.appVersion
+      $contractState = if ($contractVersion) { 'ok' } else { 'missing' }
+    } else {
+      $contractState = 'legacy'
+    }
+  } catch { $contractState = 'legacy' }
 }
 $versionDrift = $false
 if (-not $hostAppVersion) {
   Warn "读不到客户端 app 版本（$AppRoot\resources\app\package.json 与 resources\app.asar 都没读到）——无法做版本校验"
+} elseif ($contractState -eq 'legacy') {
+  Warn "仓库契约是老格式（缺 electronVersion / platforms），忽略它做版本校验；下次推送会按新格式重写"
 } elseif (-not $contractVersion) {
   Warn "仓库缺少 profile\host-contract.json（或里面没有 appVersion）——跳过版本校验"
 } elseif ($hostAppVersion -ne $contractVersion) {
@@ -842,17 +859,19 @@ foreach ($f in @('cordis.yml', 'cordis.patch.yml', 'pnpm-workspace.yaml', 'pnpm-
   if (-not (Test-Path -LiteralPath $src)) { Warn "仓库里没有 profile\$f，跳过"; continue }
   # 必须读→替换→写。直接 Copy-Item 会把仓库里的 {{APP_ROOT}} 或别的机器的盘符原样带过来，
   # 进而让 pnpm-lock.yaml 与 package.json 对不上，--frozen-lockfile 必挂。
-  $raw = Expand-AppRoot (Read-TextPreserveBom $src) $appRootFwd
+  $raw = Expand-AllTokens (Read-TextPreserveBom $src) $appRootFwd
   # 写完就地核对：占位符没展开会让 cordis.patch.yml 变成非法 YAML（宿主启动直接 fatal），
   # 也会让 pnpm-lock.yaml 的 specifier 与 package.json 对不上。宁可在这里停，也不要把坏文件铺下去。
-  if ($raw.Contains($AppRootToken) -or $raw.Contains($WorkspaceHomeToken)) {
-    Die "展开占位符失败：$f 里仍有 {{APP_ROOT}}/{{WORKSPACE_HOME}}（-AppRoot=$AppRoot）"
+  # 任何占位符残留都算失败：只检查 APP_ROOT/WORKSPACE_HOME 会放过 {{DSH_HOME}} / {{ROOT:*}}，
+  # 那两个漏进本机后，工具路径就是字面量占位符（实测 cordis.patch.yml 的 pwsh7.cmd 这条）。
+  if ($raw -match '\{\{[A-Za-z_]+(:[A-Za-z0-9_.\-]+)?\}\}') {
+    Die "展开占位符失败：$f 里仍有未展开的占位符（-AppRoot=$AppRoot）"
   }
   Write-TextPreserveBom (Join-Path $ProfileDir $f) $raw
 }
 Ok "已写入 cordis.yml / cordis.patch.yml / pnpm-workspace.yaml / pnpm-lock.yaml（路径指向 $appRootFwd）"
 
-$pkgRaw = Expand-AppRoot (Read-TextPreserveBom (Join-Path $RepoRoot 'profile\package.json')) $appRootFwd
+$pkgRaw = Expand-AllTokens (Read-TextPreserveBom (Join-Path $RepoRoot 'profile\package.json')) $appRootFwd
 
 
 # 实验性 bundle 门控：@deepseek-ai/dsh-experimental-* 由宿主自带、按 app 版本强绑定，不满足就不写进本机
@@ -927,6 +946,9 @@ foreach ($dirName in $localPluginMap.Keys) {
   $pattern = 'link:[^"]*' + [regex]::Escape($dirName)
   $pkgRaw = [regex]::Replace($pkgRaw, $pattern, ('link:' + $appRootFwd + '/' + $dirName), 'IgnoreCase')
 }
+  # 仓库里的 link 可能带占位符（capture 会把 userHome 下的本地插件写成 {{ROOT:userHome}}/…）：
+  # 写回前必须展开，否则本机 pnpm install 会去装一个字面量 {{ROOT:userHome}} 的路径。
+  $pkgRaw = Expand-TokenText $pkgRaw (Get-SyncRoots $DshHome $AppRoot $WorkspaceHome)
 Write-TextPreserveBom (Join-Path $ProfileDir 'package.json') $pkgRaw
 Ok "已写入 package.json（link 路径指向 $appRootFwd）"
 } else { Warn '跳过（未勾选同步）：profile 配置（package.json / lock / cordis 保持本机现状）' }
@@ -936,7 +958,19 @@ if (Test-SyncGroupEnabled $Scope 'prompt') {
 foreach ($f in @('AGENTS.md', 'prompt-inject.md')) {
   if (-not (Test-SyncItemEnabled $Scope 'prompt' $f)) { continue }
   $src = Join-Path $RepoRoot "prompt\$f"
-  if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $DshHome $f) -Force; Ok "已写入 $f" }
+  if (Test-Path -LiteralPath $src) {
+    $rawPrompt = [IO.File]::ReadAllText($src)
+    $promptRoots = Get-SyncRoots $DshHome $AppRoot $WorkspaceHome
+    $expandedPrompt = Expand-TokenText $rawPrompt $promptRoots
+    $missingPrompt = @(Get-MissingTokens $expandedPrompt)
+    if ($missingPrompt.Count -gt 0) {
+      # 本机还没确认那个根：写进去就是 {{WORKSPACE_HOME}} 字面量，宁可保留本机现状
+      Warn ("跳过 $f：需要先确认路径 " + ($missingPrompt -join '、') + "（在面板「本机路径」卡里填好再拉取）")
+    } else {
+      Write-TextPreserveBom (Join-Path $DshHome $f) $expandedPrompt
+      Ok "已写入 $f"
+    }
+  }
 }
 } else { Warn '跳过（未勾选同步）：全局提示（AGENTS.md / prompt-inject.md）' }
 
@@ -1055,7 +1089,7 @@ foreach ($m in $settingsMap) {
   }
   $dir = Split-Path -Parent $m.Src
   if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-  [IO.File]::WriteAllText($m.Src, $expanded, (New-Object Text.UTF8Encoding($false)))
+  Write-FileAtomic $m.Src $expanded (New-Object Text.UTF8Encoding($false))
 }
 Ok "已还原插件设置 / 工作流 / 各插件配置"
 } else { Warn '跳过（未勾选同步）：插件设置 / 工作流 / 各插件配置' }
@@ -1219,7 +1253,7 @@ if (-not (Test-SyncGroupEnabled $Scope 'extra')) {
         Ok ('已还原额外路径 ' + $it.id + '：' + $n + ' 个文件 → ' + $dst)
       } else {
         $leaf = Split-Path -Leaf ([string]$it.src)
-        $itemSrc = Join-Path $exSrc ($it.id + (Split-Path -Extension $dst))
+        $itemSrc = Join-Path $exSrc ($it.id + [IO.Path]::GetExtension($dst))
         if (-not (Test-Path -LiteralPath $itemSrc)) {
           $itemSrc = Join-Path $exSrc $it.id
           if (-not (Test-Path -LiteralPath $itemSrc)) { continue }
@@ -1234,7 +1268,7 @@ if (-not (Test-SyncGroupEnabled $Scope 'extra')) {
         }
         Copy-Item -LiteralPath $itemSrc -Destination $dst -Force
         # 只展开这一个文件（整目录展开会改到用户同目录下的其他文件）
-        if ((Split-Path -Extension $dst).ToLower() -notin @('.tgz', '.zip', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.exe', '.dll', '.wasm', '.pdf')) {
+        if ([IO.Path]::GetExtension($dst).ToLower() -notin @('.tgz', '.zip', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.exe', '.dll', '.wasm', '.pdf')) {
           $raw = Read-TextPreserveBom $dst
           if ($raw -match '\{\{(APP_ROOT|DSH_HOME|WORKSPACE_HOME|ROOT:[A-Za-z0-9_.\-]+)\}\}') { Write-TextPreserveBom $dst (Expand-TokenText $raw $pdRoots) }
         }
@@ -1326,8 +1360,10 @@ foreach ($dirName in $localPluginMap.Keys) {
     } elseif (Test-Path -LiteralPath $arch) {
       # 读不到版本（老归档、结构异常）时退回 mtime，但要求比已部署目录新 10 秒以上，避免每轮误判
       $archTime = (Get-Item -LiteralPath $arch).LastWriteTime
-      $depTime = (Get-ChildItem -LiteralPath $target -Recurse -File -Force | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
-      $hasNewVersion = $archTime -gt $depTime.AddSeconds(10)
+      $depTime = (Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+      # 已部署目录是空壳（上一轮解压失败 / 被手工清空）时 $depTime 为 $null，
+      # $null.AddSeconds() 会抛「不能对 null 值表达式调用方法」并终止整次 apply。
+      if (-not $depTime) { $hasNewVersion = $true } else { $hasNewVersion = $archTime -gt $depTime.AddSeconds(10) }
     }
     if ($hasNewVersion) {
       Warn "本地插件有新版本，将重新部署：$target（$depVer → $archVer，旧目录先改名备份）"
@@ -1551,7 +1587,17 @@ if ($missing.Count -eq 0) {
 
 # bundle 可解析性检查：清单里写了、本机却没有 → 启动期 entry loading 必挂（整个应用起不来，不是功能不可用）
 # 解析顺序与 DSH 一致：先 profile\node_modules（pnpm 装的），再 <AppRoot>\resources\app\dsh\node_modules（宿主自带）
-$bundles = @((Get-Content -LiteralPath (Join-Path $ProfileDir 'package.json') -Raw -Encoding utf8 | ConvertFrom-Json).dsh.profile.bundles)
+# @($null).Count 在 PowerShell 里是 1（不是 0）：缺 dsh.profile.bundles 时旧写法会迭代一次 $null，
+# 报「以下 1 个 bundle 找不到」后面却是空的，然后 Die 挡住整个流程。先过滤掉空值再判。
+$pkgObj = $null
+try { $pkgObj = Get-Content -LiteralPath (Join-Path $ProfileDir 'package.json') -Raw -Encoding utf8 | ConvertFrom-Json } catch { $pkgObj = $null }
+$bundles = @()
+if ($pkgObj -and $pkgObj.dsh -and $pkgObj.dsh.profile -and $pkgObj.dsh.profile.bundles) {
+  $bundles = @($pkgObj.dsh.profile.bundles | Where-Object { $_ -and ([string]$_).Trim() })
+}
+if ($bundles.Count -eq 0) {
+  Warn 'profile\package.json 里没有 dsh.profile.bundles（新 profile 或已被裁剪），跳过 bundle 可解析性检查'
+}
 $unresolved = @()
 foreach ($b in $bundles) {
   $rel = ($b -replace '/', '\')
@@ -1577,7 +1623,7 @@ if ($unresolved.Count -eq 0) {
 Ok "Skill 目录：$((Get-ChildItem -LiteralPath $skillsDst -Directory -Force -ErrorAction SilentlyContinue | Measure-Object).Count) 个"
 Say ""
 Say "下一步：完全启动 DSH（不是重启窗口，要确认进程全部退出后再开）。"
-if ($hostAppVersion) { Say "版本：本机 app = $hostAppVersion（仓库契约 $contractVersion）" }
+if ($hostAppVersion) { Say ("版本：本机 app = {0}（仓库契约 {1}）" -f $hostAppVersion, $(if ($contractVersion) { $contractVersion } else { if ($contractState -eq 'legacy') { '老格式，已忽略' } else { '无' } })) }
 Say "验证：插件页看 20 项是否齐全、按要求检查 cordis.patch.yml 里的开关是否生效、Skill 列表能列出。"
 Say "如需回滚：把 $BackupDir 里的文件拷回原位置（工作区资料在 workspace\ 子目录、登记表备份为 workspace-registry-before.json）。"
 

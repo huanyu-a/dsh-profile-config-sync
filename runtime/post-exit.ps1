@@ -1,4 +1,4 @@
-<#
+﻿<#
 退出后执行同步：等 DSH 完全退出，再跑 pull 或 push（插件在 DSH 进程里，自己等不了自己退出）
 
 由插件在 DSH 运行期用 detached 方式拉起：
@@ -30,6 +30,9 @@ param(
   [string]$LogFile,
   # 仅 Phase=wait 用：由外部启动器（如 ShellExecute 脱离 Job Object）回读本进程真实 PID
   [string]$PidFile = '',
+  # 强杀残留客户端只在「插件自己请求过关闭」时允许（见 index.js closeRequested）；
+  # 被动等待不该偷偷杀掉用户收进托盘的客户端。
+  [switch]$CloseWhenIdle,
   # ---- 仅 -Mode restore 用：还原到哪份快照 ----
   [string]$BackupDir = '',
   # 备份类型：profile（配置快照，默认）/ plugin（插件本体备份）/ session（会话目录备份）
@@ -41,7 +44,9 @@ param(
   [string]$UpdateTgz = '',
   [string]$UpdateSha256 = '',
   # 仓库是私有库时必须带的只读令牌（Gitee 私人令牌）；留空就按匿名方式下载
-  [string]$UpdateToken = ''
+  [string]$UpdateToken = '',
+  # 结果展示窗口的停留秒数（默认 360 = 6 分钟）。自动化验收传小值，避免每套夹具干等 6 分钟。
+  [int]$HoldSeconds = 360
 )
 
 # ---------- Phase=wait：只等退出，然后换成可见窗口执行 ----------
@@ -57,6 +62,7 @@ if ($Phase -eq 'wait') {
   }
   $deadline = (Get-Date).AddMinutes($MaxWaitMinutes)
   $noWindowTicks = 0
+  $toldNoWindow = $false
   $waitLog = Join-Path $DshHome 'logs\auto-sync-wait.log'
   function WaitLog([string]$text) {
     try {
@@ -81,12 +87,18 @@ if ($Phase -eq 'wait') {
     $newest = $byName | Sort-Object StartTime -Descending | Select-Object -First 1
     $ageSec = if ($newest -and $newest.StartTime) { ((Get-Date) - $newest.StartTime).TotalSeconds } else { 0 }
     if ($visible.Count -eq 0 -and $ageSec -gt 60) { $noWindowTicks++ } else { $noWindowTicks = 0 }
-    if ($noWindowTicks -ge 8) {
+    if ($noWindowTicks -ge 8 -and $CloseWhenIdle) {
       WaitLog '前台窗口已关闭且进程不退，强制结束残留进程'
       try { Stop-Process -Name 'DeepSeek Harness' -Force -ErrorAction SilentlyContinue } catch { }
       Start-Sleep -Seconds 3
       if (@(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue).Count -eq 0) { WaitLog '已全部结束'; break }
       $noWindowTicks = 0
+    }
+    # 没拿到强杀授权时，把「窗口没了但进程还在」说清楚，让用户知道为什么没同步、
+    # 而不是看到一条「等待超时」却不知道是谁在等。
+    if ($noWindowTicks -ge 8 -and -not $CloseWhenIdle -and -not $toldNoWindow) {
+      $toldNoWindow = $true
+      WaitLog '客户端没有任何可见窗口但进程仍在运行；未收到强杀授权，继续等待（收进托盘不会自动同步）'
     }
     if ((Get-Date) -gt $deadline) { WaitLog '等待超时，放弃本次同步'; exit 2 }
     Start-Sleep -Seconds 2
@@ -122,7 +134,7 @@ $ErrorActionPreference = 'Continue'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 # 窗口是可见的：给它一个能看懂的标题，并把控制台编码设成 UTF-8（否则中文进度全是乱码）
-try { $Host.UI.RawUI.WindowTitle = ('DSH 配置同步 · ' + $(if ($Mode -eq 'update') { '插件更新' } elseif ($Mode -eq 'relaunch') { '重启' } elseif ($Mode -eq 'restore') { '还原' } elseif ($Mode -eq 'pull') { '拉取' } else { '推送' })) } catch { }
+try { $Host.UI.RawUI.WindowTitle = ('DSH 配置备份与同步 · ' + $(if ($Mode -eq 'update') { '插件更新' } elseif ($Mode -eq 'relaunch') { '重启' } elseif ($Mode -eq 'restore') { '还原' } elseif ($Mode -eq 'pull') { '拉取' } else { '推送' })) } catch { }
 try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false; $OutputEncoding = [Console]::OutputEncoding } catch { }
 
 if (-not $LogFile) {
@@ -137,13 +149,112 @@ function Log([string]$text) {
   try { Write-Host $line } catch { }
 }
 
+# ---------- 环境自愈：模块被别的 PowerShell 版本抢走时，这一步决定后面还能不能跑 ----------
+# 实测：DSH 从 pwsh（PowerShell 7）里启动时，子进程 powershell.exe 5.1 继承了 PS7 的 PSModulePath，
+# 自动加载先撞上 PS7 的 Microsoft.PowerShell.Utility（7.0.0.0，5.1 装不进去），于是
+# Get-FileHash / Invoke-WebRequest 直接「无法识别」——更新流程把空 hash 当校验失败，永远装不上。
+try {
+  if ($PSVersionTable -and $PSVersionTable.PSEdition -ne 'Core') {
+    $selfModules = Join-Path $PSHOME 'Modules'
+    if ($selfModules -and (Test-Path -LiteralPath $selfModules)) {
+      $cur = [string]$env:PSModulePath
+      $rest = @($cur -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ne $selfModules.TrimEnd('\')) })
+      $env:PSModulePath = (@($selfModules) + $rest) -join ';'
+    }
+  }
+} catch { }
+
+# Get-FileHash 的 .NET 等价实现：模块加载失败时也别让一个 cmdlet 决定整条链路生死
+if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+  function Get-FileHash {
+    param(
+      [Parameter(Mandatory = $true)][string]$LiteralPath,
+      [ValidateSet('SHA256', 'SHA1', 'MD5')][string]$Algorithm = 'SHA256'
+    )
+    $algo = [System.Security.Cryptography.HashAlgorithm]::Create($Algorithm)
+    $fs = [System.IO.File]::Open($LiteralPath, 'Open', 'Read', 'ReadWrite')
+    try { $bytes = $algo.ComputeHash($fs) } finally { $fs.Dispose(); $algo.Dispose() }
+    [pscustomobject]@{
+      Algorithm = $Algorithm
+      Hash      = (($bytes | ForEach-Object { $_.ToString('X2') }) -join '')
+      Path      = $LiteralPath
+    }
+  }
+}
+
+# 下载兜底：Invoke-WebRequest 不可用（或被策略挡掉）时直接用 .NET，带上同样的头与超时
+function Save-UrlToFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$Uri,
+    [Parameter(Mandatory = $true)][string]$OutFile,
+    [hashtable]$Headers = @{},
+    [int]$TimeoutSec = 180
+  )
+  # 这个兜底实现（HttpWebRequest）在 5.1 里会把 Authorization 头吃掉（实测：头存进对象但发不出去），
+  # 所以带令牌的下载宁可直接报错并给出办法，也不让用户对着一个没头没脑的 401 猜。
+  foreach ($hk in @($Headers.Keys)) {
+    if ([string]$hk -ieq 'Authorization') {
+      throw '当前 PowerShell 环境不支持带令牌下载（模块被别的 PowerShell 版本占用了）：请在面板里用「更新」，或从开始菜单/桌面重新启动 DSH 后重试'
+    }
+  }
+  $req = [System.Net.HttpWebRequest]::Create($Uri)
+  $req.Timeout = $TimeoutSec * 1000
+  $req.ReadWriteTimeout = $TimeoutSec * 1000
+  $req.UserAgent = 'dsh-profile-config-sync'
+  foreach ($k in @($Headers.Keys)) {
+    $v = [string]$Headers[$k]
+    if ($k -eq 'User-Agent') { $req.UserAgent = $v } else { $req.Headers[$k] = $v }
+  }
+  $resp = $req.GetResponse()
+  try {
+    $in = $resp.GetResponseStream()
+    $out = [System.IO.File]::Create($OutFile)
+    try { $in.CopyTo($out) } finally { $out.Dispose() }
+  } finally { $resp.Close() }
+}
+
+# 统一下载入口：优先 cmdlet，缺失时自动走 Save-UrlToFile
+function Invoke-DownloadFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$Uri,
+    [Parameter(Mandatory = $true)][string]$OutFile,
+    [hashtable]$Headers = @{},
+    [int]$TimeoutSec = 180
+  )
+  Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+  # 注意：Get-Command 只表示「命令能被发现」，不代表能执行 —— PS7 的模块目录排在 PSModulePath 前面时，
+  # Invoke-WebRequest 会被解析到装不进 5.1 的版本，调用当场抛装配错误（实测）。所以必须 try/catch 兜底，
+  # 而不是只看命令在不在。
+  if (Get-Command Invoke-WebRequest -ErrorAction SilentlyContinue) {
+    try {
+      Invoke-WebRequest -Uri $Uri -Headers $Headers -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec
+      return
+    } catch {
+      Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+    }
+  }
+  Save-UrlToFile -Uri $Uri -OutFile $OutFile -Headers $Headers -TimeoutSec $TimeoutSec
+}
+# 本脚本刻意不 dot-source common（它要在客户端退出后独立运行）。
+# 但 workspace.json / state / lock 这些文件别的进程会同时读，裸写会留半截内容，
+# 所以这里带一份最小的原子写：临时文件 + Move-Item -Force（同卷 rename 原子），失败短重试。
+function Write-TextAtomic([string]$path, [string]$text) {
+  $dir = Split-Path -Parent $path
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  $tmp = $path + ".tmp-" + $PID
+  [IO.File]::WriteAllText($tmp, $text, (New-Object Text.UTF8Encoding($false)))
+  for ($i = 0; $i -lt 20; $i++) {
+    try { Move-Item -LiteralPath $tmp -Destination $path -Force -ErrorAction Stop; return $true }
+    catch { Start-Sleep -Milliseconds (10 * ($i + 1)) }
+  }
+  try { [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding($false))); return $false }
+  finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+}
 $ResultFile = Join-Path $DshHome 'auto-sync-result.json'
 # 接管互斥锁：等待阶段记的是那个等候进程的 pid，这里换成真正干活的进程；
 # 别的同步动作看到这把锁（且 pid 活着）就会排队等待/放弃，不会两个一起改配置。
 try {
-  [IO.File]::WriteAllText((Join-Path $DshHome 'auto-sync.lock'),
-    ([ordered]@{ pid = $PID; mode = $Mode; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json),
-    (New-Object Text.UTF8Encoding $false))
+  $null = Write-TextAtomic (Join-Path $DshHome 'auto-sync.lock') ([ordered]@{ pid = $PID; mode = $Mode; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json)
 } catch { }
 # 结果文件给客户端下次启动读：ok/mode/at/code/message/restored/log (+ notices)
 function Write-Result([bool]$ok, [int]$code, [string]$message, [bool]$restored) {
@@ -173,7 +284,7 @@ function Write-Result([bool]$ok, [int]$code, [string]$message, [bool]$restored) 
     $dir = Split-Path -Parent $ResultFile
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $json = $obj | ConvertTo-Json -Depth 6
-    [IO.File]::WriteAllText($ResultFile, $json, (New-Object Text.UTF8Encoding $false))
+    $null = Write-TextAtomic $ResultFile $json
     Log ("结果已写入：{0}" -f $ResultFile)
   } catch { Log ("写结果文件失败：{0}" -f $_.Exception.Message) }
 }
@@ -262,11 +373,11 @@ function Finish([int]$code, [string]$note) {
       if ($code -ne 0) { Show-FailureSummary }
       Write-Host ''
       Write-Host ("================ {0} ================" -f $title)
-      Write-Host '  窗口将在 6 分钟后自动关闭；也可直接点右上角 × 关闭（客户端在后台运行，不受影响）。'
+      Write-Host ("  窗口将在 {0}后自动关闭；也可直接点右上角 × 关闭（客户端在后台运行，不受影响）。" -f $(if ($HoldSeconds -ge 60) { ('{0} 分钟' -f [Math]::Round($HoldSeconds / 60, 1)) } else { ('{0} 秒' -f $HoldSeconds) }))
       if ($code -ne 0) { Write-Host '  失败原因已集中在上面「失败原因集中展示」一段，不必再翻日志。' -ForegroundColor Red }
       Write-Host '==========================================='
     } catch { }
-    try { Start-Sleep -Seconds 360 } catch { }
+    try { if ($HoldSeconds -gt 0) { Start-Sleep -Seconds $HoldSeconds } } catch { }
   } else {
     try { Start-Sleep -Seconds 3 } catch { }
   }
@@ -403,7 +514,7 @@ function Set-DefaultWorkspace {
     Copy-Item -LiteralPath $reg -Destination ($reg + '.bak-' + $stamp) -Force
     $obj.global.defaultWorkspaceId = $target
     $text = (($obj | ConvertTo-Json -Depth 12) -replace "`r`n", "`n") + "`n"
-    [IO.File]::WriteAllText($reg, $text, (New-Object Text.UTF8Encoding($false)))
+    $null = Write-TextAtomic $reg $text
 
     # 回读校验：值改对了、工作区条数没变，才算成功；否则静默保持原样会让「新会话落在哪」继续不对。
     $back = Get-Content -LiteralPath $reg -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -463,7 +574,18 @@ function RestartClient([switch]$SkipWatermark) {
       Log '启动后进程又退了（旧实例的锁可能还没释放），等 8 秒重试'
       Start-Sleep -Seconds 8
     }
-    if (-not $ok) { Finish 4 '重启失败（试了 3 次都没起来）' }
+    if (-not $ok) {
+      # 调用方在上面已经把结果文件写成「成功 + 已重启」。同步/安装本身确实做完了，但客户端没起来，
+      # 不改写就是假绿：用户看到「已拉取、已重启」，面前却一个进程都没有。这里按模式覆写成失败。
+      $restartFailText = switch ($Mode) {
+        'update' { '插件已更新，但客户端没能自动重启（连续 3 次没起来）；详见日志' }
+        'restore' { '配置已还原，但客户端没能自动重启（连续 3 次没起来）；详见日志' }
+        'relaunch' { '客户端没能自动重启（连续 3 次没起来）；详见日志' }
+        default { '同步已完成，但客户端没能自动重启（连续 3 次没起来）；详见日志' }
+      }
+      try { Write-Result $false 4 $restartFailText $SkipWatermark } catch { }
+      Finish 4 '重启失败（试了 3 次都没起来）'
+    }
 
     # 重启成功后再刷一次"上次同步时间"。apply/capture 刚写过的文件 mtime 落在这之前，
     # 客户端起来 8 秒的首检会把它们当成"本机有未推送的新内容"，立刻排一个空推送
@@ -484,7 +606,7 @@ function RestartClient([switch]$SkipWatermark) {
             head       = $old.head
           }
         }
-        [IO.File]::WriteAllText($stateFile, ($state | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
+        $null = Write-TextAtomic $stateFile ($state | ConvertTo-Json -Depth 4)
         Log '已刷新同步分水岭（重启后的首检不会误报待推送）'
       } catch { Log ("刷新同步分水岭失败：{0}" -f $_.Exception.Message) }
     } else {
@@ -501,9 +623,16 @@ function RestartClient([switch]$SkipWatermark) {
 # 不需要装东西的纯重启。做的事只有一件：等退出 → 用 explorer 代启拉回来。
 if ($Mode -eq 'relaunch') {
   Log '只重启客户端（新版本插件在重启后生效）'
-  Write-Result $true 0 '已重启客户端' $false
-  if ($Restart) { RestartClient }
-  Finish 0 '完成（已重启）'
+  if ($Restart) {
+    # 先重启再写结果：重启失败时 RestartClient 会把结果覆写成失败，不会被这里的「已重启」盖掉。
+    RestartClient
+    Write-Result $true 0 '已重启客户端' $false
+    Finish 0 '完成（已重启）'
+  } else {
+    # 旧写法不管有没有真重启都写「已重启客户端」——面板于是显示成功，实际什么都没发生。
+    Write-Result $true 0 '本次只做了退出，-Restart 未指定，客户端没有自动重启' $false
+    Finish 0 '完成（未重启：本次没有要求重启）'
+  }
 }
 
 # ---------- 仅更新模式：下载插件包 → 校验 sha256 → 备份旧版 → 覆盖安装 → 重启 ----------
@@ -511,8 +640,16 @@ if ($Mode -eq 'relaunch') {
 # 所以不能走 sync.ps1，也不能先 apply（那会把旧插件部署回去）。
 # 覆盖发生在 DSH 已经退出之后 —— 这样运行中的面板不会被卸载，用户也就不会被弹回默认页。
 if ($Mode -eq 'update') {
-  if (-not $PluginDir -or -not (Test-Path -LiteralPath $PluginDir)) { Finish 6 ('找不到插件目录：' + $PluginDir) }
-  if (-not $UpdateTgz) { Finish 6 '更新清单里没有 tgz 下载地址' }
+  if (-not $PluginDir -or -not (Test-Path -LiteralPath $PluginDir)) {
+    $msg = '插件更新失败：找不到插件目录（' + $PluginDir + '）'
+    Write-Result $false 6 $msg $false
+    Finish 6 $msg
+  }
+  if (-not $UpdateTgz) {
+    $msg = '插件更新失败：更新清单里没有安装包（tgz）地址'
+    Write-Result $false 6 $msg $false
+    Finish 6 $msg
+  }
 
   $currentVersion = ''
   try { $currentVersion = (Get-Content -LiteralPath (Join-Path $PluginDir 'package.json') -Raw -Encoding utf8 | ConvertFrom-Json).version } catch { }
@@ -529,21 +666,27 @@ if ($Mode -eq 'update') {
     Log ("使用已下载的安装包：{0}（{1:N0} 字节）" -f $UpdateTgz, (Get-Item -LiteralPath $UpdateTgz).Length)
     try { Copy-Item -LiteralPath $UpdateTgz -Destination $tmp -Force } catch { $tmp = $UpdateTgz }
   } else {
-    # 私有仓库：把 raw 链接换成 Gitee API 的 raw 端点并带 access_token（匿名 raw 会 403）
+    # 私有仓库：Gitee 走 API raw + access_token；GitHub 直连域走 Bearer 头（绝不传给第三方反代）
     $fetchUrl = $UpdateTgz
+    $fetchHeaders = @{}
     if ($UpdateToken) {
-      # raw 链接 → API raw 端点；分支不能留在路径里，要改成 ref 参数
       $m = [regex]::Match($UpdateTgz, '^https://gitee\.com/([^/]+)/([^/]+)/raw/([^/]+)/(.+)$')
       if ($m.Success) {
         $fetchUrl = ("https://gitee.com/api/v5/repos/{0}/{1}/raw/{2}?ref={3}" -f $m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[4].Value, $m.Groups[3].Value)
+        $sep = if ($fetchUrl.Contains('?')) { '&' } else { '?' }
+        $fetchUrl = "$fetchUrl${sep}access_token=$([uri]::EscapeDataString($UpdateToken))"
+      } elseif ($UpdateTgz -match '^https://(?:raw\.githubusercontent\.com|github\.com|api\.github\.com)/') {
+        $fetchHeaders['Authorization'] = "Bearer $UpdateToken"
+        $fetchHeaders['User-Agent'] = 'dsh-profile-config-sync'
+      } elseif ($UpdateTgz -match '^https://(?:[^/]+\.)?gitee\.com/') {
+        $sep = if ($fetchUrl.Contains('?')) { '&' } else { '?' }
+        $fetchUrl = "$fetchUrl${sep}access_token=$([uri]::EscapeDataString($UpdateToken))"
       }
-      $sep = if ($fetchUrl.Contains('?')) { '&' } else { '?' }
-      $fetchUrl = "$fetchUrl${sep}access_token=$([uri]::EscapeDataString($UpdateToken))"
     }
     Log ("下载安装包：{0}{1}" -f $UpdateTgz, $(if ($UpdateToken) { '（私有仓库，带令牌）' } else { '' }))
     $downloadError = $null
     try {
-      Invoke-WebRequest -Uri $fetchUrl -OutFile $tmp -UseBasicParsing -TimeoutSec 180
+      Invoke-DownloadFile -Uri $fetchUrl -OutFile $tmp -Headers $fetchHeaders -TimeoutSec 180
     } catch {
       $downloadError = $_.Exception.Message
     }
@@ -557,8 +700,17 @@ if ($Mode -eq 'update') {
   }
 
   if ($UpdateSha256) {
-    $hash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLower()
-    Log ("sha256：{0}" -f $hash)
+    $hash = ''
+    try { $hash = [string]((Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash) } catch { $hash = '' }
+    $hash = $hash.Trim().ToLower()
+    Log ("sha256：{0}" -f $(if ($hash) { $hash } else { '（算不出来）' }))
+    if (-not $hash) {
+      # 之前这里会把「本机算不出 hash」写成「包可能被改动」，让人去怀疑网络/文件。
+      $msg = '插件更新失败：本机 PowerShell 无法计算安装包 sha256（Get-FileHash 不可用且 .NET 回退也失败）'
+      Log $msg
+      Write-Result $false 7 $msg $false
+      Finish 7 '更新失败：无法校验安装包'
+    }
     if ($hash -ne $UpdateSha256.ToLower()) {
       Write-Result $false 7 '插件更新失败：安装包 sha256 校验不通过（可能没下载全或被改动）' $false
       Finish 7 '更新失败：sha256 不符'
@@ -762,7 +914,13 @@ if ($Mode -eq 'pull') {
 $LASTEXITCODE = -1
 $invokeOk = $false
 try {
-  & $sync @syncArgs *>&1 | ForEach-Object { Log ([string]$_) }
+  # 管道会把子脚本的退出码吃掉（实测 exit 3 到这里变成 1），所以同时在输出里认这句话。
+  $syncSkipped = $false
+  & $sync @syncArgs *>&1 | ForEach-Object {
+    $lineText = [string]$_
+    if ($lineText -match '另一个同步动作正在进行') { $syncSkipped = $true }
+    Log $lineText
+  }
   $invokeOk = $true
 } catch {
   Log ('执行体调用异常：{0}' -f $_.Exception.Message)
@@ -778,7 +936,10 @@ if (-not $invokeOk) {
 }
 Log ("sync.ps1 {0} 退出码：{1}" -f $Mode, $code)
 
-$failed = ($code -ne 0)
+# 3 = 另一个同步动作正在进行（capture/apply 的互斥）：什么都没做，但绝不能算失败 ——
+# 否则 pull 会走下面的自动回滚，把一个健康的仓库 reset 回拉取前，纯属自伤。
+$skipped = ($code -eq 3) -or $syncSkipped
+$failed = ($code -ne 0 -and -not $skipped)
 
 # ---------- 失败自动回滚（仅 pull） ----------
 $conflictPending = ($code -eq 6)
@@ -826,13 +987,16 @@ if ($Mode -eq 'pull') {
   if ($conflictPending) {
     # 冲突不是"失败"：本机文件挡住了快进，仓库没动、配置没动，等用户在面板里逐项选完再拉
     Write-Result $false 6 '拉取被本机文件挡住：面板「同步冲突」里逐项选「用本机 / 用云端」后再拉取' $false
+  } elseif ($skipped) {
+    Write-Result $true 0 '另一个同步动作正在进行，本次拉取已跳过（不是故障）' $false
   } elseif ($failed) {
     Write-Result $false $code ("拉取失败" + $(if ($restored) { '，已自动还原上一次的配置' } else { '，且未能完整还原' }) + '；详见日志') $restored
   } else {
     Write-Result $true 0 '云端配置已拉取到本机' $false
   }
 } else {
-  if ($failed) { Write-Result $false $code '推送失败（改动还在本地，下次再推）' $false }
+  if ($skipped) { Write-Result $true 0 '另一个同步动作正在进行，本次推送已跳过（不是故障）' $false }
+  elseif ($failed) { Write-Result $false $code '推送失败（改动还在本地，下次再推）' $false }
   else { Write-Result $true 0 '本机改动已推送到云端' $false }
 }
 

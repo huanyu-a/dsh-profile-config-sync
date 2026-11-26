@@ -236,7 +236,10 @@ window.__ModuleLoader__.load({
           hint ? h('span', { style: { ...S.sectionHint, opacity: 0.75 } }, `· `) : null,
           hint ? h('div', { style: S.sectionHint }, hint) : null,
         ),
-        h('div', { style: S.grid }, list),
+        // 用展开而不是把数组直接当 children：数组 children 会被 React 当成列表，
+        // 要求每一项都有 key（原来每区都在刷 "Each child in a list should have a unique key"，
+        // 且报错位置指到 ConfigSyncPanel，很难对上号）。逐项展开就没有这个要求。
+        h('div', { style: S.grid }, ...list),
       )
     }
 
@@ -281,7 +284,20 @@ window.__ModuleLoader__.load({
       if (repo.ahead > 0) return { kind: 'warn', text: M(`本机有 ${repo.ahead} 个提交还没推送`, `${repo.ahead} local commit(s) not pushed yet`) }
       // git 干净不代表没东西要推：新会话/新资料还躺在 ~\.dsh 里，没 capture 之前仓库是完全干净的
       const local = data.local || {}
-      if (local.known && local.pending > 0) {
+      // 三件不能混成一件事的：从没同步过 / 扫描没跑完 / 真的没有
+      if (local.known === false) return { kind: 'idle', text: M('还没有同步记录：先推送或拉取一次', 'No sync record yet — push or pull once') }
+      if (local.truncated) return { kind: 'warn', text: M('待推送扫描没跑完（文件太多或超时），数字可能偏小', 'Pending scan did not finish (too many files or timeout) — the count may be low') }
+      // 非 Windows：执行体只抓 profile / 提示 / Skills / 预设，别让「没有待推送」被读成「全都同步了」
+      if (Array.isArray(local.engineGroups) && local.pending === 0) {
+        return {
+          kind: 'idle',
+          text: M(
+            `已同步（这台机器走跨平台引擎，只处理 ${local.engineGroups.join(' / ')}；会话记录、插件数据、额外路径等组要 Windows 版才会同步）`,
+            `Up to date (this machine uses the cross-platform engine, which only handles ${local.engineGroups.join(' / ')}; conversations, plugin data and extra paths sync on Windows)`,
+          ),
+        }
+      }
+      if (local.pending > 0) {
         return {
           kind: 'warn',
           text: M(
@@ -346,15 +362,15 @@ window.__ModuleLoader__.load({
       throw new Error(M(`${reason}（已自动重试 3 次）`, `${reason} (retried 3 times)`))
     }
 
-    /** 每个 POST 都带 accept-language：宿主的建议句/错误信息按它出中文或英文。 */
-    const jsonHeaders = { 'content-type': 'application/json', ...langHeaders() }
+    /** 每个 POST 都现读 accept-language：用户切语言后不必重载模块，宿主错误信息也跟着走。 */
+    const jsonHeaders = () => ({ 'content-type': 'application/json', ...langHeaders() })
 
     async function callPrepare(action, message, backupDir) {
       const res = await fetch('/config-sync/prepare', {
         method: 'POST',
         cache: 'no-store',
         credentials: 'same-origin',
-        headers: jsonHeaders,
+        headers: jsonHeaders(),
         body: JSON.stringify({ action, message: message || '', backupDir: backupDir || '' }),
       })
       const text = await res.text()
@@ -369,7 +385,7 @@ window.__ModuleLoader__.load({
         method: 'POST',
         cache: 'no-store',
         credentials: 'same-origin',
-        headers: jsonHeaders,
+        headers: jsonHeaders(),
         body: JSON.stringify(payload),
       })
       const text = await res.text()
@@ -379,13 +395,13 @@ window.__ModuleLoader__.load({
       return body
     }
 
-    /** 自动同步接口：check / pull-now / push-now / cancel。 */
+    /** 自动同步接口：check / pull-now / push-now / push-live / cancel。 */
     async function callAuto(payload) {
       const res = await fetch('/config-sync/auto', {
         method: 'POST',
         cache: 'no-store',
         credentials: 'same-origin',
-        headers: jsonHeaders,
+        headers: jsonHeaders(),
         body: JSON.stringify(payload),
       })
       const text = await res.text()
@@ -405,7 +421,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           cache: 'no-store',
           credentials: 'same-origin',
-          headers: jsonHeaders,
+          headers: jsonHeaders(),
           body: JSON.stringify(payload),
         }
         : { cache: 'no-store', credentials: 'same-origin', headers: langHeaders() })
@@ -426,7 +442,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           cache: 'no-store',
           credentials: 'same-origin',
-          headers: jsonHeaders,
+          headers: jsonHeaders(),
           body: JSON.stringify(payload),
         }
         : { cache: 'no-store', credentials: 'same-origin', headers: langHeaders() })
@@ -447,7 +463,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           cache: 'no-store',
           credentials: 'same-origin',
-          headers: jsonHeaders,
+          headers: jsonHeaders(),
           body: JSON.stringify(payload),
         }
         : { cache: 'no-store', credentials: 'same-origin', headers: langHeaders() })
@@ -465,7 +481,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           cache: 'no-store',
           credentials: 'same-origin',
-          headers: jsonHeaders,
+          headers: jsonHeaders(),
           body: JSON.stringify(payload),
         }
         : { cache: 'no-store', credentials: 'same-origin', headers: langHeaders() })
@@ -483,7 +499,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           cache: 'no-store',
           credentials: 'same-origin',
-          headers: jsonHeaders,
+          headers: jsonHeaders(),
           body: JSON.stringify(payload),
         }
         : { cache: 'no-store', credentials: 'same-origin', headers: langHeaders() })
@@ -502,7 +518,7 @@ window.__ModuleLoader__.load({
         method,
         cache: 'no-store',
         credentials: 'same-origin',
-        headers: payload ? jsonHeaders : langHeaders(),
+        headers: payload ? jsonHeaders() : langHeaders(),
         body: payload ? JSON.stringify(payload) : undefined,
       })
       const text = await res.text()
@@ -524,7 +540,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           cache: 'no-store',
           credentials: 'same-origin',
-          headers: jsonHeaders,
+          headers: jsonHeaders(),
           body: JSON.stringify(payload),
         }
         : { cache: 'no-store', credentials: 'same-origin', headers: langHeaders() })
@@ -541,18 +557,21 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = react.useState(false)
       const [made, setMade] = react.useState(null)
 
-      const refresh = react.useCallback(async (done) => {
-        setBusy(true)
-        setErr('')
+      const refresh = react.useCallback(async (doneOrOpts, maybeOpts) => {
+        const done = typeof doneOrOpts === 'function' ? doneOrOpts : null
+        const opts = (typeof doneOrOpts === 'object' && doneOrOpts) ? doneOrOpts : (maybeOpts || {})
+        const silent = Boolean(opts && opts.silent)
+        if (!silent) setBusy(true)
+        if (!silent) setErr('')
         try {
           const d = await callStatus()
           setData(d)
-          if (typeof done === 'function') done(null, d)
+          if (done) done(null, d)
         } catch (e) {
           const msg = String((e && e.message) || e)
-          setErr(msg)
-          if (typeof done === 'function') done(msg, null)
-        } finally { setBusy(false) }
+          if (!silent) setErr(msg)
+          if (done) done(msg, null)
+        } finally { if (!silent) setBusy(false) }
       }, [])
 
       react.useEffect(() => {
@@ -678,7 +697,7 @@ window.__ModuleLoader__.load({
       return (async () => {
         const res = await fetch('/config-sync/webdav', {
           method: payload ? 'POST' : 'GET',
-          headers: payload ? jsonHeaders : langHeaders(),
+          headers: payload ? jsonHeaders() : langHeaders(),
           body: payload ? JSON.stringify(payload) : undefined,
         })
         const text = await res.text()
@@ -689,40 +708,118 @@ window.__ModuleLoader__.load({
       })()
     }
 
-    function WebdavCard(props) {
-      const [st, setSt] = react.useState(null)
+    /**
+     * 云端仓库与同步方式卡（合并原「云端仓库」与「同步方式（WebDAV）」）：
+     *   - 先选同步模式：Git 仓库 / WebDAV / 自动（优先 WebDAV）
+     *   - 按所选模式展开对应字段与操作，避免用 WebDAV 时还一直提示“先填 Git 远端地址”
+     */
+    function CloudTargetCard(props) {
+      const remote = (props.data && props.data.remote) || {}
+      const wdStatus = (props.data && props.data.webdav) || {}
+      const [wdFetched, setWdFetched] = react.useState(null)
+      const st = wdFetched || wdStatus
+      const currentMode = st.mode || wdStatus.mode || 'git'
+      const currentWdUrl = st.url || ''
+      const currentWdUser = st.user || ''
+      const currentWdDir = st.dir || ''
+      const currentGitUrl = remote.url || ''
+      const currentGitKey = remote.sshKey || ''
+
       const [editing, setEditing] = react.useState(false)
-      const [url, setUrl] = react.useState('')
-      const [user, setUser] = react.useState('')
-      const [pass, setPass] = react.useState('')
-      const [dir, setDir] = react.useState('')
-      const [mode, setMode] = react.useState('git')
+      const [mode, setMode] = react.useState(currentMode)
+      const [wdUrl, setWdUrl] = react.useState(currentWdUrl)
+      const [wdUser, setWdUser] = react.useState(currentWdUser)
+      const [wdPass, setWdPass] = react.useState('')
+      const [wdDir, setWdDir] = react.useState(currentWdDir)
+      const [gitUrl, setGitUrl] = react.useState(currentGitUrl)
+      const [gitKey, setGitKey] = react.useState(currentGitKey)
       const [busy, setBusy] = react.useState(false)
       const [err, setErr] = react.useState('')
       const [msg, setMsg] = react.useState('')
 
-      const load = react.useCallback(async () => {
+      const loadWebdav = react.useCallback(async () => {
         try {
           const r = await callWebdav()
-          setSt(r)
-          setUrl(r.url || ''); setUser(r.user || ''); setDir(r.dir || ''); setMode(r.mode || 'git')
-          setPass('')
-        } catch (e) { setErr(String((e && e.message) || e)) }
+          setWdFetched(r)
+        } catch { /* status 已带基础字段；不打断页面 */ }
       }, [])
-      react.useEffect(() => { load() }, [])
+      react.useEffect(() => { loadWebdav() }, [])
+
+      react.useEffect(() => {
+        if (editing) return
+        setMode(currentMode)
+        setWdUrl(currentWdUrl)
+        setWdUser(currentWdUser)
+        setWdDir(currentWdDir)
+        setWdPass('')
+        setGitUrl(currentGitUrl)
+        setGitKey(currentGitKey)
+      }, [editing, currentMode, currentWdUrl, currentWdUser, currentWdDir, currentGitUrl, currentGitKey])
+
+      const activeMode = editing ? mode : currentMode
+      const wdConfigured = Boolean(st.configured || st.url)
+      const gitConfigured = Boolean(remote.configured || remote.url)
+      const missing = Boolean(props.data) && (
+        activeMode === 'webdav' ? !wdConfigured
+          : (activeMode === 'git' ? !gitConfigured : (!wdConfigured && !gitConfigured))
+      )
+      const isEditing = editing || (!wdConfigured && !gitConfigured && Boolean(props.data))
+
+      const sourceLabel = (s) => s === 'settings' ? M('本机设置', 'Machine settings')
+        : (s === 'git' ? M('git 配置', 'git config')
+          : (s === 'default' ? M('自动探测', 'Auto-detected') : M('未配置', 'Not set')))
+
+      const startEdit = () => {
+        setMode(currentMode)
+        setWdUrl(currentWdUrl)
+        setWdUser(currentWdUser)
+        setWdDir(currentWdDir)
+        setWdPass('')
+        setGitUrl(currentGitUrl)
+        setGitKey(currentGitKey)
+        setErr(''); setMsg(''); setEditing(true)
+      }
+      const cancelEdit = () => {
+        setMode(currentMode)
+        setWdUrl(currentWdUrl)
+        setWdUser(currentWdUser)
+        setWdDir(currentWdDir)
+        setWdPass('')
+        setGitUrl(currentGitUrl)
+        setGitKey(currentGitKey)
+        setEditing(false); setErr(''); setMsg('')
+      }
 
       const save = async () => {
         setBusy(true); setErr(''); setMsg('')
         try {
-          // 密码留空 = 不改（避免把已有密码清空）
-          await callWebdav({ action: 'save', url, user, dir, mode, pass })
-          setEditing(false); setPass('')
-          setMsg(M('已保存', 'Saved'))
-          await load()
+          if (mode === 'webdav' && !wdUrl.trim()) {
+            throw new Error(M('请填写 WebDAV 地址', 'Enter a WebDAV URL'))
+          }
+          if (mode === 'git' && !gitUrl.trim()) {
+            throw new Error(M('请填写 Git 远端地址', 'Enter a Git remote URL'))
+          }
+          if (mode === 'auto' && !wdUrl.trim() && !gitUrl.trim()) {
+            throw new Error(M('自动模式下请至少填写 WebDAV 地址或 Git 远端地址', 'In Auto mode, provide at least a WebDAV URL or a Git remote URL'))
+          }
+          await callWebdav({ action: 'save', url: wdUrl, user: wdUser, dir: wdDir, mode, pass: wdPass })
+          let gitSet = false
+          const gitDirty = gitUrl.trim() !== currentGitUrl.trim() || gitKey.trim() !== currentGitKey.trim()
+          if (gitDirty && (gitUrl.trim() || currentGitUrl.trim() || gitKey.trim() || currentGitKey.trim())) {
+            const r = await callSettings({ remoteUrl: gitUrl, sshKey: gitKey })
+            gitSet = Boolean(r && r.gitRemoteSet)
+          }
+          setEditing(false); setWdPass('')
+          setMsg(M(
+            `已保存${gitSet ? '，并已更新本机 git origin' : ''}`,
+            `Saved${gitSet ? ' and updated local git origin' : ''}`,
+          ))
+          await loadWebdav()
           if (typeof props.onSaved === 'function') props.onSaved()
         } catch (e) { setErr(String((e && e.message) || e)) } finally { setBusy(false) }
       }
-      const run = async (action) => {
+
+      const runWebdav = async (action) => {
         setBusy(true); setErr(''); setMsg('')
         try {
           const r = await callWebdav({ action })
@@ -738,7 +835,7 @@ window.__ModuleLoader__.load({
 
       const field = (label, value, onCh, ph, type) => h('div', { style: S.kvRow },
         h('div', { style: S.kvKey }, label),
-        editing
+        isEditing
           ? h('input', {
             type: type || 'text', style: S.input, value, placeholder: ph, spellCheck: false,
             onChange: (e) => onCh(e.target.value),
@@ -747,63 +844,104 @@ window.__ModuleLoader__.load({
             value || M('（未设置）', '(not set)')),
       )
 
+      const modeText = currentMode === 'webdav'
+        ? M('WebDAV', 'WebDAV')
+        : (currentMode === 'auto'
+          ? (wdStatus.active ? M('自动（当前走 WebDAV）', 'Auto (using WebDAV)') : M('自动（当前走 Git）', 'Auto (using Git)'))
+          : M('Git 仓库', 'Git repo'))
+      const showWebdav = activeMode === 'webdav' || activeMode === 'auto'
+      const showGit = activeMode === 'git' || activeMode === 'auto'
+
       return h('div', { style: S.card },
         h('div', { style: S.cardHead },
-          h('div', { style: S.cardTitle }, M('同步方式（WebDAV）', 'Sync via WebDAV')),
-          editing
+          h('div', { style: S.cardTitle }, M('云端仓库与同步方式', 'Cloud repo & transport')),
+          isEditing && missing
+            ? h('div', { style: { ...S.hint, flex: 1 } }, M('先选择并填好云端目标才能生成推送/拉取', 'Configure the cloud target to enable push/pull'))
+            : null,
+          isEditing
             ? h('div', { style: S.actions },
-              h('button', { type: 'button', style: S.btnPrimary, disabled: busy || !url.trim(), onClick: save }, busy ? M('保存中…', 'Saving…') : M('保存', 'Save')),
-              h('button', { type: 'button', style: S.btn, disabled: busy, onClick: () => { setEditing(false); setErr(''); setMsg('') } }, M('取消', 'Cancel')),
+              h('button', { type: 'button', style: S.btnPrimary, disabled: busy, onClick: save }, busy ? M('保存中…', 'Saving…') : M('保存', 'Save')),
+              (!wdConfigured && !gitConfigured) ? null : h('button', { type: 'button', style: S.btn, disabled: busy, onClick: cancelEdit }, M('取消', 'Cancel')),
             )
             : h('div', { style: S.actions },
-              h('button', { type: 'button', style: S.btn, disabled: busy, onClick: () => { setEditing(true); setErr(''); setMsg('') } }, M('修改', 'Edit')),
+              h('button', { type: 'button', style: S.btn, disabled: busy || !props.data, onClick: startEdit }, M('修改', 'Edit')),
             ),
         ),
-        field(M('同步模式', 'Mode'), mode === 'webdav' ? M('WebDAV', 'WebDAV') : (mode === 'auto' ? M('自动（配了就用 WebDAV）', 'Auto (WebDAV when set)') : M('git', 'git')),
-          setMode, ''),
-        editing
+        isEditing
           ? h('div', { style: S.kvRow },
-            h('div', { style: S.kvKey }, M('模式', 'Mode')),
+            h('div', { style: S.kvKey }, M('同步模式', 'Mode')),
             h('select', {
               style: S.input, value: mode,
               onChange: (e) => setMode(e.target.value),
             },
-              h('option', { value: 'git' }, M('git（默认）', 'git (default)')),
+              h('option', { value: 'git' }, M('Git 仓库（默认）', 'Git repo (default)')),
               h('option', { value: 'webdav' }, M('WebDAV', 'WebDAV')),
-              h('option', { value: 'auto' }, M('自动', 'Auto')),
+              h('option', { value: 'auto' }, M('自动（配了 WebDAV 就用，否则用 Git）', 'Auto (WebDAV when set, else Git)')),
             ))
+          : h(Kv, { k: M('同步模式', 'Mode'), v: modeText }),
+        showWebdav
+          ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px', paddingTop: activeMode === 'auto' ? '6px' : '0px', borderTop: activeMode === 'auto' ? '1px solid var(--dsw-alias-border-l1)' : 'none' } },
+            activeMode === 'auto' ? h('div', { style: { ...S.hint, fontWeight: 600 } }, M('WebDAV（优先）', 'WebDAV (primary)')) : null,
+            field(M('WebDAV 地址', 'WebDAV URL'), isEditing ? wdUrl : currentWdUrl, setWdUrl, 'https://dav.example.com/remote.php/dav/files/me'),
+            field(M('用户名', 'Username'), isEditing ? wdUser : currentWdUser, setWdUser, ''),
+            isEditing
+              ? h('div', { style: S.kvRow },
+                h('div', { style: S.kvKey }, M('密码', 'Password')),
+                h('input', {
+                  type: 'password', style: S.input, value: wdPass,
+                  placeholder: st.hasPassword ? M('已设置，留空表示不改', 'Set; leave blank to keep') : '',
+                  spellCheck: false,
+                  onChange: (e) => setWdPass(e.target.value),
+                }))
+              : h(Kv, {
+                k: M('密码', 'Password'),
+                v: st.hasPassword ? M('已设置（不回显）', 'set (not shown)') : M('未设置', 'not set'),
+              }),
+            field(M('远端目录', 'Remote dir'), isEditing ? wdDir : currentWdDir, setWdDir, 'dsh-config-sync'),
+            h(Kv, {
+              k: M('传输安全', 'Transport'),
+              v: (st.secure === false)
+                ? M('http 明文（有密码泄露风险）', 'http (credentials in clear text)')
+                : M('https', 'https'),
+            }),
+            h('div', { style: S.actions },
+              h('button', { type: 'button', style: S.btn, disabled: busy || isEditing || !wdConfigured, onClick: () => runWebdav('test') }, M('测试连接', 'Test')),
+              h('button', { type: 'button', style: S.btn, disabled: busy || isEditing || !wdConfigured, onClick: () => runWebdav('upload') }, M('立即上传', 'Upload now')),
+              h('button', { type: 'button', style: S.btn, disabled: busy || isEditing || !wdConfigured, onClick: () => runWebdav('download') }, M('立即下载', 'Download now')),
+            ),
+            h('div', { style: S.footnote }, M(
+              'WebDAV 与 git 共用同一份仓库格式，只换传输层：上传不删云端多余文件（开启「同步内容 → 删除云端副本」时除外），下载不删本机多余文件；两边都有且不同时本机那份留底为 .conflict-<时间>。',
+              'WebDAV reuses the same repo format and only swaps the transport: upload keeps extra cloud files (unless "Also delete the cloud copy" is on in Content), download keeps extra local files; when both differ the local copy is kept as .conflict-<time>.',
+            )),
+          )
           : null,
-        field(M('WebDAV 地址', 'WebDAV URL'), editing ? url : (st && st.url) || '', setUrl, 'https://dav.example.com/remote.php/dav/files/me'),
-        field(M('用户名', 'Username'), editing ? user : (st && st.user) || '', setUser, ''),
-        editing
-          ? h('div', { style: S.kvRow },
-            h('div', { style: S.kvKey }, M('密码', 'Password')),
-            h('input', {
-              type: 'password', style: S.input, value: pass,
-              placeholder: (st && st.hasPassword) ? M('已设置，留空表示不改', 'Set; leave blank to keep') : '',
-              spellCheck: false,
-              onChange: (e) => setPass(e.target.value),
-            }))
-          : h(Kv, {
-            k: M('密码', 'Password'),
-            v: (st && st.hasPassword) ? M('已设置（不回显）', 'set (not shown)') : M('未设置', 'not set'),
-          }),
-        field(M('远端目录', 'Remote dir'), editing ? dir : (st && st.dir) || '', setDir, 'dsh-config-sync'),
-        h(Kv, {
-          k: M('传输安全', 'Transport'),
-          v: (st && st.secure === false)
-            ? M('http 明文（有密码泄露风险）', 'http (credentials in clear text)')
-            : M('https', 'https'),
-        }),
-        h('div', { style: S.actions },
-          h('button', { type: 'button', style: S.btn, disabled: busy || !(st && st.configured), onClick: () => run('test') }, M('测试连接', 'Test')),
-          h('button', { type: 'button', style: S.btn, disabled: busy || !(st && st.configured), onClick: () => run('upload') }, M('立即上传', 'Upload now')),
-          h('button', { type: 'button', style: S.btn, disabled: busy || !(st && st.configured), onClick: () => run('download') }, M('立即下载', 'Download now')),
-        ),
-        h('div', { style: S.footnote }, M(
-          'WebDAV 与 git 共用同一份仓库格式，只换传输层：上传不删云端多余文件，下载不删本机多余文件；两边都有且不同时本机那份留底为 .conflict-<时间>。',
-          'WebDAV reuses the same repo format and only swaps the transport: upload never deletes extra cloud files, download never deletes extra local files; when both differ the local copy is kept as .conflict-<time>.',
-        )),
+        showGit
+          ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px', paddingTop: activeMode === 'auto' ? '6px' : '0px', borderTop: activeMode === 'auto' ? '1px solid var(--dsw-alias-border-l1)' : 'none' } },
+            activeMode === 'auto' ? h('div', { style: { ...S.hint, fontWeight: 600 } }, M('Git 仓库（WebDAV 未配时备用）', 'Git repo (fallback)')) : null,
+            field(M('远端地址', 'Remote URL'), isEditing ? gitUrl : currentGitUrl, setGitUrl, 'git@<host>:you/dsh-config.git'),
+            field(M('SSH 私钥', 'SSH key'), isEditing ? gitKey : currentGitKey, setGitKey, M('C:\\Users\\你\\.ssh\\id_ed25519', 'C:\\Users\\you\\.ssh\\id_ed25519')),
+            h(Kv, {
+              k: M('私钥来源', 'Key source'),
+              v: `${sourceLabel(remote.sshKeyFrom)}${remote.sshKeyExists ? '' : M('（文件不存在）', ' (file missing)')}`,
+            }),
+            h(Kv, { k: M('地址来源', 'URL source'), v: sourceLabel(remote.urlSource) }),
+            h(Kv, { k: M('设置文件', 'Settings file'), v: remote.settingsPath || M('（未知）', '(unknown)') }),
+            h('div', { style: S.footnote }, M(
+              '远端地址支持任意 git 托管平台（Gitee / GitHub / GitLab / 自建 Gitea）：'
+              + 'git@host:owner/repo.git、ssh://、https:// 三种写法都行；'
+              + '例：git@gitee.com:you/dsh-config.git、git@github.com:you/dsh-config.git、https://gitlab.com/you/dsh-config.git。'
+              + 'SSH 地址用私钥/ssh config 走认证，https 地址用 Git 凭据管理器里的账号或令牌。',
+              'Any git host works (Gitee / GitHub / GitLab / self-hosted Gitea): '
+              + 'git@host:owner/repo.git, ssh:// and https:// are all accepted; '
+              + 'e.g. git@gitee.com:you/dsh-config.git, git@github.com:you/dsh-config.git, https://gitlab.com/you/dsh-config.git. '
+              + 'SSH URLs authenticate with the key or ssh config; https URLs use the account or token in Git Credential Manager.',
+            )),
+            h('div', { style: S.footnote }, M(
+              '只存私钥路径不存内容；保存远端地址会同步更新本机 git origin，git 失败则整套回滚。',
+              'Only the key path is stored; saving also updates the local git origin, rolling everything back if git fails.',
+            )),
+          )
+          : null,
         err ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-error-primary)' } }, M(`失败：${err}`, `Failed: ${err}`)) : null,
         msg ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-success-primary)' } }, msg) : null,
       )
@@ -817,21 +955,21 @@ window.__ModuleLoader__.load({
         return { section: 'automation', label: M('前往初始化推送 →', 'Go to initialize push →') }
       }
       if (/连不上 WebDAV|Cannot reach WebDAV/i.test(s)) {
-        return { section: 'platform', label: M('检查 WebDAV →', 'Check WebDAV →') }
+        return { section: 'targets', label: M('检查 WebDAV →', 'Check WebDAV →') }
       }
       if (/连不上云端|云端仓库地址|Cloud repo is not set|Cannot reach the cloud/i.test(s)) {
-        return { section: webdavOn ? 'platform' : 'targets', label: webdavOn ? M('检查 WebDAV →', 'Check WebDAV →') : M('去配置云端 →', 'Go to cloud settings →') }
+        return { section: 'targets', label: webdavOn ? M('检查 WebDAV →', 'Check WebDAV →') : M('去配置云端 →', 'Go to cloud settings →') }
       }
       if (/拉取|run Pull|\bPull\b/i.test(s) && !/只允许拉取|only Pull is allowed/i.test(s)) {
         return { section: 'automation', label: M('前往立即拉取 →', 'Go to pull →') }
       }
       if (/只允许拉取|only Pull is allowed/i.test(s)) {
-        return { section: webdavOn ? 'platform' : 'targets', label: webdavOn ? M('检查 WebDAV →', 'Check WebDAV →') : M('检查云端配置 →', 'Check cloud config →') }
+        return { section: 'targets', label: webdavOn ? M('检查 WebDAV →', 'Check WebDAV →') : M('检查云端配置 →', 'Check cloud config →') }
       }
       if (/推送|run Push|\bPush\b/i.test(s)) {
         return { section: 'automation', label: M('前往立即推送 →', 'Go to push →') }
       }
-      if (/仓库路径|本机仓库|Repo path|repo directory is not set|Local repo/i.test(s)) {
+      if (/仓库路径|本机仓库|Repo path|repo directory is not set|Local repo|仓库目录|runnable sync script/i.test(s)) {
         return { section: 'targets', label: M('去设置仓库 →', 'Go to repo settings →') }
       }
       if (/客户端根目录|client root/i.test(s)) {
@@ -857,7 +995,7 @@ window.__ModuleLoader__.load({
               type: 'button',
               style: S.anchorBtn,
               title: M('点击直达对应操作区', 'Jump directly to this section'),
-              onClick: () => onNav(target),
+              onClick: () => onNav(target.section, target),
             }, target.label)
             : null,
         )
@@ -1029,106 +1167,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /**
-     * 云端仓库卡：远端地址 + SSH 私钥路径。
-     * 默认只读展示；点「修改」才变成可编辑，保存走 POST /config-sync/settings，
-     * 宿主那边会同时 git remote set-url，失败则回滚设置文件并回显错误。
-     */
-    function RemoteCard(props) {
-      const remote = (props.data && props.data.remote) || {}
-      // 没配过云端仓库 = 强制编辑态：不给「取消」，也不许就这么放着去生成推送/拉取
-      const missing = Boolean(props.data) && !remote.configured
-      const [editing, setEditing] = react.useState(false)
-      const [url, setUrl] = react.useState(remote.url || '')
-      const [key, setKey] = react.useState(remote.sshKey || '')
-      const [busy, setBusy] = react.useState(false)
-      const [err, setErr] = react.useState('')
-      const [msg, setMsg] = react.useState('')
-      const isEditing = editing || missing
-      const sourceLabel = (s) => s === 'settings' ? M('本机设置', 'Machine settings')
-        : (s === 'git' ? M('git 配置', 'git config')
-          : (s === 'default' ? M('自动探测', 'Auto-detected') : M('未配置', 'Not set')))
-
-      const startEdit = () => {
-        setUrl(remote.url || '')
-        setKey(remote.sshKey || '')
-        setErr('')
-        setMsg('')
-        setEditing(true)
-      }
-      const cancelEdit = () => { setEditing(false); setErr(''); setMsg('') }
-      const save = async () => {
-        setBusy(true); setErr(''); setMsg('')
-        try {
-          const r = await callSettings({ remoteUrl: url, sshKey: key })
-          setMsg(M(
-            `已保存${r.gitRemoteSet ? '，并已更新本机 git origin' : ''}`,
-            `Saved${r.gitRemoteSet ? ' and updated the local git origin' : ''}`,
-          ))
-          setEditing(false)
-          if (typeof props.onSaved === 'function') props.onSaved()
-        } catch (e) {
-          setErr(String((e && e.message) || e))
-        } finally { setBusy(false) }
-      }
-
-      const field = (label, value, onChange, placeholder) => h('div', { style: S.kvRow },
-        h('div', { style: S.kvKey }, label),
-        isEditing
-          ? h('input', {
-            type: 'text', style: S.input, value, placeholder, spellCheck: false,
-            onChange: (e) => onChange(e.target.value),
-          })
-          : h('div', { style: { ...S.kvVal, fontFamily: 'Consolas, ui-monospace, monospace' } }, value || M('（未配置）', '(not set)')),
-      )
-
-      return h('div', { style: S.card },
-        h('div', { style: S.cardHead },
-          h('div', { style: S.cardTitle }, M('云端仓库', 'Cloud repo')),
-          isEditing && missing
-            ? h('div', { style: { ...S.hint, flex: 1 } }, M('先填远端地址才能生成推送/拉取', 'Set the remote URL to enable push/pull'))
-            : null,
-          isEditing
-            ? h('div', { style: S.actions },
-              h('button', { type: 'button', style: S.btnPrimary, disabled: busy || !url.trim(), onClick: save }, busy ? M('保存中…', 'Saving…') : M('保存', 'Save')),
-              missing ? null : h('button', { type: 'button', style: S.btn, disabled: busy, onClick: cancelEdit }, M('取消', 'Cancel')),
-            )
-            : h('div', { style: S.actions },
-              h('button', { type: 'button', style: S.btn, disabled: !props.data, onClick: startEdit }, M('修改', 'Edit')),
-            ),
-        ),
-        field(M('远端地址', 'Remote URL'), isEditing ? url : (remote.url || ''), setUrl, 'git@<host>:you/dsh-config.git'),
-        field(M('SSH 私钥', 'SSH key'), isEditing ? key : (remote.sshKey || ''), setKey, M('C:\\Users\\你\\.ssh\\id_ed25519', 'C:\\Users\\you\\.ssh\\id_ed25519')),
-        h(Kv, {
-          k: M('私钥来源', 'Key source'),
-          v: `${sourceLabel(remote.sshKeyFrom)}${remote.sshKeyExists ? '' : M('（文件不存在）', ' (file missing)')}`,
-        }),
-        h(Kv, { k: M('地址来源', 'URL source'), v: sourceLabel(remote.urlSource) }),
-        h(Kv, { k: M('设置文件', 'Settings file'), v: remote.settingsPath || M('（未知）', '(unknown)') }),
-        missing && !remote.sshKeyExists
-          ? h('div', { style: S.footnote }, M(
-            '私钥可留空：认证交给 .ssh\\config 或 Git 默认选择；填了才写进脚本的 GIT_SSH_COMMAND。',
-            'The key is optional — auth falls back to .ssh\\config or Git defaults; fill it only to write GIT_SSH_COMMAND into scripts.',
-          ))
-          : null,
-        err ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-error-primary)' } }, M(`保存失败：${err}`, `Save failed: ${err}`)) : null,
-        msg ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-success-primary)' } }, msg) : null,
-        h('div', { style: S.footnote }, M(
-          '远端地址支持任意 git 托管平台（Gitee / GitHub / GitLab / 自建 Gitea）：'
-          + 'git@host:owner/repo.git、ssh://、https:// 三种写法都行；'
-          + '例：git@gitee.com:you/dsh-config.git、git@github.com:you/dsh-config.git、https://gitlab.com/you/dsh-config.git。'
-          + 'SSH 地址用下面的私钥/ssh config 走认证，https 地址用 Git 凭据管理器里的账号或令牌。',
-          'Any git host works (Gitee / GitHub / GitLab / self-hosted Gitea): '
-          + 'git@host:owner/repo.git, ssh:// and https:// are all accepted; '
-          + 'e.g. git@gitee.com:you/dsh-config.git, git@github.com:you/dsh-config.git, https://gitlab.com/you/dsh-config.git. '
-          + 'SSH URLs authenticate with the key or ssh config below; https URLs use the account or token in Git Credential Manager.',
-        )),
-        h('div', { style: S.footnote }, M(
-          '只存私钥路径不存内容；保存远端地址会同步更新本机 git origin，git 失败则整套回滚。',
-          'Only the key path is stored; saving also updates the local git origin, rolling everything back if git fails.',
-        )),
-      )
-    }
+    // RemoteCard 已合并进 CloudTargetCard（同步方式 + 云端目标统一在一张卡里）
 
     /**
      * 「还原备份」卡：先看备份目录在哪（默认 <DshHome>\backups，可改成别的绝对路径），
@@ -1339,7 +1378,7 @@ window.__ModuleLoader__.load({
             `动手前先整份备份当前位置到 ${pv.backupTo || 'backups\\<自动命名>'}，不满意还能再退回来。`,
             `The current location is copied to ${pv.backupTo || 'backups\\<auto-named>'} first, so you can undo it.`,
           )),
-          h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warning-primary)' } }, M(
+          h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warn-primary, #d97706)' } }, M(
             '确认后：客户端正常退出 → 弹出进度窗口执行 → 完成后自动重启客户端。',
             'After confirming: the client closes normally, a progress window runs it, then the client restarts automatically.',
           )),
@@ -1357,8 +1396,8 @@ window.__ModuleLoader__.load({
         },
         h('div', { style: { ...S.cardTitle, fontSize: '13px' } }, confirmTitle),
         h('div', { style: S.hint }, M(
-          `快照时间 ${when(confirm.snap.at)}（${rel(confirm.snap.at)}）· ${confirm.snap.files || 0} 个文件 · ${size(confirm.snap.bytes)} · ${confirm.snap.plugins || 0} 个插件`,
-          `Snapshot ${when(confirm.snap.at)} (${rel(confirm.snap.at)}) · ${confirm.snap.files || 0} files · ${size(confirm.snap.bytes)} · ${confirm.snap.plugins || 0} plugins`,
+          `快照时间 ${when(confirm.snap.at)}（${rel(confirm.snap.at)}）· ${confirm.snap.plugins || 0} 个插件 · ${confirm.snap.bundles || 0} 个 bundle`,
+          `Snapshot ${when(confirm.snap.at)} (${rel(confirm.snap.at)}) · ${confirm.snap.plugins || 0} plugins · ${confirm.snap.bundles || 0} bundles`,
         )),
         listBox(
           M(`将撤走 ${pvRemovePlugins.length} 个快照之后装上的插件`, `Removing ${pvRemovePlugins.length} plugin(s) installed after this snapshot`),
@@ -1380,7 +1419,7 @@ window.__ModuleLoader__.load({
           '动手前会把当前配置整份存到 backups\\manual-<时间戳>；撤走的东西另有 rollback 清单，随时能再还原回来。',
           'The current config is copied to backups\\manual-<timestamp> first, and everything removed is listed in a rollback manifest — both can be restored later.',
         )),
-        h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warning-primary)' } }, M(
+        h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warn-primary, #d97706)' } }, M(
           '确认后：客户端正常退出 → 弹出进度窗口执行还原 → 完成后自动重启客户端。',
           'After confirming: the client closes normally, a progress window runs the restore, then the client restarts automatically.',
         )),
@@ -1403,7 +1442,7 @@ window.__ModuleLoader__.load({
           h('div', {
             style: { ...S.hint, fontFamily: 'Consolas, ui-monospace, monospace', wordBreak: 'break-all' },
           }, M(`备份位置：${manual.dir}`, `Backup path: ${manual.dir}`)),
-          h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warning-primary)' } }, M(
+          h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warn-primary, #d97706)' } }, M(
             '这份备份认不出类型，自动还原不知道该写回哪，按下面三步手动拷：',
             'This backup cannot be classified, so there is no automatic target. Copy it by hand:',
           )),
@@ -1508,6 +1547,8 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = react.useState(false)
       const [err, setErr] = react.useState('')
       const [msg, setMsg] = react.useState('')
+      // 「放弃清单」的二次确认态：一次点击就删掉整份清单与已做的逐项选择，太容易被误触
+      const [armDiscard, setArmDiscard] = react.useState(false)
 
       const load = async () => {
         setBusy(true); setErr('')
@@ -1528,6 +1569,9 @@ window.__ModuleLoader__.load({
           h('div', { style: S.hint }, err
             ? M(`读取失败：${err}`, `Read failed: ${err}`)
             : M('正在读取冲突清单…', 'Loading conflicts…')),
+          // 失败后没有重试入口的话，这张卡会一直钉在「读取失败」上：
+          // 父层的「重新检测」只刷 /status，不会重拉这张卡。
+          err ? h('button', { type: 'button', style: S.btn, disabled: busy, onClick: load }, M('重试', 'Retry')) : null,
         )
       }
       if (!state.exists) return null
@@ -1675,7 +1719,12 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', style: S.btn, disabled: busy, onClick: () => setAll('cloud') }, M('全部用云端', 'All cloud')),
           h('button', { type: 'button', style: S.btn, disabled: busy, onClick: () => setAll('local') }, M('全部用本机', 'All local')),
           h('button', { type: 'button', style: S.btnPrimary, disabled: busy, onClick: save }, busy ? M('保存中…', 'Saving…') : M('保存选择', 'Save')),
-          h('button', { type: 'button', style: S.btn, disabled: busy, onClick: discard }, M('放弃清单', 'Discard')),
+          // 两段式：点一下就删掉整份清单（连同逐项选择），和旁边「保存选择」长得很像，
+          // 误点等于白选一遍。第一次点只进入确认态，再点才真的删。
+          h('button', {
+            type: 'button', style: S.btn, disabled: busy,
+            onClick: () => { if (!armDiscard) { setArmDiscard(true); return } setArmDiscard(false); discard() },
+          }, armDiscard ? M('确认放弃？（点此删除清单）', 'Confirm discard (click again)') : M('放弃清单', 'Discard')),
         ),
         err ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-error-primary)' } }, M(`操作失败：${err}`, `Failed: ${err}`)) : null,
         msg ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-success-primary)' } }, msg) : null,
@@ -1794,7 +1843,8 @@ window.__ModuleLoader__.load({
       if (!data || !draft) {
         return h('div', { style: S.card },
           h('div', { style: S.cardTitle }, M('插件数据与额外路径', 'Plugin data & extra paths')),
-          h('div', { style: S.hint }, err ? M(`读取失败：${err}`, `Read failed: ${err}`) : M('正在读取规则…', 'Loading rules…')))
+          h('div', { style: S.hint }, err ? M(`读取失败：${err}`, `Read failed: ${err}`) : M('正在读取规则…', 'Loading rules…')),
+          err ? h('button', { type: 'button', style: S.btn, disabled: busy, onClick: load }, M('重试', 'Retry')) : null)
       }
 
       const hardMB = Math.round(data.hardMaxBytes / (1024 * 1024))
@@ -1845,6 +1895,18 @@ window.__ModuleLoader__.load({
         ),
 
         // 排除名单
+        // 安全必需项补齐要让人看见：宿主会把 browser-profiles 这类条目补回生效名单，
+        // 但不静默改用户的口径 —— 这里明确说「你的文件缺这几条，已按内置名单补齐」。
+        (() => {
+          const mm = data && data.config && data.config.pluginData && data.config.pluginData.missingMandatory
+          if (!mm || (!(mm.skipDirs || []).length && !(mm.exclude || []).length)) return null
+          const parts = [...(mm.skipDirs || []), ...(mm.exclude || [])].filter((v, i, a) => a.indexOf(v) === i)
+          return h('div', { style: { ...S.footnote, marginTop: '6px', color: 'var(--dsw-alias-label-warn, #b45309)' } },
+            M(
+              `你的规则文件缺少安全必需项，已按内置名单补齐：${parts.join('、')}（这些是浏览器剖面/凭据库，删掉也不会同步；点保存会写回文件）`,
+              `Your rules file was missing mandatory safety entries; they are restored: ${parts.join(', ')} (browser profiles / credential stores — never synced even if removed; saving writes them back).`,
+            ))
+        })(),
         h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px', flexWrap: 'wrap' } },
           h('div', { style: { fontSize: '12px' } }, M('排除名单（通配，一行一条）', 'Exclusions (wildcards, one per line)')),
           h('button', { type: 'button', style: S.btn, disabled: !editing || busy, onClick: resetExclude }, M('恢复默认', 'Restore defaults')),
@@ -1948,7 +2010,8 @@ window.__ModuleLoader__.load({
       if (!data || !data.available) {
         return h('div', { style: S.card },
           h('div', { style: S.cardTitle }, M('工作区显示状态', 'Workspace visibility')),
-          h('div', { style: S.hint }, err ? M('读取失败：' + err, 'Read failed: ' + err) : M('本机还没有工作区数据，DSH 初始化后可用。', 'No workspace data yet — available after DSH initializes.')))
+          h('div', { style: S.hint }, err ? M('读取失败：' + err, 'Read failed: ' + err) : M('本机还没有工作区数据，DSH 初始化后可用。', 'No workspace data yet — available after DSH initializes.')),
+          err ? h('button', { type: 'button', style: S.btn, disabled: busy, onClick: load }, M('重试', 'Retry')) : null)
       }
 
       const wss = data.workspaces || []
@@ -2044,9 +2107,9 @@ window.__ModuleLoader__.load({
                 // 编辑态下用带词义的按钮文案（隐藏/显示，颜色区分），不再是一个孤零零的按钮。
                 open
                   ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '2px', marginTop: '6px', paddingLeft: '18px' } },
-                    (w.sessions || []).length === 0
+                    (Array.isArray(w.sessions) ? w.sessions : []).length === 0
                       ? h('div', { style: S.footnote }, M('这个工作区还没有会话。', 'No sessions in this workspace.'))
-                      : w.sessions.map(s => h('div', {
+                      : (Array.isArray(w.sessions) ? w.sessions : []).map(s => h('div', {
                         key: s.id,
                         style: {
                           display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', lineHeight: '18px',
@@ -2156,6 +2219,7 @@ window.__ModuleLoader__.load({
         return h('div', { style: S.card },
           h('div', { style: S.cardTitle }, M('同步内容', 'Sync content')),
           h('div', { style: S.hint }, err ? M(`读取失败：${err}`, `Read failed: ${err}`) : M('正在读取同步范围…', 'Loading sync scope…')),
+          err ? h('button', { type: 'button', style: S.btn, disabled: busy, onClick: load }, M('重试', 'Retry')) : null,
         )
       }
 
@@ -2203,6 +2267,7 @@ window.__ModuleLoader__.load({
             const groupOn = g.enabled !== false
             const canExpand = items.length > 0
             return h('div', {
+              key: g.id,
               style: { borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: '6px', paddingBottom: '2px' },
             },
               // 整行可点：点一下展开明细，再点收起（不再单独放「明细」按钮）
@@ -2248,6 +2313,7 @@ window.__ModuleLoader__.load({
                   },
                 },
                   items.map((i) => h('label', {
+                    key: i.id,
                     style: {
                       display: 'flex', gap: '8px', alignItems: 'center', fontSize: '12px',
                       cursor: editing ? 'pointer' : 'default', opacity: groupOn ? 1 : 0.6,
@@ -2292,6 +2358,8 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = react.useState('')
       const [err, setErr] = react.useState('')
       const [msg, setMsg] = react.useState('')
+      const [liveLocal, setLiveLocal] = react.useState(null)
+      const [nowTick, setNowTick] = react.useState(() => Date.now())
 
       const save = async (patch) => {
         setBusy('save'); setErr(''); setMsg('')
@@ -2304,14 +2372,31 @@ window.__ModuleLoader__.load({
 
       const act = async (action, extra) => {
         setBusy(action); setErr(''); setMsg('')
+        if (action === 'push-live') {
+          setLiveLocal({
+            running: true,
+            startedAt: Date.now(),
+            finishedAt: 0,
+            ok: null,
+            phase: 'starting',
+            message: initMode
+              ? M('正在核对云端状态并启动初始化推送…', 'Checking cloud state and starting initialize push…')
+              : M('正在核对云端状态并启动后台推送…', 'Checking cloud state and starting background push…'),
+            recent: [],
+            initPush: initMode,
+          })
+        }
         try {
           const res = await fetch('/config-sync/auto', {
             method: 'POST', cache: 'no-store', credentials: 'same-origin',
-            headers: jsonHeaders,
+            headers: jsonHeaders(),
             body: JSON.stringify({ action, ...(extra || {}) }),
           })
           const text = await res.text()
-          const body = text ? JSON.parse(text) : null
+          let body
+          // 这一处原来是全文件唯一没有 try 的 JSON.parse：宿主代理回一页 HTML 错误时，
+          // 用户看到的是 "Unexpected token '<'" 这种噪声，而不是「500 返回非 JSON」。
+          try { body = text ? JSON.parse(text) : null } catch { throw badJson(res) }
           if (!res.ok || !body || body.ok !== true) throw new Error((body && body.error) || `${res.status}`)
           if (action === 'check') {
             const d = body.drift
@@ -2319,16 +2404,17 @@ window.__ModuleLoader__.load({
               ? M(`云端：落后 ${d.behind} 个提交，领先 ${d.ahead} 个提交`, `Cloud: ${d.behind} commit(s) behind, ${d.ahead} ahead`)
               : (body.error || M('读不到远端', 'Cannot read the remote')))
           } else if (action === 'push-live') {
-            setMsg(body.alreadyRunning
-              ? M('后台推送已在运行中，请稍候…', 'Live push is already running…')
-              : M('已开始后台推送（不关闭 DSH），进度与结果会在下方实时更新', 'Live push started in background (DSH stays open) — status updates below'))
+            if (body.livePush) setLiveLocal(body.livePush)
           } else {
             setMsg(body.closeRequested
               ? M('已排队：客户端马上关闭，退出后执行；拉取完成后按设置自动重开', 'Queued: the client closes now and the sync runs after exit; it relaunches per your settings when pulling finishes')
               : M('已排队：退出 DSH 后自动执行', 'Queued: runs automatically after DSH exits'))
           }
-          if (typeof props.onSaved === 'function') props.onSaved()
-        } catch (e) { setErr(String((e && e.message) || e)) } finally { setBusy('') }
+          if (typeof props.onSaved === 'function') props.onSaved(action === 'push-live' ? { silent: true } : undefined)
+        } catch (e) {
+          if (action === 'push-live') setLiveLocal(null)
+          setErr(String((e && e.message) || e))
+        } finally { setBusy('') }
       }
 
       const sw = (patchKey, stateKey, label, hintText) => {
@@ -2363,10 +2449,39 @@ window.__ModuleLoader__.load({
       }
 
       const pending = auto.pending
-      const livePush = auto.livePush || null
+      const serverLive = auto.livePush || null
+      const hasServerLive = Boolean(serverLive && (serverLive.running || serverLive.finishedAt))
+      // 后端状态一旦到齐（或已有更新时间戳）就以真实状态为准，避免旧的乐观占位盖住真实进度
+      const livePush = hasServerLive && (!liveLocal || serverLive.startedAt >= (liveLocal.startedAt || 0) - 2000)
+        ? serverLive
+        : (liveLocal || serverLive)
       const liveRunning = Boolean(livePush && livePush.running)
+      react.useEffect(() => {
+        if (!liveRunning) return undefined
+        setNowTick(Date.now())
+        const timer = setInterval(() => setNowTick(Date.now()), 1000)
+        return () => clearInterval(timer)
+      }, [liveRunning])
+      react.useEffect(() => {
+        if (hasServerLive && !serverLive.running && liveLocal) setLiveLocal(null)
+      }, [hasServerLive, serverLive && serverLive.running, serverLive && serverLive.finishedAt])
       // 后台调度拿不到请求语言，宿主把原因中英各存一份，这里按当前界面语言挑
       const pendingReason = pending ? (langIsZh() ? (pending.reasonZh || pending.reason) : (pending.reasonEn || pending.reason)) : ''
+      const liveSteps = (() => {
+        if (!livePush) return []
+        const isWebdav = livePush.transport === 'webdav' || Boolean(props.data && props.data.webdav && props.data.webdav.active)
+        const base = []
+        if (livePush.initPush) base.push({ key: 'init', label: M('初始化仓库', 'Init repo') })
+        base.push({ key: 'capture', label: M('抓取配置', 'Capture') })
+        if (!isWebdav) base.push({ key: 'commit', label: M('提交变更', 'Commit') })
+        base.push({ key: 'upload', label: isWebdav ? M('上传 WebDAV', 'Upload WebDAV') : M('推送远端', 'Push remote') })
+        return base
+      })()
+      const phaseRank = { starting: -1, init: 0, capture: 1, commit: 2, upload: 3, done: 99, error: -2 }
+      const curRank = phaseRank[String((livePush && livePush.phase) || 'starting')] ?? -1
+      const elapsedSec = (livePush && livePush.startedAt)
+        ? Math.max(0, Math.floor(((livePush.finishedAt || nowTick) - livePush.startedAt) / 1000))
+        : 0
       return h('div', { style: S.card },
         h('div', { style: S.cardHead },
           h('div', { style: S.cardTitle }, M('自动同步', 'Auto sync')),
@@ -2410,11 +2525,13 @@ window.__ModuleLoader__.load({
               ? M('不关闭 DSH 直接在后台抓配置并上传（只读本地配置，安全不打断当前对话）', 'Capture and push in background without closing DSH')
               : M('云端已有内容：本机还是空的，先拉取', 'The cloud already has content — pull first'),
             onClick: () => act('push-live'),
-          }, liveRunning
-            ? M('后台推送中…', 'Pushing in background…')
-            : (initMode
-              ? M('初始化推送（不关 DSH）', 'Initialize push (keep DSH open)')
-              : M('立即推送（不关 DSH）', 'Push now (keep DSH open)'))),
+          }, busy === 'push-live'
+            ? M('准备启动…', 'Starting…')
+            : (liveRunning
+              ? M('后台推送中…', 'Pushing in background…')
+              : (initMode
+                ? M('初始化推送（不关 DSH）', 'Initialize push (keep DSH open)')
+                : M('立即推送（不关 DSH）', 'Push now (keep DSH open)')))),
           h('button', {
             type: 'button',
             style: (pushAllowed && !liveRunning) ? S.btn : { ...S.btn, opacity: 0.5, cursor: 'not-allowed' },
@@ -2431,7 +2548,8 @@ window.__ModuleLoader__.load({
         livePush && (livePush.running || livePush.finishedAt)
           ? h('div', {
             style: {
-              padding: '8px 10px', borderRadius: '8px', fontSize: '12px', lineHeight: '18px',
+              padding: '9px 11px', borderRadius: '8px', fontSize: '12px', lineHeight: '18px',
+              display: 'flex', flexDirection: 'column', gap: '6px',
               border: '1px solid ' + (livePush.running
                 ? 'var(--dsw-alias-toast-action)'
                 : (livePush.ok ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)')),
@@ -2441,15 +2559,56 @@ window.__ModuleLoader__.load({
                 : (livePush.ok ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)'),
             },
           },
-          h('div', { style: { fontWeight: 600 } },
-            (livePush.running ? '⏳ ' : (livePush.ok ? '✓ ' : '✕ ')) + (livePush.message || '')),
+          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap' } },
+            h('div', { style: { fontWeight: 600 } },
+              (livePush.running ? '⏳ ' : (livePush.ok ? '✓ ' : '✕ ')) + (livePush.message || '')),
+            h('div', { style: { ...S.footnote, fontFamily: 'Consolas, ui-monospace, monospace' } },
+              livePush.running
+                ? M(`已耗时 ${elapsedSec}s`, `${elapsedSec}s elapsed`)
+                : M(`耗时 ${elapsedSec}s`, `${elapsedSec}s`)),
+          ),
+          liveSteps.length
+            ? h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } },
+              liveSteps.map((st, idx) => {
+                const stRank = phaseRank[st.key] ?? idx
+                const done = livePush.phase === 'done' || (curRank > stRank && curRank >= 0)
+                const active = livePush.running && curRank === stRank
+                const failed = !livePush.running && livePush.ok === false && curRank === stRank
+                return h('span', {
+                  key: st.key,
+                  style: {
+                    ...S.chip,
+                    border: '1px solid ' + (active
+                      ? 'var(--dsw-alias-toast-action)'
+                      : (done
+                        ? 'var(--dsw-alias-state-success-primary)'
+                        : (failed ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-border-l1)'))),
+                    background: done
+                      ? 'var(--dsw-alias-state-success-tertiary)'
+                      : (failed ? 'var(--dsw-alias-state-error-tertiary, var(--dsw-alias-file-diff-deleted-bg))' : 'var(--dsw-alias-bg-base)'),
+                    color: active
+                      ? 'var(--dsw-alias-toast-action)'
+                      : (done ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)'),
+                    fontWeight: active ? 600 : 500,
+                  },
+                }, `${done ? '✓ ' : (active ? '▸ ' : (failed ? '✕ ' : ''))}${idx + 1}. ${st.label}`)
+              }))
+            : null,
+          (livePush.running || livePush.ok === false) && Array.isArray(livePush.recent) && livePush.recent.length
+            ? h('div', {
+              style: {
+                ...S.code, padding: '6px 8px', fontSize: '11px', lineHeight: '16px',
+                maxHeight: '96px', overflowY: 'auto',
+              },
+            }, livePush.recent.join('\n'))
+            : null,
           livePush.finishedAt
-            ? h('div', { style: { ...S.footnote, marginTop: '2px' } },
+            ? h('div', { style: S.footnote },
               M(`完成时间：${new Date(livePush.finishedAt).toLocaleTimeString(localeNow(), { hour12: false })}`,
                 `Finished at: ${new Date(livePush.finishedAt).toLocaleTimeString(localeNow(), { hour12: false })}`)
               + (livePush.log ? ` · ${livePush.log}` : ''))
             : (livePush.log
-              ? h('div', { style: { ...S.footnote, marginTop: '2px' } }, M(`日志：${livePush.log}`, `Log: ${livePush.log}`))
+              ? h('div', { style: S.footnote }, M(`日志：${livePush.log}`, `Log: ${livePush.log}`))
               : null),
           )
           : null,
@@ -2691,12 +2850,24 @@ window.__ModuleLoader__.load({
         setUpdBusy(true)
         setUpdMsg(M('DSH 即将退出，退出后安装并自动重启…', 'DSH will exit; the package is installed afterwards and DSH relaunches…'))
         try {
-          await callUpdate({ action: 'install-restart' })
-          showToast(M('DSH 即将退出并自动安装、重启…', 'DSH will exit, install, and relaunch…'))
+          const r = await callUpdate({ action: 'install-restart' })
+          // closeRequested=false 说明后端没能让客户端退出（taskkill 被拦 / app.quit 被模态框挡住），
+          // 这时再喊「马上退出」就是骗人：安装要等到真的退出之后才会发生。
+          if (r && r.closeRequested === false) {
+            setUpdMsg(M('已排队：没能让客户端自动退出，请手动完全退出 DSH，退出后会自动安装并重启',
+              'Queued: the client did not exit automatically. Quit DSH fully; the install and relaunch run afterwards.'))
+            showToast(M('已排队：请手动退出 DSH（窗口 + 托盘），退出后自动安装并重启',
+              'Queued: quit DSH fully (window and tray); install and relaunch run afterwards.'))
+          } else {
+            showToast(M('DSH 即将退出并自动安装、重启…', 'DSH will exit, install, and relaunch…'))
+          }
         } catch (e) {
           const msg = String((e && e.message) || e)
           setUpdMsg(M('安装失败：', 'Install failed: ') + msg)
           showToast(M('安装失败：', 'Install failed: ') + msg)
+        } finally {
+          // 必须复位：退出没真的发生时（上面 closeRequested=false 就是这种），
+          // 卡上 7 个按钮会全部 disabled 且本会话内没有复位入口。
           setUpdBusy(false)
         }
       }
@@ -2768,7 +2939,9 @@ window.__ModuleLoader__.load({
             await callAuto({ action: 'check' })
           } catch { /* 检查失败不该挡住页面，状态行会显示失败原因 */ }
           if (alive) setChecking(false)
-          if (alive && typeof refresh === 'function') refresh()
+          // 静默刷新：这里是每 2 分钟的自动复查。用非静默的 refresh() 会把整页 busy 置真
+          //（按钮周期性变灰），网络抖动时还会把「读取失败」写进页面，而 data 明明是有效的。
+          if (alive && typeof refresh === 'function') refresh({ silent: true })
         }
         run()
         const timer = setInterval(run, 2 * 60 * 1000)
@@ -2777,14 +2950,22 @@ window.__ModuleLoader__.load({
 
       const lastLiveFinishedRef = react.useRef(0)
 
-      const jumpToSection = (sid, opts) => {
+      const jumpToSection = (sidOrTarget, opts) => {
+        const sid = (sidOrTarget && typeof sidOrTarget === 'object') ? sidOrTarget.section : sidOrTarget
+        const options = (sidOrTarget && typeof sidOrTarget === 'object') ? sidOrTarget : opts
         if (!sid) return
-        if (opts && opts.openRoots && !showRoots) setShowRoots(true)
+        if (options && options.openRoots && !showRoots) setShowRoots(true)
         setActiveSection(sid)
         const scrollNow = () => {
           const el = document.getElementById('sync-section-' + sid)
-          if (!el || !el.scrollIntoView) return
-          el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+          if (!el) return
+          const body = bodyRef && bodyRef.current
+          if (body && typeof body.scrollTo === 'function') {
+            const top = el.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop - 8
+            body.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+          } else if (typeof el.scrollIntoView === 'function') {
+            el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+          }
           try {
             if (typeof el.animate === 'function') {
               el.animate([
@@ -2794,21 +2975,34 @@ window.__ModuleLoader__.load({
             }
           } catch { }
         }
-        if (opts && opts.openRoots && !showRoots) {
+        if (options && options.openRoots && !showRoots) {
           setTimeout(scrollNow, 60)
         } else {
           scrollNow()
         }
       }
 
-      // 后台在线推送进行中时，每 1.5s 轮询状态直到结束，并弹出完成/失败提示
       const liveRunning = Boolean(data && data.auto && data.auto.livePush && data.auto.livePush.running)
+      // 后台在线推送进行中时，每 800ms 静默轮询状态直到结束，并弹出完成/失败提示。
+      // 用「自调度 setTimeout + in-flight 门闩」而不是 setInterval：/status 要跑备份枚举与本机待推送统计，
+      // 推送期间经常超过 800ms，setInterval 会让请求不断叠加（失败还要退避重试，越叠越多）。
       react.useEffect(() => {
         if (!liveRunning) return undefined
-        const timer = setInterval(() => {
-          if (typeof refresh === 'function') refresh()
-        }, 1500)
-        return () => clearInterval(timer)
+        let alive = true
+        let pending = false
+        let timer = null
+        const tick = async () => {
+          if (!alive) return
+          if (!pending) {
+            pending = true
+            try {
+              if (typeof refresh === 'function') await refresh({ silent: true })
+            } catch { /* 静默轮询失败不影响页面 */ } finally { pending = false }
+          }
+          if (alive) timer = setTimeout(tick, 800)
+        }
+        timer = setTimeout(tick, 800)
+        return () => { alive = false; if (timer) clearTimeout(timer) }
       }, [liveRunning])
 
       react.useEffect(() => {
@@ -2889,9 +3083,11 @@ window.__ModuleLoader__.load({
         const failed = !has && u.ok === false && !restartRequired
         const kind = (restartRequired || preparedReady || has) ? 'warn' : (failed ? 'error' : 'ok')
         const notesText = (u.remote && (langIsZh() ? (u.remote.notes || u.remote.notesEn) : (u.remote.notesEn || u.remote.notes))) || ''
-        // 检查失败时把每个源的失败原因摆出来，别只给一句 aborted
+        // 检查失败时仅在 error 尚未带明细时补充 sourceNote，避免把各源报错打印两遍
         const badSources = (Array.isArray(u.sources) ? u.sources : []).filter((x) => x && x.ok === false)
-        const sourceNote = badSources.length
+        const errText = String(u.error || '')
+        const alreadyDetailed = badSources.length > 0 && badSources.some((x) => errText.includes(x.host || x.url || ''))
+        const sourceNote = (badSources.length && !alreadyDetailed)
           ? M(
             `（${badSources.map((x) => `${x.host || x.url}: ${x.error || '失败'}`).join('；')}）`,
             ` (${badSources.map((x) => `${x.host || x.url}: ${x.error || 'failed'}`).join('; ')})`,
@@ -2966,15 +3162,15 @@ window.__ModuleLoader__.load({
                 h('input', {
                   type: 'text', style: S.input, value: updToken, spellCheck: false,
                   placeholder: cfg.tokenSet
-                    ? M('已配置；留空表示不改', 'Already set; leave empty to keep it')
-                    : M('Gitee 私人令牌（私有库必填）', 'Gitee personal token (required for private repos)'),
+                    ? M('已配置；留空表示不改（支持 $GITHUB_TOKEN 读取环境变量）', 'Already set; leave empty to keep (or enter $GITHUB_TOKEN for env var)')
+                    : M('GitHub / Gitee 令牌，或填 $GITHUB_TOKEN 读取本机环境变量', 'GitHub / Gitee token, or $GITHUB_TOKEN to read from env'),
                   onChange: (e) => setUpdToken(e.target.value),
                 }),
               ),
               h('div', { style: S.actions },
                 h('button', { type: 'button', style: S.btnPrimary, disabled: updBusy, onClick: saveUpdConfig }, updBusy ? M('保存中…', 'Saving…') : M('保存', 'Save')),
                 h('button', { type: 'button', style: S.btn, disabled: updBusy, onClick: cancelEditUpd }, M('取消', 'Cancel')),
-                cfg.tokenSet
+                cfg.tokenSaved
                   ? h('button', { type: 'button', style: S.btn, disabled: updBusy, onClick: clearUpdToken }, M('清除已存令牌', 'Clear stored token'))
                   : null,
               ),
@@ -2983,7 +3179,7 @@ window.__ModuleLoader__.load({
               h(Kv, {
                 k: M('更新清单', 'Manifest'),
                 v: cfg.manifestUrlIsDefault
-                  ? M('内置默认（jsDelivr → GitHub raw 依次尝试）', 'Built-in default (jsDelivr → GitHub raw in order)')
+                  ? M('内置默认（GitHub API / gh-proxy / ghfast / GitHub raw 依次尝试）', 'Built-in default (GitHub API / gh-proxy / ghfast / GitHub raw in order)')
                   : (cfg.manifestUrl || '…'),
               }),
               h(Kv, {
@@ -2994,9 +3190,15 @@ window.__ModuleLoader__.load({
               }),
               h(Kv, {
                 k: M('更新令牌', 'Token'),
-                v: cfg.tokenSet
-                  ? M('已配置（只存本机）', 'Set (stored on this machine only)')
-                  : M('未配置（私有库会读不到清单）', 'Not set (private repos cannot be read)'),
+                v: cfg.tokenSource === 'env' && cfg.tokenEnv
+                  ? M(`已从环境变量 ${cfg.tokenEnv} 读取（不落盘、绝不推送）`, `From env var ${cfg.tokenEnv} (not stored, never pushed)`)
+                  : cfg.tokenSource === 'git-credential'
+                    ? M('已从本机 git 凭据自动读取（不落盘、绝不推送）', 'From local git credential (not stored, never pushed)')
+                    : cfg.tokenSource === 'gh-cli'
+                      ? M('已从 GitHub CLI (gh) 自动读取（不落盘、绝不推送）', 'From GitHub CLI (gh) (not stored, never pushed)')
+                      : cfg.tokenSet
+                        ? M('已配置（仅存本机，绝不推送）', 'Set (local only, never pushed)')
+                        : M('未配置（公开库可不填；私有库可用本机 GitHub 登录、$GITHUB_TOKEN 或填入令牌）', 'Not set (optional for public repos; private repos use local GitHub login, $GITHUB_TOKEN, or a token)'),
               }),
               u.remote && u.remote.npmTgzUrls && u.remote.npmTgzUrls.length
                 ? h(Kv, {
@@ -3204,11 +3406,9 @@ window.__ModuleLoader__.load({
       )
 
       const workspaceViewCard = h(WorkspaceViewCard, {})
-      const remoteCard = data ? h(RemoteCard, { data, onSaved: refresh }) : null
+      const cloudCard = data ? h(CloudTargetCard, { data, onSaved: refresh }) : null
       const autoCard = data ? h(AutoCard, { data, onSaved: refresh }) : null
-      // 0.4.0：跨端状态卡（只读）与 WebDAV 同步方式卡
       const platformCard = h(PlatformCard, { data })
-      const webdavCard = h(WebdavCard, { onSaved: refresh })
       // 「还原备份」自己拿 status 里的 backup 段（快照列表），改动后让父层 refresh 重新读
       const restoreCard = data ? h(RestoreCard, { data, onSaved: refresh }) : null
       // 「同步内容」卡自己拉 /config-sync/scope，不依赖 status（status 读的是仓库与本机，跟勾选无关）
@@ -3232,7 +3432,7 @@ window.__ModuleLoader__.load({
             h('div', { ref: headerRef, style: S.pageHeader },
             h('div', { style: S.pageHeaderMain },
               h('div', { style: S.pageTitleRow },
-                h('div', { style: S.pageTitle }, M('配置同步', 'Config Sync')),
+                h('div', { style: S.pageTitle }, M('配置备份与同步', 'Config Backup & Sync')),
                 h('div', { style: S.badgeGroup },
                   h('span', { style: S.badgeKey }, M('本机', 'local')),
                   h('span', { style: chipStyle(summary.kind) }, chipLabel(summary.kind)),
@@ -3256,8 +3456,8 @@ window.__ModuleLoader__.load({
                 ] : h('span', null, summary.text),
               ),
               h('div', { style: S.pageLead },
-                M('配置在本机、仓库、云端之间流转。改完立即生效；写回与还原在退出客户端后执行。',
-                  'Configs flow between this machine, the repo and the cloud. Edits apply at once; write-back and restore run after the client quits.')),
+                M('多端配置备份、同步与还原：本机 → 仓库 → 云端 → 另一台机器。改完立即生效；写回与还原在退出客户端后执行。',
+                  'Multi-device backup, sync and restore: this machine → repo → cloud → another machine. Edits apply at once; write-back and restore run after the client quits.')),
             ),
             h('div', { style: S.headerActions },
               // 「本机路径」区唯一的入口：平时普通按钮，只有根外路径/被覆盖这两类告警才变橙并带数字
@@ -3285,7 +3485,7 @@ window.__ModuleLoader__.load({
                 ...(conflictCard ? [['conflict', M('同步冲突', 'Sync conflicts')]] : []),
                 ...(showRoots ? [['roots', M('本机路径', 'Local paths')]] : []),
                 ['targets', M('同步目标', 'Targets')],
-                ['platform', M('跨端/传输', 'Platform')],
+                ['platform', M('跨端状态', 'Platform')],
                 ['automation', M('自动化', 'Automation')],
                 ['actions', M('生成脚本', 'Scripts')],
                 ['restore', M('还原备份', 'Restore')],
@@ -3336,9 +3536,8 @@ window.__ModuleLoader__.load({
             ? Section(M('同步冲突', 'Sync conflicts'), M('这些文件挡住了拉取：逐项选完保存，再点「立即拉取」', 'These files block the pull: pick per file, save, then pull'), [conflictCard], 'conflict')
             : null,
           Section(M('本机路径', 'Local paths'), M('每台机器确认一次即可：仓库里用占位符，落地时按这里展开', 'Confirm once per machine: the repo stores placeholders, expanded with these paths'), [rootsCard], 'roots'),
-          Section(M('同步目标', 'Sync targets'), M('仓库与远端都是本机设置，改完即生效', 'Repo and remote are local settings, applied at once'), [repoCard, remoteCard].filter(Boolean), 'targets'),
-          // 0.4.0：跨端状态与 WebDAV 方式紧随同步目标，便于「先确认平台、再选传输」
-          Section(M('跨端与同步方式', 'Platform & transport'), M('本机平台、仓库契约来自哪个平台、是否改用 WebDAV', 'Local platform, which platform the contract came from, and whether to use WebDAV'), [platformCard, webdavCard].filter(Boolean), 'platform'),
+          Section(M('同步目标', 'Sync targets'), M('本机仓库、同步方式（Git / WebDAV）与云端目标统一在这里设置', 'Local repo, sync transport (Git / WebDAV), and cloud target settings'), [repoCard, cloudCard].filter(Boolean), 'targets'),
+          Section(M('跨端状态', 'Cross-platform'), M('本机平台、仓库契约来自哪个平台与已登记机器', 'Local platform, which platform the contract came from, and registered machines'), [platformCard].filter(Boolean), 'platform'),
           Section(M('自动化与插件更新', 'Automation & plugin update'), M('退出后自动做什么、插件自己怎么升级', 'What runs automatically after exit, and how the plugin upgrades'), [autoCard, updCard].filter(Boolean), 'automation'),
           Section(M('退出后执行', 'After exit'), M('生成脚本 → 退出客户端后跑一遍', 'Generate the script → it runs after the client quits'), [actionCard], 'actions'),
           Section(M('还原备份', 'Restore backup'), M('点快照 → 确认差异 → 排队还原（退出客户端后执行）', 'Pick a snapshot → confirm the diff → queued restore (runs after the client quits)'), [restoreCard].filter(Boolean), 'restore'),
@@ -3381,7 +3580,13 @@ window.__ModuleLoader__.load({
         try {
           const r = await callRoots()
           setData(r)
-          if (editing) setDraft(snap(r))
+          const next = snap(r)
+          // 两件事一起判：
+          // ① 编辑态下不用服务端值覆盖未保存的草稿（手填的路径会无声消失）；
+          // ② 一个根都没探测到（forced：没路径就先填）时也要把空草稿灌进去，
+          //    否则输入框永远不出现、保存按钮恒 disabled，「首次填根」直接成死局。
+          const noRoots = !(next.appRoot || next.dshHome || next.workspaceHome)
+          if (!draft && (editing || noRoots)) setDraft(next)
         } catch (e) {
           setErr(String((e && e.message) || e))
         } finally { setBusy(false) }
@@ -3633,11 +3838,12 @@ window.__ModuleLoader__.load({
      */
     /** 问题反馈：提交即建 GitHub Issue（label feedback），列表读 Issue，点「已解决」就关单。 */
     function FeedbackCard() {
-      const empty = { connected: false, repo: '', label: 'feedback', items: [], counts: { open: 0, closed: 0, total: 0 }, outbox: [], error: '', ghFile: '', version: '', owner: '', login: '', canClose: false, readAnon: false, note: '' }
+      const empty = { connected: false, repo: '', defaultRepo: '', label: 'feedback', items: [], counts: { open: 0, closed: 0, total: 0 }, outbox: [], error: '', ghFile: '', version: '', owner: '', login: '', canClose: false, readAnon: false, note: '', tokenPresent: false, tokenSource: 'none', tokenEnv: '', tokenSaved: false, envCandidates: [] }
       const [st, setSt] = react.useState(empty)
       const [title, setTitle] = react.useState('')
       const [text, setText] = react.useState('')
       const [token, setToken] = react.useState('')
+      const [repoInput, setRepoInput] = react.useState('')
       const [askToken, setAskToken] = react.useState(false)
       const [busy, setBusy] = react.useState(false)
       const [msg, setMsg] = react.useState('')
@@ -3646,17 +3852,18 @@ window.__ModuleLoader__.load({
       const [filter, setFilter] = react.useState('open')
       const [kw, setKw] = react.useState('')
 
-      const load = async () => {
+      const load = async (forceRefresh = false) => {
         setBusy(true)
         try {
-          const r = await callFeedback(null)
+          const r = await callFeedback(null, forceRefresh ? { query: { refresh: '1' } } : undefined)
           setSt({ ...empty, ...r })
+          if (r && r.repo && !askToken) setRepoInput(String(r.repo))
           setErr(String(r.error || ''))
         } catch (e) {
           setErr(String((e && e.message) || e))
         } finally { setBusy(false) }
       }
-      react.useEffect(() => { load() }, [])
+      react.useEffect(() => { load(false) }, [])
 
       const submit = async () => {
         setBusy(true); setErr(''); setMsg('')
@@ -3680,14 +3887,29 @@ window.__ModuleLoader__.load({
         } finally { setBusy(false) }
       }
 
-      const saveToken = async () => {
+      const saveToken = async (opts = {}) => {
         setBusy(true); setErr(''); setMsg('')
         try {
-          await callFeedback({ token }, { query: { action: 'token' } })
+          const body = { repo: (opts.repo || repoInput || st.repo || '').trim() }
+          if (opts.clearToken) {
+            body.clearToken = true
+            body.clearEnv = Boolean(opts.clearEnv)
+          } else if (opts.tokenEnv) {
+            body.tokenEnv = String(opts.tokenEnv).trim()
+          } else if (token.trim()) {
+            body.token = token.trim()
+          }
+          const res = await callFeedback(body, { query: { action: 'token' } })
           setToken('')
           setAskToken(false)
-          setMsg(M('令牌已存到本机（不进仓库），连接正常。', 'Token saved locally (never committed); connection works.'))
-          await load()
+          if (opts.clearToken) {
+            setMsg(M('已清除本机保存的明文令牌（后续优先读本机环境变量或 git 凭据，绝不推送进同步仓库）。', 'Cleared the stored plaintext token (env vars / git credential will be used instead, never pushed).'))
+          } else if (res && res.tokenSource === 'env') {
+            setMsg(M(`已绑定环境变量 ${res.tokenEnv || ''}（实时读取，不写入明文令牌，绝不推送进同步仓库）。`, `Bound env var ${res.tokenEnv || ''} (read dynamically, no plaintext token saved or pushed).`))
+          } else {
+            setMsg(M('已保存到本机私有配置（绝不推送进同步仓库），连接正常。', 'Saved locally (never committed or pushed); connection works.'))
+          }
+          await load(true)
         } catch (e) {
           setErr(String((e && e.message) || e))
         } finally { setBusy(false) }
@@ -3744,40 +3966,109 @@ window.__ModuleLoader__.load({
         onClick: () => setFilter(key),
       }, label)
 
+      const tokenSourceHint = () => {
+        if (st.note) return st.note
+        if (st.tokenSource === 'env' && st.tokenEnv) {
+          return M(
+            `令牌来源：本机环境变量 ${st.tokenEnv}（实时读取，不落盘、绝不推送进同步仓库）；仓库记在 ${st.ghFile || 'config-sync-gh.json'}`,
+            `Token source: local env var ${st.tokenEnv} (read dynamically, never saved or pushed); repo lives in ${st.ghFile || 'config-sync-gh.json'}`,
+          )
+        }
+        if (st.tokenSource === 'git-credential') {
+          return M(
+            `令牌来源：本机 git 凭据（仅内存使用，不落盘、绝不推送进同步仓库）；仓库记在 ${st.ghFile || 'config-sync-gh.json'}`,
+            `Token source: local git credential (memory only, never saved or pushed); repo lives in ${st.ghFile || 'config-sync-gh.json'}`,
+          )
+        }
+        if (st.tokenSource === 'gh-cli') {
+          return M(
+            `令牌来源：本机 GitHub CLI（gh auth token，仅内存使用，不落盘、绝不推送进同步仓库）；仓库记在 ${st.ghFile || 'config-sync-gh.json'}`,
+            `Token source: local GitHub CLI (gh auth token, memory only, never saved or pushed); repo lives in ${st.ghFile || 'config-sync-gh.json'}`,
+          )
+        }
+        if (st.tokenSaved) {
+          return M(
+            `令牌/仓库记在 ${st.ghFile || 'config-sync-gh.json'}（本机私有，绝不推送进同步仓库；也可改用 $GITHUB_TOKEN）`,
+            `Token and repo live in ${st.ghFile || 'config-sync-gh.json'} (local only, never pushed; or switch to $GITHUB_TOKEN)`,
+          )
+        }
+        return M(
+          `支持读取本机环境变量（DSH_CONFIG_SYNC_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN）；只存仓库与变量名于 ${st.ghFile || 'config-sync-gh.json'}（绝不推送令牌）`,
+          `Supports local env vars (DSH_CONFIG_SYNC_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN); only repo/var name live in ${st.ghFile || 'config-sync-gh.json'} (tokens never pushed)`,
+        )
+      }
+
       return h('div', { style: S.card },
         h('div', { style: S.cardHead },
           h('div', { style: S.cardTitle }, M('问题反馈', 'Feedback')),
           h('div', { style: { flex: 1 } }, null),
           h('span', { style: S.chip }, M(`${open} 待处理 / 共 ${total}`, `${open} open / ${total} total`)),
-          h('button', { type: 'button', style: S.btn, disabled: busy, onClick: load }, busy ? M('刷新中…', 'Refreshing…') : M('刷新', 'Refresh')),
+          h('button', { type: 'button', style: S.btn, disabled: busy, onClick: () => load(true) }, busy ? M('刷新中…', 'Refreshing…') : M('刷新', 'Refresh')),
         ),
         h('div', { style: S.kvRow },
           h('div', { style: S.kvKey }, M('连接', 'Connect')),
           h('div', { style: S.kvVal },
             h('div', null,
-              dot(st.canClose ? 'var(--dsw-alias-state-success-primary, #35a854)' : (st.items.length ? 'var(--dsw-alias-state-warning-primary, #d97706)' : 'var(--dsw-alias-state-error-primary)')),
-              st.canClose
+              dot(st.canClose && st.connected ? 'var(--dsw-alias-state-success-primary, #35a854)' : ((st.items.length || st.tokenPresent) ? 'var(--dsw-alias-state-warn-primary, #d97706)' : 'var(--dsw-alias-state-error-primary)')),
+              st.canClose && st.connected
                 ? M(`GitHub ${st.repo} · 已用 ${st.login} 登录（可提交、可关单）`, `GitHub ${st.repo} · signed in as ${st.login} (can submit and close)`)
                 : st.connected
                   ? M(`GitHub ${st.repo} · 令牌属于 ${st.login || '?'}，不是仓库所有者，只能读和提交`, `GitHub ${st.repo} · token belongs to ${st.login || '?'}, not the repo owner: read and submit only`)
                   : st.readAnon
                     ? M(`GitHub ${st.repo} · 匿名读取（公开仓库，不需要令牌；提交走浏览器）`, `GitHub ${st.repo} · anonymous read (public repo, no token; submit via browser)`)
-                    : M('还没连上 GitHub（令牌没取到或网络不通）', 'Not connected to GitHub (no token or no network)'),
+                    : st.tokenPresent
+                      ? M(`GitHub ${st.repo || st.defaultRepo || 'huanyu-a/dsh-profile-config-sync'} · 已读取本机令牌${st.login ? `（${st.login}）` : ''}，但连不上 GitHub API（请检查网络/代理）`, `GitHub ${st.repo || st.defaultRepo || 'huanyu-a/dsh-profile-config-sync'} · local token loaded${st.login ? ` (${st.login})` : ''}, but cannot reach GitHub API (check network/proxy)`)
+                      : M('还没连上 GitHub（令牌没取到或网络不通）', 'Not connected to GitHub (no token or no network)'),
             ),
-            h('div', { style: S.footnote },
-              st.note || (st.ghFile ? M(`令牌/仓库记在 ${st.ghFile}（本机私有，不进仓库）`, `Token and repo live in ${st.ghFile} (local only, never committed)`) : null)),
+            h('div', { style: S.footnote }, tokenSourceHint()),
           ),
         ),
-        (askToken || !st.connected)
-          ? h('div', { style: S.kvRow },
-            h('div', { style: S.kvKey }, M('令牌', 'Token')),
-            h('div', { style: { ...S.kvVal, display: 'flex', gap: '8px' } },
-              h('input', {
-                type: 'password', style: S.input, value: token, spellCheck: false, autoComplete: 'off',
-                placeholder: M('粘贴 GitHub 令牌（一次即可；留空则读本机 git 凭据）', 'Paste a GitHub token (once); leave empty to reuse the local git credential'),
-                onChange: (e) => setToken(e.target.value),
-              }),
-              h('button', { type: 'button', style: S.btnPrimary, disabled: busy || !token.trim(), onClick: saveToken }, M('保存', 'Save')),
+        (askToken || (!st.connected && !st.tokenPresent))
+          ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+            h('div', { style: S.kvRow },
+              h('div', { style: S.kvKey }, M('仓库', 'Repo')),
+              h('div', { style: { ...S.kvVal, display: 'flex', gap: '8px', alignItems: 'center' } },
+                h('input', {
+                  type: 'text', style: S.input, value: repoInput, spellCheck: false,
+                  placeholder: st.defaultRepo || 'huanyu-a/dsh-profile-config-sync',
+                  onChange: (e) => setRepoInput(e.target.value),
+                }),
+                st.defaultRepo && repoInput.trim() !== st.defaultRepo
+                  ? h('button', {
+                    type: 'button', style: S.btn, disabled: busy,
+                    onClick: () => { setRepoInput(st.defaultRepo); saveToken({ repo: st.defaultRepo }) },
+                  }, M(`改用 ${st.defaultRepo}`, `Use ${st.defaultRepo}`))
+                  : null,
+              ),
+            ),
+            h('div', { style: S.kvRow },
+              h('div', { style: S.kvKey }, M('令牌', 'Token')),
+              h('div', { style: { ...S.kvVal, display: 'flex', flexDirection: 'column', gap: '6px' } },
+                h('div', { style: { display: 'flex', gap: '8px' } },
+                  h('input', {
+                    type: 'password', style: S.input, value: token, spellCheck: false, autoComplete: 'off',
+                    placeholder: M('填 $GITHUB_TOKEN / env:GH_TOKEN 读环境变量，或粘贴令牌（留空也可只改仓库）', 'Enter $GITHUB_TOKEN / env:GH_TOKEN for env var, or paste a token'),
+                    onChange: (e) => setToken(e.target.value),
+                  }),
+                  h('button', {
+                    type: 'button', style: S.btnPrimary,
+                    disabled: busy || (!token.trim() && repoInput.trim() === String(st.repo || '')),
+                    onClick: () => saveToken(),
+                  }, M('保存', 'Save')),
+                ),
+                h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } },
+                  ...(Array.isArray(st.envCandidates) ? st.envCandidates : []).map((envName) => h('button', {
+                    key: envName, type: 'button', style: S.btn, disabled: busy,
+                    onClick: () => saveToken({ tokenEnv: envName }),
+                  }, M(`使用环境变量 ${envName}`, `Use env ${envName}`))),
+                  st.tokenSaved
+                    ? h('button', {
+                      type: 'button', style: S.btn, disabled: busy,
+                      onClick: () => saveToken({ clearToken: true }),
+                    }, M('清除已存令牌（改用环境变量）', 'Clear saved token (use env)'))
+                    : null,
+                ),
+              ),
             ),
           )
           : null,
@@ -3914,7 +4205,7 @@ window.__ModuleLoader__.load({
 
       const head = h('div', { style: S.head },
         h('div', { style: S.headText },
-          h('div', { style: S.title }, M('配置同步', 'Config Sync')),
+          h('div', { style: S.title }, M('配置备份与同步', 'Config Backup & Sync')),
           h('div', { style: S.sub }, busy ? M('检测中…', 'Checking…') : summary.text),
           data ? h('div', { style: S.sub }, `app ${data.version.local || '?'} / ${M('契约', 'contract')} ${data.version.contract || '?'}`) : null,
         ),
@@ -4057,7 +4348,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           cache: 'no-store',
           credentials: 'same-origin',
-          headers: jsonHeaders,
+          headers: jsonHeaders(),
           body: JSON.stringify({ action: 'busy', sessionId: sessionId || '' }),
         })
         if (!res.ok) return false
@@ -4108,7 +4399,7 @@ window.__ModuleLoader__.load({
             name: 'sidebar.panellist',
             id: PANEL_ID,
             order: 35,
-            label: () => M('配置同步', 'Config Sync'),
+            label: () => M('配置备份与同步', 'Config Backup & Sync'),
             locale: 'config-sync',
           }, SidebarIcon)
           return () => {

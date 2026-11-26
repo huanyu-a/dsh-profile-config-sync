@@ -115,9 +115,24 @@ async function request(url, w, init = {}, timeoutMs = 30000) {
   }
 }
 
+/**
+ * 读完响应体，带**独立**超时。
+ *
+ * fetch 的超时（request() 里的 AbortController）只管到「响应头到手」，之后 body 卡住不会再有超时：
+ * 实测遇到服务端先回 200 再停住不发的 PROPFIND，整条同步流水线就永久挂着（进程不退、面板一直转）。
+ * 所以读 body 单独计时。
+ */
+function withBodyTimeout(promise, timeoutMs = 30000, label = '读取响应体') {
+  let timer = null
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}超时（${Math.round(timeoutMs / 1000)}s）`)), timeoutMs)
+  })
+  return Promise.race([promise, timeout]).finally(() => { if (timer) clearTimeout(timer) })
+}
+
 /** 文本响应（错误信息里要带服务端原文，便于定位）。 */
 async function textOf(res) {
-  try { return (await res.text()).slice(0, 400) } catch { return '' }
+  try { return (await withBodyTimeout(res.text(), 30000, '读取错误响应')).slice(0, 400) } catch { return '' }
 }
 
 /**
@@ -181,10 +196,12 @@ export async function listRemote(w, relDir = '') {
       if (res.status === 404) return { entries: new Map(), exists: false }
       return null
     }
-    const xml = await res.text()
-    // 解析基准 = webdavDir + relDir（与 href 里的实际路径对齐）
-    const base = [String(w.dir || '').replace(/^\/+|\/+$/g, ''), String(relDir || '').replace(/^\/+|\/+$/g, '')]
-      .filter(Boolean).join('/')
+    const xml = await withBodyTimeout(res.text(), 60000, `PROPFIND 响应`)
+    // 解析基准必须是**请求 URL 的真实路径**，不能只用 w.dir：
+    // WebDAV 根经常带路径前缀（Nextcloud 的 /remote.php/dav/files/<user>、坚果云的 /dav、Alist 的 /dav），
+    // 服务端回的 href 里带着那段前缀，只拿 dir 去比 parent 永远对不上 → 列目录恒为空，
+    // 后果是 pull 报「云端还是空的」、push 每轮全量重传。
+    const base = requestPathBase(url, w, relDir)
     return { entries: parsePropfind(xml, w, base), exists: true }
   } catch {
     return null
@@ -212,7 +229,15 @@ function parsePropfind(xml, w, relDir) {
     if (!clean) continue
     const lastSlash = clean.lastIndexOf('/')
     const parent = lastSlash >= 0 ? clean.slice(0, lastSlash) : ''
-    if (parent !== baseDir) continue
+    // 基准对齐：正常情况 parent 精确等于基准；反向代理把路径改写成别的前缀时，
+    // 两者可能互为后缀（请求 /dav/dsh-config-sync，href 却是 /dsh-config-sync/x），也认。
+    // 直接返回「不带斜杠的相对 href」时 parent 为空，同样属于当前目录。
+    const flat = lastSlash < 0
+    const sameDir = flat
+      || parent === baseDir
+      || (baseDir && parent.endsWith('/' + baseDir))
+      || (parent && baseDir.endsWith('/' + parent))
+    if (!sameDir) continue
     const name = lastSlash >= 0 ? clean.slice(lastSlash + 1) : clean
     if (!name) continue
     // 目录（collection）跳过：我们只同步文件
@@ -236,6 +261,20 @@ function parsePropfind(xml, w, relDir) {
  */
 function normalizeHrefs(p) {
   return String(p).replace(/\/{2,}/g, '/').replace(/^\/+|\/+$/g, '')
+}
+
+/**
+ * PROPFIND 响应里的 href 是「服务端视角的绝对路径」，可能带着 WebDAV 根的路径前缀。
+ * 解析基准必须取自**本次请求 URL 的真实路径**，不能用 w.dir：带前缀的服务器
+ * （Nextcloud / 坚果云 / Alist）会因此一个子目录都列不出来。
+ */
+function requestPathBase(url, w, relDir) {
+  try {
+    return normalizeHrefs(decodeURIComponent(new URL(url).pathname))
+  } catch {
+    return [String(w && w.dir ? w.dir : '').replace(/^\/+|\/+$/g, ''), String(relDir || '').replace(/^\/+|\/+$/g, '')]
+      .filter(Boolean).join('/')
+  }
 }
 
 /** 取某个标签的内容（容忍前缀）。 */
@@ -267,7 +306,7 @@ export async function getFile(w, relPath) {
   try {
     const res = await request(url, w, {}, 120000)
     if (!res.ok) return null
-    const buf = Buffer.from(await res.arrayBuffer())
+    const buf = Buffer.from(await withBodyTimeout(res.arrayBuffer(), 120000, `下载响应`))
     return buf
   } catch {
     return null
@@ -303,7 +342,90 @@ export function listLocalFiles(root) {
   return out
 }
 
+
+/**
+ * 浏览器剖面 / 凭据库：这些东西一旦进仓库就等于把登录态搬走了。
+ * 需要的只是插件的小配置，不需要整份 Edge/Chrome 用户目录。
+ *   browser-profiles —— 插件把 CDP 用的剖面存在这里（本机实测 297 MB、3,696 个文件）；
+ *   User Data        —— Chromium 系默认剖面目录名；
+ *   Login Data / Cookies / Web Data / Secure Preferences / Local State / History —— 密码库、
+ *                       登录态、自动填充、受保护设置、浏览器主库。
+ * 只看路径段（不区分大小写），所以深层嵌套也拦得住。
+ */
+const BLOCKED_PROFILE_SEGMENTS = new Set([
+  'browser-profiles', 'user data', 'login data', 'login data for account',
+  'cookies', 'cookies-journal', 'web data', 'web data-journal', 'secure preferences',
+  'local state', 'history', 'history-journal', 'top sites', 'current session', 'current tabs',
+])
+/** 单文件上限：超过就别传（NAS 与 git 都受不了，且这类文件基本是缓存/数据库）。 */
+const MAX_SYNC_FILE_BYTES = 32 * 1024 * 1024
+
+function blockedProfilePath(rel) {
+  const parts = String(rel || '').split('/').filter(Boolean)
+  return parts.some((seg) => BLOCKED_PROFILE_SEGMENTS.has(String(seg).toLowerCase()))
+}
+const PRIVATE_SECRET_FILES = new Set([
+  'config-sync-gh.json',
+  'config-sync-feedback-outbox.json',
+  'dsh-config-sync.json',
+  'config-sync-state.json',
+  'config-sync-roots.json',
+  'config-sync-scope.json',
+  'config-sync-delete-cloud.json',
+  'config-sync-extra.json',
+  'sync-notices.json',
+  '.credentials.yaml',
+  '.env',
+  'dsh-ssh-master.key',
+])
+const SELF_RUNTIME_FILES = new Set([
+  'apply.ps1', 'capture.ps1', 'dsh-sync-common.ps1', 'post-exit.ps1',
+  'restore.ps1', 'sync.ps1', 'webdav.mjs', 'sync-engine.mjs',
+])
+const GH_TOKEN_RE = /gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}/
+
+/**
+ * 上传前的拦截判定，**带原因**。
+ *
+ * 以前只返回 true/false，调用方统一打印「安全拦截：跳过含令牌或本机私有凭据的文件」。
+ * 但「体积超过 32MB」和「浏览器剖面」都不是凭据问题，用同一句话会把用户吓去查令牌 ——
+ * 实测一个 40MB 的插件数据文件会得到「含令牌」的指控。所以这里把原因分开：
+ *   secret    —— 真的像凭据（文件名/内容命中）
+ *   profile   —— 浏览器剖面 / 凭据库（Login Data、Cookies…）
+ *   too-big   —— 超过单文件上限，不是安全问题，只是不该走 WebDAV
+ */
+export function secretSkipReason(rel, buf) {
+  const leaf = String(rel || '').split('/').pop().toLowerCase()
+  if (PRIVATE_SECRET_FILES.has(leaf) || leaf.startsWith('.env.') || /\.(pem|key|p12|pfx)$/.test(leaf)) return 'secret'
+  // 浏览器剖面 / 凭据库：无论它是怎么进到仓库里的（老版本抓的、手动拷的），都不上传
+  if (blockedProfilePath(rel)) return 'profile'
+  // 超大文件不上传：NAS 扛不住，且这类体积基本是缓存/数据库（不是安全问题，别冤枉用户的令牌）
+  if (buf && buf.length > MAX_SYNC_FILE_BYTES) return 'too-big'
+  // 插件自己的运行脚本不拦（它们本身就含 env 名，容易命中下面的内容扫描）
+  if (SELF_RUNTIME_FILES.has(String(rel || '').replace(/^\.\//, ''))) return ''
+  if (!buf || buf.length > 8 * 1024 * 1024) return ''
+  const slice = buf.subarray(0, Math.min(buf.length, 65536))
+  if (slice.includes(0)) return ''
+  const text = slice.toString('utf8')
+  if (GH_TOKEN_RE.test(text)) return 'secret'
+  for (const envName of ['DSH_CONFIG_SYNC_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) {
+    const val = String(process.env[envName] || '').trim()
+    if (val.length >= 12 && text.includes(val)) return 'secret'
+  }
+  return ''
+}
+
+/** 兼容包装：只需要「拦不拦」的调用方继续用它。 */
+function isSecretLeakCandidate(rel, buf) {
+  return secretSkipReason(rel, buf) !== ''
+}
+
+
 /** 文件内容哈希（用于判断是否需要上传/下载）。 */
+export function isBlockedProfilePath(rel) { return blockedProfilePath(rel) }
+export const BLOCKED_SEGMENTS = BLOCKED_PROFILE_SEGMENTS
+export const MAX_FILE_BYTES = MAX_SYNC_FILE_BYTES
+
 export function contentHash(buf) {
   return createHash('sha256').update(buf).digest('hex')
 }
@@ -315,7 +437,7 @@ export function contentHash(buf) {
  * —— 那可能是另一台机器推上去的，删了就等于抢别人的配置。
  * 返回 { ok, uploaded, skipped, errors }。
  */
-export async function uploadRepo(w, localRepo, { dryRun = false } = {}) {
+export async function uploadRepo(w, localRepo, { dryRun = false, onProgress = null } = {}) {
   const uploaded = [], skipped = [], errors = []
   if (!w.enabled) return { ok: false, uploaded, skipped, errors: ['WebDAV 未配置'] }
 
@@ -334,15 +456,28 @@ export async function uploadRepo(w, localRepo, { dryRun = false } = {}) {
     return { ok: false, uploaded, skipped, errors: [...errors, '读不到云端目录（PROPFIND 失败）'] }
   }
 
-  const remoteFiles = remote.exists ? await listRemoteRecursive(w, '') : []
-  const remoteMeta = await listRemoteMeta(w, '')
-  const remoteSet = new Set(remoteFiles)
+  const remoteMeta = remote.exists ? await listRemoteMeta(w, '') : new Map()
+  const remoteSet = new Set(remoteMeta.keys())
+  const ensuredDirs = new Set()
 
   const files = listLocalFiles(localRepo)
-  for (const rel of files) {
+  if (typeof onProgress === 'function') {
+    try { onProgress({ phase: 'scan', done: 0, total: files.length, uploaded: 0, skipped: 0, errors: 0 }) } catch { }
+  }
+  let lastReportAt = 0
+  for (let idx = 0; idx < files.length; idx++) {
+    const rel = files[idx]
     let buf
     try { buf = readFileSync(join(localRepo, fromRepoRel(rel))) } catch (e) {
       errors.push(`${rel}: ${e && e.message ? e.message : e}`)
+      continue
+    }
+    const skipReason = secretSkipReason(rel, buf)
+    if (skipReason) {
+      skipped.push(rel)
+      if (skipReason === 'secret') console.log(`  [!] 安全拦截：跳过含令牌或本机私有凭据的文件 ${rel}（绝不上传）`)
+      else if (skipReason === 'profile') console.log(`  [!] 安全拦截：跳过浏览器剖面 / 凭据库文件 ${rel}（含登录态，绝不上传）`)
+      else console.log(`  [!] 体积超限：${rel} 超过单文件上限 ${Math.round(MAX_SYNC_FILE_BYTES / 1048576)}MB，未上传（不是安全问题；需要它请用 git 模式）`)
       continue
     }
     // 远端有同名文件：只在内容**真的**相同时跳过。
@@ -355,18 +490,39 @@ export async function uploadRepo(w, localRepo, { dryRun = false } = {}) {
       const meta = remoteMeta.get(rel)
       if (meta && meta.size === buf.length) {
         const remoteBuf = await getFile(w, rel)
-        if (remoteBuf && contentHash(remoteBuf) === contentHash(buf)) { skipped.push(rel); continue }
+        if (remoteBuf && contentHash(remoteBuf) === contentHash(buf)) {
+          skipped.push(rel)
+          if (typeof onProgress === 'function') {
+            const now = Date.now()
+            if (idx + 1 === files.length || now - lastReportAt >= 1200) {
+              lastReportAt = now
+              try { onProgress({ phase: 'upload', done: idx + 1, total: files.length, uploaded: uploaded.length, skipped: skipped.length, errors: errors.length, current: rel }) } catch { }
+            }
+          }
+          continue
+        }
       }
     }
     if (dryRun) { uploaded.push(rel); continue }
     const dir = dirname(rel).split('/').filter(Boolean)
-    // 逐级建目录（WebDAV 不自动建父级）
+    // 逐级建目录（WebDAV 不自动建父级），同一会话内缓存已建路径避免重复 MKCOL
     for (let i = 1; i <= dir.length; i++) {
-      await ensureRemoteDir(w, dir.slice(0, i).join('/'))
+      const sub = dir.slice(0, i).join('/')
+      if (!ensuredDirs.has(sub)) {
+        const mr = await ensureRemoteDir(w, sub)
+        if (mr.ok) ensuredDirs.add(sub)
+      }
     }
     const r = await putFile(w, rel, buf)
     if (r.ok) uploaded.push(rel)
     else errors.push(`${rel}: ${r.error || r.status}`)
+    if (typeof onProgress === 'function') {
+      const now = Date.now()
+      if (idx + 1 === files.length || now - lastReportAt >= 1200) {
+        lastReportAt = now
+        try { onProgress({ phase: 'upload', done: idx + 1, total: files.length, uploaded: uploaded.length, skipped: skipped.length, errors: errors.length, current: rel }) } catch { }
+      }
+    }
   }
   return { ok: errors.length === 0, uploaded, skipped, errors, hashHint: files.length }
 }
@@ -392,6 +548,11 @@ export async function downloadRepo(w, localRepo, { dryRun = false } = {}) {
   // 递归列云端全部文件（PROPFIND Depth:1 只给一层，这里逐目录下钻）
   const all = await listRemoteRecursive(w, '')
   for (const rel of all) {
+    // 先判路径再取内容：越界路径连请求都不该发（`..` 会把 URL 拼成上一级，白拿一次 404）
+    if (!isSafeRemoteRel(rel)) {
+      errors.push(`${rel}: 云端返回了越界路径（可能指向仓库之外），已拒绝写入`)
+      continue
+    }
     const buf = await getFile(w, rel)
     if (!buf) { errors.push(`${rel}: 下载失败`); continue }
     const localPath = join(localRepo, fromRepoRel(rel))
@@ -462,9 +623,9 @@ async function listRemoteDirs(w, relDir = '') {
     }, 45000)
     if (!res.ok && res.status !== 207) return []
     if (res.status === 404) return []
-    const xml = await res.text()
-    const baseDir = [String(w.dir || '').replace(/^\/+|\/+$/g, ''), String(relDir || '').replace(/^\/+|\/+$/g, '')]
-      .filter(Boolean).join('/')
+    const xml = await withBodyTimeout(res.text(), 60000, `PROPFIND 响应`)
+    // 与 listRemote 共用基准：必须取请求 URL 的真实路径，否则带前缀的 WebDAV 永远列不到子目录
+    const baseDir = requestPathBase(url, w, relDir)
     const dirs = []
     const blocks = String(xml).split(/<(?:\w+:)?response[\s>]/i).slice(1)
     for (const block of blocks) {
@@ -477,7 +638,13 @@ async function listRemoteDirs(w, relDir = '') {
       const lastSlash = clean.lastIndexOf('/')
       const parent = lastSlash >= 0 ? clean.slice(0, lastSlash) : ''
       const name = lastSlash >= 0 ? clean.slice(lastSlash + 1) : clean
-      if (!name || parent !== baseDir) continue
+      // 反向代理改写前缀时，两者可能互为后缀；不带斜杠的裸 href 视为当前目录
+      const flat = lastSlash < 0
+      const sameDir = flat
+        || parent === baseDir
+        || (baseDir && parent.endsWith('/' + baseDir))
+        || (parent && baseDir.endsWith('/' + parent))
+      if (!name || !sameDir) continue
       const isCollection = /<(?:\w+:)?collection\s*\/?>/i.test(block)
       if (isCollection) dirs.push(name)
     }
@@ -495,6 +662,22 @@ async function listRemoteDirs(w, relDir = '') {
  */
 function fromRepoRel(rel) {
   return String(rel).split('/').join(SEP)
+}
+
+/**
+ * 远端给的相对路径必须真的留在仓库目录内。
+ *
+ * href 是服务端可控字符串：配置错误/恶意的 WebDAV（或被改写的反代）可以回
+ * `..%2F..%2Fevil.txt`，直接 join 就会写到仓库外面。这里按段判定，
+ * 越界（.. / 空段 / 绝对路径 / 盘符 / NUL）一律拒收。
+ */
+function isSafeRemoteRel(rel) {
+  const s = String(rel || '')
+  if (!s || s.length > 1024) return false
+  if (s.includes('\0')) return false
+  if (/^[\\/]/.test(s)) return false
+  if (/^[A-Za-z]:/.test(s)) return false
+  return !s.split(/[\\/]/).some((seg) => seg === '..' || seg === '')
 }
 
 /** 连通性测试（面板「测试连接」与探云端是否为空共用）。 */
@@ -531,19 +714,54 @@ function parseCliArgs(argv) {
   return out
 }
 
+/** 只认识的参数；打错字（-DshHme）时明确提示，而不是静默用默认值跑错目录。 */
+function warnUnknownArgs(args, known, usage) {
+  const extra = Object.keys(args).filter((k) => !known.includes(k))
+  if (!extra.length) return
+  console.error(`[!] 未知参数：${extra.map((k) => '-' + k).join(', ')}（已忽略；用法：${usage}）`)
+}
+
 function readLocalSettings(dshHome) {
   const p = join(dshHome, 'dsh-config-sync.json')
   if (!existsSync(p)) return {}
-  return JSON.parse(readFileSync(p, 'utf8').replace(/^\uFEFF/, ''))
+  try {
+    const doc = JSON.parse(readFileSync(p, 'utf8').replace(/^\uFEFF/, ''))
+    return doc && typeof doc === 'object' ? doc : {}
+  } catch (e) {
+    // 设置文件被手改坏（多一个逗号 / 截断）时不要整个同步崩掉：
+    // 走默认值（= 未配置 WebDAV）并明确说清楚，否则 CLI 只吐一堆 JSON 解析堆栈，用户看不懂。
+    console.error(`设置文件不是合法 JSON：${p}（${e && e.message ? e.message : e}）；按未配置 WebDAV 处理`)
+    return {}
+  }
+}
+
+export async function deletePrefixes(w, prefixes = []) {
+  const clean = [...new Set((prefixes || []).map((p) => String(p || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')).filter(Boolean))]
+  const deleted = [], errors = []
+  if (!w.enabled || !clean.length) return { ok: true, deleted, errors }
+  for (const p of clean) {
+    if (!isSafeRemoteRel(p)) { errors.push(`${p}: 越界路径，已拒绝`); continue }
+  }
+  const remoteMeta = await listRemoteMeta(w, '')
+  const keys = [...remoteMeta.keys()]
+  for (const k of keys) {
+    if (clean.some((p) => k === p || k.startsWith(p + '/'))) {
+      const r = await deleteRemote(w, k)
+      if (r.ok) deleted.push(k)
+      else errors.push(`${k}: ${r.error || r.status}`)
+    }
+  }
+  return { ok: errors.length === 0, deleted, errors }
 }
 
 export async function runWebdavCli(argv) {
   const [cmd, ...rest] = argv
   const a = parseCliArgs(rest)
+  warnUnknownArgs(a, ['DshHome', 'dshHome', 'RepoRoot', 'repoRoot', 'PathsFile', 'pathsFile'], 'node webdav.mjs <probe|upload|download|delete-paths> -DshHome <dir> -RepoRoot <dir>')
   const dshHome = a.DshHome || a.dshHome || process.env.DSH_HOME || join(homedir(), '.dsh')
   const repoRoot = a.RepoRoot || a.repoRoot || process.cwd()
-  if (!cmd || !['probe', 'upload', 'download'].includes(cmd)) {
-    console.error('用法：node webdav.mjs <probe|upload|download> -DshHome <dir> -RepoRoot <dir>')
+  if (!cmd || !['probe', 'upload', 'download', 'delete-paths'].includes(cmd)) {
+    console.error('用法：node webdav.mjs <probe|upload|download|delete-paths> -DshHome <dir> -RepoRoot <dir>')
     return 2
   }
   const settings = readLocalSettings(dshHome)
@@ -562,7 +780,15 @@ export async function runWebdavCli(argv) {
       console.error('WebDAV 地址不是 https（明文传输密码有风险）；确需使用请设 DSH_SYNC_ALLOW_INSECURE=1')
       return 1
     }
-    const r = await uploadRepo(w, repoRoot)
+    const r = await uploadRepo(w, repoRoot, {
+      onProgress: (p) => {
+        if (p.phase === 'scan') {
+          console.log(`上传扫描：共 ${p.total} 个文件`)
+        } else {
+          console.log(`上传进度：${p.done}/${p.total}（已上传 ${p.uploaded} · 跳过 ${p.skipped}${p.errors ? ` · 失败 ${p.errors}` : ''}）`)
+        }
+      },
+    })
     console.log(`WebDAV 上传：上传 ${r.uploaded.length} · 跳过 ${r.skipped.length} · 错误 ${r.errors.length}`)
     for (const e of r.errors.slice(0, 20)) console.error(`  [!] ${e}`)
     return r.ok ? 0 : 1
@@ -574,6 +800,26 @@ export async function runWebdavCli(argv) {
     }
     const r = await downloadRepo(w, repoRoot)
     console.log(`WebDAV 下载：下载 ${r.downloaded.length} · 跳过 ${r.skipped.length} · 冲突 ${r.conflicts.length} · 错误 ${r.errors.length}`)
+    for (const e of r.errors.slice(0, 20)) console.error(`  [!] ${e}`)
+    return r.ok ? 0 : 1
+  }
+  if (cmd === 'delete-paths') {
+    if (!isSecureUrl(w.url)) {
+      console.error('WebDAV 地址不是 https（明文传输密码有风险）；确需使用请设 DSH_SYNC_ALLOW_INSECURE=1')
+      return 1
+    }
+    const pf = a.PathsFile || a.pathsFile || join(dshHome, 'config-sync-delete-cloud.json')
+    let prefixes = []
+    if (existsSync(pf)) {
+      try {
+        const doc = JSON.parse(readFileSync(pf, 'utf8').replace(/^\uFEFF/, ''))
+        if (Array.isArray(doc?.prefixes)) prefixes = doc.prefixes
+      } catch { }
+    }
+    const r = await deletePrefixes(w, prefixes)
+    if (r.deleted.length || r.errors.length) {
+      console.log(`WebDAV 清理云端未勾选副本：删除 ${r.deleted.length} · 错误 ${r.errors.length}`)
+    }
     for (const e of r.errors.slice(0, 20)) console.error(`  [!] ${e}`)
     return r.ok ? 0 : 1
   }
