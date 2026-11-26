@@ -2,6 +2,13 @@
 
 > **dsh-profile-config-sync** — multi-device configuration **backup / sync / restore** for the DeepSeek Harness desktop client.
 
+[![npm](https://img.shields.io/npm/v/dsh-profile-config-sync?style=flat-square&logo=npm&logoColor=white&label=npm&color=cb3837)](https://www.npmjs.com/package/dsh-profile-config-sync)
+[![release](https://img.shields.io/github/v/release/huanyu-a/dsh-profile-config-sync?style=flat-square&label=release&color=2f81f7)](https://github.com/huanyu-a/dsh-profile-config-sync/releases/latest)
+[![license](https://img.shields.io/github/license/huanyu-a/dsh-profile-config-sync?style=flat-square&color=3fb950)](LICENSE)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-8957e5?style=flat-square)](#sync-scope)
+[![groups](https://img.shields.io/badge/sync%20scope-12%20groups-1f6feb?style=flat-square)](#sync-scope)
+[![tests](https://img.shields.io/badge/self--check-64%20suites%20%C2%B7%201065%20asserts-3fb950?style=flat-square)](https://github.com/huanyu-a/dsh-profile-config-sync/blob/main/docs/CHANGELOG.md)
+
 [中文](README.md) | English
 
 DSH keeps its configuration in a dozen places under `~/.dsh`: the profile, the global prompt, skills, agent presets, plugin settings, plugin data, workspaces and session logs.

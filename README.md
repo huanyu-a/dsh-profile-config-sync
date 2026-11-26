@@ -2,6 +2,13 @@
 
 > **dsh-profile-config-sync** —— DeepSeek Harness 客户端的**多端配置备份 / 同步 / 还原**插件。
 
+[![npm](https://img.shields.io/npm/v/dsh-profile-config-sync?style=flat-square&logo=npm&logoColor=white&label=npm&color=cb3837)](https://www.npmjs.com/package/dsh-profile-config-sync)
+[![release](https://img.shields.io/github/v/release/huanyu-a/dsh-profile-config-sync?style=flat-square&label=release&color=2f81f7)](https://github.com/huanyu-a/dsh-profile-config-sync/releases/latest)
+[![license](https://img.shields.io/github/license/huanyu-a/dsh-profile-config-sync?style=flat-square&color=3fb950)](LICENSE)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-8957e5?style=flat-square)](#同步内容勾选)
+[![groups](https://img.shields.io/badge/%E5%90%8C%E6%AD%A5%E5%86%85%E5%AE%B9-12%20%E7%BB%84-1f6feb?style=flat-square)](#同步内容勾选)
+[![tests](https://img.shields.io/badge/%E8%87%AA%E6%A3%80-64%20%E5%A5%97%20%C2%B7%201065%20%E6%9D%A1-3fb950?style=flat-square)](#自检)
+
 中文 | [English](README.en.md)
 
 DSH 的配置散在 `~/.dsh` 的十几处：profile、全局提示、Skills、Agent 预设、插件设置、插件数据、工作区、会话记录。
