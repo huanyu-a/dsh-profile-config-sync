@@ -12,12 +12,12 @@
     {
       "name": "dsh-profile-config-sync",
       "title": {
-        "en": "Config Sync",
-        "zh": "配置同步"
+        "en": "Config Backup & Sync",
+        "zh": "配置备份与同步"
       },
       "description": {
-        "zh": "多机、跨系统 DSH 配置同步：本机与云端仓库的差异一目了然——改了哪些文件、提交领先还是落后、哪些会话和技能还没同步，一键生成退出后执行的推送、拉取、还原脚本。支持 Windows（PowerShell）、macOS 与 Linux（Node 引擎），并可用 WebDAV 代替 git。拉取被本地改动挡住时两侧都留底、逐项选保留哪边；每次应用前自动备份，配置快照、插件备份、会话备份都能一键还原，装坏的插件也能整份回滚。",
-        "en": "Multi-machine, cross-platform DSH config sync: see exactly how this machine differs from the cloud config repo — changed files, commits ahead or behind, sessions and skills not synced yet — then generate the push, pull and restore scripts that run after the client exits. Runs on Windows (PowerShell), macOS and Linux (Node engine), and can use WebDAV instead of git. A blocked pull keeps both sides and lets you pick file by file; every apply snapshots the profile first, and config snapshots, plugin backups and session backups all restore in one click, including rolling back a broken plugin install."
+        "zh": "多终端 DSH 配置备份、同步与还原：把 profile、全局提示、Skills、预设、插件设置与数据、工作区与会话等 12 组内容抓成一份 Git 仓库快照，推送到自有 Git 远端或 WebDAV；换机、重装、误改都能一条命令拉回并铺开。同步动作在客户端退出后执行，覆盖前先留底；浏览器剖面与凭据库三处硬拦，永不入库。",
+        "en": "Multi-device DSH configuration backup, sync and restore: capture the profile, global prompt, skills, presets, plugin settings and data, workspaces and sessions — 12 groups — into one Git snapshot, pushed to your own Git remote or WebDAV. Reinstall, switch machines or undo a bad edit with one command. Sync runs after the client exits, files are backed up before being overwritten, and browser profiles / credential stores are blocked at three layers so they never enter the repo."
       },
       "icon": "https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/docs/panel.png",
       "author": "huanyu-a",
@@ -27,12 +27,12 @@
       },
       "versions": [
         {
-          "version": "0.4.0",
-          "publishTimestamp": 1795536948595,
+          "version": "0.6.39",
+          "publishTimestamp": 1795681161617,
           "source": {
             "type": "git",
             "url": "https://github.com/huanyu-a/dsh-profile-config-sync",
-            "commit": ""
+            "commit": "83bf0fbbb4f77df6d67f713fbea730424a1bac91"
           }
         }
       ]
