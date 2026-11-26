@@ -19,7 +19,7 @@
         "zh": "多终端 DSH 配置备份、同步与还原：把 profile、全局提示、Skills、预设、插件设置与数据、工作区与会话等 12 组内容抓成一份 Git 仓库快照，推送到自有 Git 远端或 WebDAV；换机、重装、误改都能一条命令拉回并铺开。同步动作在客户端退出后执行，覆盖前先留底；浏览器剖面与凭据库三处硬拦，永不入库。",
         "en": "Multi-device DSH configuration backup, sync and restore: capture the profile, global prompt, skills, presets, plugin settings and data, workspaces and sessions — 12 groups — into one Git snapshot, pushed to your own Git remote or WebDAV. Reinstall, switch machines or undo a bad edit with one command. Sync runs after the client exits, files are backed up before being overwritten, and browser profiles / credential stores are blocked at three layers so they never enter the repo."
       },
-      "icon": "https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/docs/panel.png",
+      "icon": "https://raw.githubusercontent.com/huanyu-a/dsh-profile-config-sync/main/docs/icon-180.png",
       "author": "huanyu-a",
       "homepage": "https://github.com/huanyu-a/dsh-profile-config-sync#readme",
       "repository": {
@@ -27,12 +27,12 @@
       },
       "versions": [
         {
-          "version": "0.6.40",
-          "publishTimestamp": 1795681962277,
+          "version": "0.6.41",
+          "publishTimestamp": 1795686343151,
           "source": {
             "type": "git",
             "url": "https://github.com/huanyu-a/dsh-profile-config-sync",
-            "commit": "dc0bd3bd3b62c505691fb0b2c23e61a299c2479d"
+            "commit": ""
           }
         }
       ]

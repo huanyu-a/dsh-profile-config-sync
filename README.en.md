@@ -46,9 +46,9 @@ Package name **`dsh-profile-config-sync`** (the npm package `dsh-config-sync` is
 |---|---|
 | npm | `npm i dsh-profile-config-sync` — **npm only has `0.4.1`**, without the 0.6.x safety fixes |
 | Plugin market | Search “Config Backup & Sync” in the client's plugin market (via the git commit registered in `market-index.json`) |
-| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.40.tgz` |
+| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.41.tgz` |
 
-**Release status**: the latest release is [`v0.6.40`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.40) (2026-11-26) and the repository is public; the npm package is awaiting publish approval.
+**Release status**: the latest release is [`v0.6.41`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.41) (2026-11-26); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
 
 ## Known limits
 

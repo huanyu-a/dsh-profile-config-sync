@@ -1062,6 +1062,10 @@ window.__ModuleLoader__.load({
      */
     function RepoCard(props) {
       const repo = (props.data && props.data.repo) || {}
+      // WebDAV 模式下仓库目录只是普通文件夹（没有 .git），分支/HEAD 与提交前后比较都不存在；
+      // 以前这里一律回落到 '?'，面板上就显示成「? @ ?」「落后 ? · 领先 ?」，看着像坏了
+      const wdOn = Boolean(props.data && props.data.webdav && props.data.webdav.active)
+      const hasGitRef = Boolean(repo.branch || repo.head)
       // 空目录不算「没配好」：它是新机器还没拉取的状态，不该把人按在编辑态
       const missing = Boolean(props.data) && !repo.exists && !repo.empty
       const [editing, setEditing] = react.useState(false)
@@ -1128,16 +1132,27 @@ window.__ModuleLoader__.load({
         }),
         h(Kv, {
           k: M('分支 / HEAD', 'Branch / HEAD'),
-          v: repo.exists ? `${repo.branch || '?'} @ ${repo.head || '?'}` : (repo.empty ? M('（待首次拉取）', '(after the first pull)') : M('（不可用）', '(unavailable)')),
+          v: !repo.exists
+            ? (repo.empty ? M('（待首次拉取）', '(after the first pull)') : M('（不可用）', '(unavailable)'))
+            : (hasGitRef
+              ? `${repo.branch || '?'} @ ${repo.head || '?'}`
+              : (wdOn
+                ? M('（WebDAV 模式：这个目录不是 git 仓库，没有分支）', '(WebDAV mode: this folder is not a git repository, so there is no branch)')
+                : M('（这个目录还没有 git 提交）', '(this folder has no git commits yet)'))),
         }),
         h(Kv, {
           k: M('远端', 'Remote'),
-          v: repo.exists
-            ? M(
-              `落后 ${repo.behind ?? '?'} · 领先 ${repo.ahead ?? '?'} · 未提交 ${repo.uncommitted ?? repo.dirty ?? '?'}` + (repo.pending ? `（本机待同步 ${repo.pending}）` : ''),
-              `behind ${repo.behind ?? '?'} · ahead ${repo.ahead ?? '?'} · uncommitted ${repo.uncommitted ?? repo.dirty ?? '?'}` + (repo.pending ? ` (${repo.pending} pending on this machine)` : ''),
-            )
-            : (repo.empty ? M('（拉取之后才有得比）', '(available after the first pull)') : M('（不可用）', '(unavailable)')),
+          v: !repo.exists
+            ? (repo.empty ? M('（拉取之后才有得比）', '(available after the first pull)') : M('（不可用）', '(unavailable)'))
+            : (repo.behind === null || repo.ahead === null
+              ? (wdOn
+                ? M('（WebDAV 模式不比提交前后）', '(WebDAV mode: no commit comparison)')
+                : M('（还没有上游分支，无法比较前后）', '(no upstream branch to compare)'))
+                + ` · ${M('未提交', 'uncommitted')} ${repo.uncommitted ?? repo.dirty ?? '?'}` + (repo.pending ? `（${M('本机待同步', 'pending on this machine')} ${repo.pending}）` : '')
+              : M(
+                `落后 ${repo.behind} · 领先 ${repo.ahead} · 未提交 ${repo.uncommitted ?? repo.dirty ?? '?'}` + (repo.pending ? `（本机待同步 ${repo.pending}）` : ''),
+                `behind ${repo.behind} · ahead ${repo.ahead} · uncommitted ${repo.uncommitted ?? repo.dirty ?? '?'}` + (repo.pending ? ` (${repo.pending} pending on this machine)` : ''),
+              )),
         }),
         (repo.empty || repo.phase === 'missing')
           ? h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warn-primary)' } },
@@ -3444,15 +3459,24 @@ window.__ModuleLoader__.load({
                 ),
               ),
               // 一行元信息：版本与仓库位置。状态说明交给上面的徽标和下面的指标条，这里不再重复。
+              // 仓库位置只在真有 git 分支时才写 branch @ head；WebDAV 模式退化成写传输方式，
+              // 免得出现「app x / Electron y · ? @ ?」这种看着像坏掉的尾巴。
               h('div', { style: S.meta },
                 data ? [
                   h('span', { key: 'app' }, `app ${data.version.local || '?'} / Electron ${data.version.electron || '?'}`),
-                  data.repo && data.repo.exists
-                    ? [
-                      h('span', { key: 's2', style: S.metaSep }, '·'),
-                      h('span', { key: 'repo' }, `${data.repo.branch || '?'} @ ${(data.repo.head || '').split(' ')[0] || '?'}`),
-                    ]
-                    : null,
+                  (() => {
+                    const label = data.repo && data.repo.exists
+                      ? (data.repo.branch || data.repo.head
+                        ? `${data.repo.branch || '?'} @ ${(data.repo.head || '').split(' ')[0] || '?'}`
+                        : (data.webdav && data.webdav.active ? 'WebDAV' : ''))
+                      : ''
+                    return label
+                      ? [
+                        h('span', { key: 's2', style: S.metaSep }, '·'),
+                        h('span', { key: 'repo' }, label),
+                      ]
+                      : null
+                  })(),
                 ] : h('span', null, summary.text),
               ),
               h('div', { style: S.pageLead },
@@ -4228,7 +4252,9 @@ window.__ModuleLoader__.load({
           data ? h(Kv, {
             k: M('仓库', 'Repo'),
             v: data.repo.exists
-              ? `${data.repo.path} (${data.repo.branch || '?'} @ ${data.repo.head || '?'})`
+              ? (data.repo.branch || data.repo.head
+                ? `${data.repo.path} (${data.repo.branch || '?'} @ ${data.repo.head || '?'})`
+                : `${data.repo.path}${data.webdav && data.webdav.active ? M('（WebDAV 模式，无 git 分支）', ' (WebDAV mode, no git branch)') : ''}`)
               : M('还没配置（请到面板里设置）', 'Not configured (set it in the panel)'),
           }) : null,
           data ? h(Kv, {

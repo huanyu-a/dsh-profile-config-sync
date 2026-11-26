@@ -112,6 +112,8 @@ check('没配仓库时强制停在编辑态、且不提供取消', /forced/.test
 check('没配仓库时生成按钮被禁用', source.includes('disabled: busy || !canPush || noRemote'))
 check('云端仓库缺配置时也强制编辑态（无取消）', /\(!wdConfigured && !gitConfigured\) \? null :/.test(source) && source.includes('云端仓库与同步方式'))
 check('强制编辑态时不渲染「取消」按钮（forced ? null）', /forced \? null :/.test(source))
+check('WebDAV 模式下不显示「? @ ?」（分支为空时给的是说明而不是问号）', /WebDAV 模式：这个目录不是 git 仓库/.test(source) && /WebDAV 模式不比提交前后/.test(source))
+check('元信息行只在真有分支时才写 branch @ head', /data\.repo\.branch \|\| data\.repo\.head/.test(source) && /webdav\.active \? 'WebDAV' : ''/.test(source))
 check('云端仓库没配时推送/拉取禁用、还原仍可用',
   source.includes('disabled: busy || !canPull || noRemote')
     && source.includes("disabled: busy || !hasRepoPath, onClick: () => prepare('restore')"))
