@@ -46,9 +46,9 @@ Package name **`dsh-profile-config-sync`** (the npm package `dsh-config-sync` is
 |---|---|
 | npm | `npm i dsh-profile-config-sync` — **npm only has `0.4.1`**, without the 0.6.x safety fixes |
 | Plugin market | Search “Config Backup & Sync” in the client's plugin market (via the git commit registered in `market-index.json`) |
-| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.43.tgz` |
+| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.44.tgz` |
 
-**Release status**: the latest release is [`v0.6.43`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.43) (2026-11-27); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
+**Release status**: the latest release is [`v0.6.44`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.44) (2026-11-27); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
 
 ## HTTP route admission
 
@@ -60,7 +60,7 @@ back to its own `originAllowed` (loopback Host, cross-site and `Sec-Fetch-Site: 
 **Why this layer exists**: `webServer.register` is a bare HTTP carrier — the DSH docs say the carrier "owns no
 authentication or Origin policy", so route authentication belongs to the composition. Through 0.6.41 the plugin relied
 only on its own `originAllowed`, which treats a request without an `Origin` header as trustworthy; a bare
-`curl http://127.0.0.1:10297/config-sync/status` returned **200** and exposed repo paths, config digests and the pending
+`curl http://127.0.0.1:<port>/config-sync/status` (the Host port changes on every start; read `DSH_WEB_URL`) returned **200** and exposed repo paths, config digests and the pending
 list, and could trigger push or restore. The same request now answers **401**, and a refusal body carries only
 `{ ok: false, error: "unauthorized" | "forbidden" }` — no business fields.
 
