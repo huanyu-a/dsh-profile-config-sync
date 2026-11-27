@@ -20,6 +20,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
+import { gunzipSync } from 'node:zlib'
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs'
 import { writeFileAtomicSync } from './runtime/atomic-write.mjs'
 import { homedir, hostname, tmpdir } from 'node:os'
@@ -100,32 +101,54 @@ const PLUGIN_VERSION = (() => {
     return String(pkg.version || '')
   } catch { return '' }
 })()
-// version.json 放在公开插件仓库根：{ version, notes, releasedAt, tgz, sha256 }
-// 更新检查只读这一个文件，几百字节，不拉整包。公开仓库不需要令牌。
+// ── 0.6.47 起：更新检查只查 npm，不看 GitHub ──
+// 用户明确要求「插件更新只检查 npm 是否有更新，不检查 GitHub」。
 //
-// 为什么不止一个地址：raw.githubusercontent.com 在这类网络上时通时不通（本机实测一次 20 秒超时 code=000、
-// 另一次 538ms 正常），而宿主的 fetch 是 Node 内置实现、**不读系统代理**，超时一到就被 AbortController 掐断，
-// 面板上只剩一句 "This operation was aborted"。
+// 版本判定：npm registry 的 dist-tags.latest。
+// 下载地址与校验值：该版本的单版本文档里的 dist.tarball / dist.integrity / dist.shasum。
+// 发布说明：npm tarball 里的 package/release-notes.json（已加进 package.json 的 files 字段）。
 //
-// 候选顺序：两个实时反代（gh-proxy / ghfast，实测 1 秒内拿到最新清单，且能把 tgz 一起拉下来）→ 直连 raw。
-// **不要**用 jsDelivr 兜清单：它对 `@main` 这类分支别名有明显缓存（实测发版后仍返回上一版清单，purge 接口也没
-// 立刻刷新），拿它当清单源会让"有新版本"晚几小时才出现，比读不到更误导人。
-// 用户自己在设置里填了清单地址时只用他那一个 —— 不掺镜像，免得"读到的其实不是他指定的源"。
-const UPDATE_REPO_OWNER = 'huanyu-a'
-const UPDATE_REPO_NAME = 'dsh-profile-config-sync'
-const RAW_MANIFEST_URL = `https://raw.githubusercontent.com/${UPDATE_REPO_OWNER}/${UPDATE_REPO_NAME}/main/version.json`
-const API_MANIFEST_URL = `https://api.github.com/repos/${UPDATE_REPO_OWNER}/${UPDATE_REPO_NAME}/contents/version.json?ref=main`
-const UPDATE_MANIFEST_MIRRORS = [
-  `https://gh-proxy.com/${RAW_MANIFEST_URL}`,
-  `https://ghfast.top/${RAW_MANIFEST_URL}`,
-  API_MANIFEST_URL,
-  RAW_MANIFEST_URL,
-]
-const UPDATE_MANIFEST_URL = RAW_MANIFEST_URL
-// 30 秒：慢链路 10 秒根本不够（raw 通的时候也要几百毫秒到十几秒不等）
+// 为什么这么换（不是"顺手改一下"，是踩到过坑）：
+// GitHub release 资产与 npm tarball **不是同一个字节流** —— 实测 npm pack 产物与 registry 上的
+// tarball 逐字节一致（sha256 相同），但与 pnpm pack 的资产不同，差在打包元数据。
+// 于是旧实现「清单里记 pnpm 的 sha256、下载走 npm 兜底」在校验那一步必然失败，
+// 那条「npm 兜底下载」的路一直有坑。改成单一 npm 源后，校验改用 registry 自己的
+// dist.integrity / dist.shasum，权威值与被校验物同源，不会再出现这种错配。
+//
+// npm 作为唯一更新源（0.6.47 起）
+const NPM_PACKAGE_NAME = 'dsh-profile-config-sync'
+// registry / dist-tags / 版本文档的 URL 一律由 npmUrls(registry) 现算（见下方 effectiveNpmRegistry），
+// 不在模块顶层写死 —— 否则夹具没法用本地服务器当 registry。
+
+// 30 秒：慢链路 10 秒根本不够
 const UPDATE_FETCH_TIMEOUT = 30 * 1000
 const UPDATE_CHECK_TTL = 30 * 60 * 1000
 const GH_TOKEN_ENV_CANDIDATES = ['DSH_CONFIG_SYNC_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']
+// 0.6.47：npm registry 可被设置或环境变量覆盖。
+// 用途有两个：① 国内用户换 npmmirror 之类镜像（仍然只查 npm，只是换了个 registry）；
+// ② 审计夹具用本地 HTTP 服务器当 registry，不必真的连公网。
+// 环境变量优先，便于夹具在进程启动前就定好；设置里改了下次检查生效。
+const NPM_REGISTRY_ENV = 'DSH_CONFIG_SYNC_NPM_REGISTRY'
+const DEFAULT_NPM_REGISTRY = 'https://registry.npmjs.org'
+
+function effectiveNpmRegistry(settings = {}) {
+  const fromSettings = String((settings && settings.updateRegistry) || '').trim()
+  if (fromSettings) return fromSettings.replace(/\/+$/, '')
+  const fromEnv = String(process.env[NPM_REGISTRY_ENV] || '').trim()
+  if (fromEnv) return fromEnv.replace(/\/+$/, '')
+  return DEFAULT_NPM_REGISTRY
+}
+
+function npmUrls(registry) {
+  const base = String(registry || DEFAULT_NPM_REGISTRY).replace(/\/+$/, '')
+  return {
+    registry: base,
+    distTags: `${base}/${NPM_PACKAGE_NAME}/-/package/${NPM_PACKAGE_NAME}/dist-tags`,
+    versionDoc: (v) => `${base}/${NPM_PACKAGE_NAME}/${encodeURIComponent(v)}`,
+    latestDoc: `${base}/${NPM_PACKAGE_NAME}/latest`,
+    tarball: (v) => `${base}/${NPM_PACKAGE_NAME}/-/${NPM_PACKAGE_NAME}-${v}.tgz`,
+  }
+}
 
 const winEnvCache = new Map()
 function clearWinEnvCache() { winEnvCache.clear() }
@@ -2873,83 +2896,123 @@ function compareVersion(a, b) {
 }
 
 /**
- * 0.3.89：npm registry 的 tarball 地址（双源）。npm 包与 GitHub release 的 tgz 是同一份
- * 发布产物（实测 sha256 完全一致），GitHub release 不通时自动从 npm 取。两个源都列：
- * npmmirror 国内快、但发版后有同步窗口期会短暂 404；官方 registry 更权威、不受镜像延迟影响。
- * 清单里的权威 sha256 照常校验，换源不放宽校验。
+ * 0.3.89 起是「npm 双源」；0.6.47 起 npm 成为**唯一**更新源。
+ *
+ * 旧注释说「npm 包与 GitHub release 的 tgz 是同一份发布产物（实测 sha256 完全一致）」——
+ * 这句话是错的，实测：npm pack 产物与 registry 上的 tarball 逐字节一致（sha256 相同），
+ * 但与 pnpm pack 的资产**不是同一份**（打包元数据不同，sha256 不同）。
+ * 于是旧实现「清单记 pnpm 的 sha256、下载走 npm 兜底」在校验那一步必然失败。
+ * 0.6.47 改成单一 npm 源后，校验值取 registry 自己的 dist.integrity / dist.shasum，
+ * 权威值与被校验物同源，这个错配从根上没了。
  */
-function npmTgzUrls(version) {
+function npmTgzUrls(version, registry = DEFAULT_NPM_REGISTRY) {
   const v = String(version || '').replace(/[^0-9A-Za-z.+\-]/g, '')
   if (!v) return []
-  const f = `dsh-profile-config-sync-${v}.tgz`
-  return [
-    `https://registry.npmmirror.com/dsh-profile-config-sync/-/${f}`,
-    `https://registry.npmjs.org/dsh-profile-config-sync/-/${f}`,
-  ]
+  return [npmUrls(registry).tarball(v)]
 }
-// 兼容旧调用：返回首选 npm 兜底地址
-function npmTgzUrl(version) {
-  const list = npmTgzUrls(version)
+// 兼容旧调用：返回首选 npm 地址
+function npmTgzUrl(version, registry = DEFAULT_NPM_REGISTRY) {
+  const list = npmTgzUrls(version, registry)
   return list.length ? list[0] : ''
 }
 
 /**
- * 清单里 tgz 可以写相对路径（releases/xxx.tgz），也可以是绝对 GitHub release 地址。
- * 下载地址按"读到清单的那个源"优先，其余镜像依次兜底；末尾追加 npm 镜像作为最终兜底
- * —— GitHub release 整段不通时（国内常见），仍能走 npm 把包下下来。
+ * 0.6.47：下载地址只认 npm 单版本文档里给的 dist.tarball。
+ * 没有它才退回按版本号拼 registry 地址（正常不会走到）。
  */
-function resolveTgzCandidates(manifest, manifestUrl = '') {
+function resolveTgzCandidates(manifest, registry = DEFAULT_NPM_REGISTRY) {
   const tgz = String((manifest && manifest.tgz) || '')
-  const npmList = npmTgzUrls(manifest && manifest.version)
-  const withNpm = (list) => {
-    const out = list.slice()
-    for (const u of npmList) if (u && !out.includes(u)) out.push(u)
-    return out
-  }
-  // 清单没给 tgz 时，也留 npm 这两条路（有版本就能拼出 tarball）
+  const npmList = npmTgzUrls(manifest && manifest.version, registry)
   if (!tgz) return npmList.slice()
-  // 清单里写了绝对地址：先照它来，末尾追加 npm 双源兜底（0.3.89 起不再直接 return）
-  if (/^https?:\/\//i.test(tgz)) return withNpm([tgz])
+  if (/^https?:\/\//i.test(tgz)) return [tgz]
+  const base = String(registry || DEFAULT_NPM_REGISTRY).replace(/\/+$/, '')
   const rel = tgz.replace(/^\.?\//, '')
-  const bases = []
-  const actual = String(manifestUrl || '').replace(/[^/]*$/, '')
-  if (actual) bases.push(actual)
-  for (const cand of UPDATE_MANIFEST_MIRRORS) {
-    const base = cand.replace(/[^/]*$/, '')
-    if (base && !bases.includes(base)) bases.push(base)
-  }
-  return withNpm(bases.map((base) => base + rel))
+  return [`${base}/${rel}`]
 }
 
-/** version.json 里的 tgz 可以写相对路径（releases/xxx.tgz），拼在仓库 raw 根上。 */
-function resolveTgzUrl(manifest, manifestUrl = UPDATE_MANIFEST_URL) {
-  const list = resolveTgzCandidates(manifest, manifestUrl)
+/** 下载地址：优先用 registry 给的绝对地址，没有才按版本号拼。 */
+function resolveTgzUrl(manifest, registry = DEFAULT_NPM_REGISTRY) {
+  const list = resolveTgzCandidates(manifest, registry)
   if (list.length) return list[0]
   // 没给 tgz 时保留原来的兜底行为（返回空串，调用方自己报错）
   return ''
 }
 
-async function fetchManifest(url, timeoutMs = UPDATE_FETCH_TIMEOUT, headers = {}) {
+/**
+ * 0.6.47：读 npm 的 dist-tags（几十字节），拿到 latest 指向的版本号。
+ * 用 /-/package/<name>/dist-tags 而不是完整 packument —— 后者含全部历史版本，
+ * 面板每次打开都拉一遍纯属浪费。
+ */
+async function fetchNpmLatestVersion(registry = DEFAULT_NPM_REGISTRY, timeoutMs = UPDATE_FETCH_TIMEOUT) {
   if (typeof fetch !== 'function') throw new Error(t('当前运行环境没有 fetch，无法检查更新', 'fetch is unavailable in this runtime — cannot check for updates'))
   const seconds = Math.round(timeoutMs / 1000)
   const ctrl = typeof AbortController === 'function' ? new AbortController() : null
   let timedOut = false
   const timer = ctrl ? setTimeout(() => { timedOut = true; try { ctrl.abort() } catch { } }, timeoutMs) : null
   try {
-    const res = await fetch(url, { cache: 'no-store', headers, signal: ctrl ? ctrl.signal : undefined })
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}${(res.status === 401 || res.status === 403 || res.status === 404) ? t('（若为私有仓库，需配置只读令牌或环境变量）', ' (if private, configure a read-only token or env var)') : ''}`)
-    }
+    const res = await fetch(npmUrls(registry).distTags, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const json = await res.json()
-    if (!json || !json.version) throw new Error(t('version.json 里没有 version 字段', 'version.json has no "version" field'))
-    return json
+    const latest = json && json.latest
+    if (!latest || typeof latest !== 'string') throw new Error(t('npm 的 dist-tags 里没有 latest', 'npm dist-tags has no "latest"'))
+    return String(latest)
   } catch (error) {
-    // abort 的原话是 "This operation was aborted"，看不出是谁的问题，换成能看懂的话
     if (timedOut) throw new Error(t(`超时（${seconds} 秒内没有响应）`, `timed out (no response in ${seconds}s)`))
     throw error
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+/**
+ * 0.6.47：读 npm 上某个版本的文档（2~3 KB），取 dist.tarball / dist.integrity / dist.shasum。
+ * 校验值一律取 registry 自己给的 —— 权威值与被校验物同源，不会出现「清单记 A 的哈希、下载 B 的包」。
+ */
+async function fetchNpmVersionDoc(version, registry = DEFAULT_NPM_REGISTRY, timeoutMs = UPDATE_FETCH_TIMEOUT) {
+  if (typeof fetch !== 'function') throw new Error(t('当前运行环境没有 fetch，无法检查更新', 'fetch is unavailable in this runtime — cannot check for updates'))
+  const seconds = Math.round(timeoutMs / 1000)
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null
+  let timedOut = false
+  const timer = ctrl ? setTimeout(() => { timedOut = true; try { ctrl.abort() } catch { } }, timeoutMs) : null
+  try {
+    const res = await fetch(npmUrls(registry).versionDoc(version), { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const json = await res.json()
+    if (!json || !json.version) throw new Error(t('npm 上没有这个版本的文档', 'npm has no document for that version'))
+    return json
+  } catch (error) {
+    if (timedOut) throw new Error(t(`超时（${seconds} 秒内没有响应）`, `timed out (no response in ${seconds}s)`))
+    throw error
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/**
+ * 0.6.47：从 npm tarball 里取包内的 release-notes.json（发布说明）。
+ * npm tarball 是 gzip 的 tar，只解到内存 —— 只取 release-notes.json 一个文件，
+ * tar 里条目按顺序出现，release-notes.json 通常排在 package.json 之后。
+ */
+function extractReleaseNotesFromTarball(buf) {
+  try {
+    const tar = gunzipSync(buf)
+    // tar 头 512 字节一块；文件名在 0..100，size 在 124..156（八进制字符串）
+    for (let off = 0; off + 512 <= tar.length; off += 512) {
+      const nameRaw = tar.slice(off, off + 100)
+      const zero = nameRaw.indexOf(0)
+      const name = zero >= 0 ? nameRaw.slice(0, zero).toString('utf8') : nameRaw.toString('utf8')
+      if (!name) continue
+      const sizeRaw = tar.slice(off + 124, off + 156).toString('ascii').replace(/\0.*$/, '').trim()
+      const size = parseInt(sizeRaw, 8) || 0
+      const body = off + 512
+      const base = name.replace(/^\.\//, '')
+      if (base === 'package/release-notes.json' || base === 'release-notes.json') {
+        if (size > 0 && body + size <= tar.length) return JSON.parse(tar.slice(body, body + size).toString('utf8'))
+      }
+      off += Math.ceil(size / 512) * 512
+    }
+  } catch { /* 解不出来就当没有说明文字 */ }
+  return null
 }
 
 /** 仅向直连官方域传令牌（绝不把令牌发给第三方反代 gh-proxy / ghfast）。 */
@@ -2994,39 +3057,13 @@ async function resolveUpdateToken(settings, customUrl = '') {
 }
 
 /**
- * 读清单：自定义地址只用它自己；没配则按候选源依次试，第一个成功的就用。
- * 有令牌时把 GitHub API 放在最前面（私有库第三方反代必 404、直连 raw 常超时，API 几百毫秒直达）。
- * 全失败时把每个源各自的失败原因汇总抛出 —— 面板上一眼能看出是超时、HTTP 状态还是解析失败。
+ * 0.6.47：旧的「清单」读取路径整体退休。
+ *
+ * 原来是「读 GitHub 仓库根的 version.json」（raw / API / gh-proxy / ghfast 依次试），
+ * 现在更新检查只查 npm，GitHub 不再参与 —— fetchManifestAuto / fetchManifest 连同
+ * UPDATE_MANIFEST_MIRRORS 一起删掉，避免留下「看起来还在用」的分支。
+ * 保留 withAccessToken / authHeadersForUrl：下载环节还可能碰到 Gitee 私有库与 GitHub 资产的旧配置。
  */
-async function fetchManifestAuto(targetUrl, token = '', timeoutMs = UPDATE_FETCH_TIMEOUT) {
-  const custom = String(targetUrl || '').trim()
-  const candidates = custom
-    ? [custom]
-    : (token
-      ? [API_MANIFEST_URL, ...UPDATE_MANIFEST_MIRRORS.filter((u) => u !== API_MANIFEST_URL)]
-      : UPDATE_MANIFEST_MIRRORS.slice())
-  const tried = []
-  for (const cand of candidates) {
-    try {
-      const headers = authHeadersForUrl(cand, token)
-      // 有令牌且走直连 GitHub 域时改用 Authorization Header，绝不把令牌拼进第三方反代 URL
-      const reqUrl = Object.keys(headers).length ? cand : withAccessToken(cand, token)
-      const manifest = await fetchManifest(reqUrl, timeoutMs, headers)
-      tried.push({ url: cand, ok: true })
-      return { manifest, url: cand, tried }
-    } catch (error) {
-      const msg = String((error && error.message) || error)
-      let host = cand
-      try { host = new URL(cand).host } catch { }
-      tried.push({ url: cand, host, ok: false, error: msg })
-      if (custom) break
-    }
-  }
-  const detail = tried.map((x) => `${x.host || x.url}：${x.ok ? 'ok' : x.error}`).join('；')
-  const error = new Error(t(`所有更新源都读不到（${detail}）`, `No update source could be reached (${detail})`))
-  error.sources = tried
-  throw error
-}
 
 /**
  * 私有仓库的 raw 链接匿名读会 403，必须换成 Gitee API 的 raw 端点再带 access_token。
@@ -3049,17 +3086,18 @@ function withAccessToken(url, token) {
   return target + sep + 'access_token=' + encodeURIComponent(token)
 }
 
-async function checkUpdate({ force = false, url = '', token = '' } = {}) {
-  const custom = String(url || '').trim()
+async function checkUpdate({ force = false, registry = '', settings = {} } = {}) {
+  const reg = String(registry || effectiveNpmRegistry(settings))
   const now = Date.now()
-  if (!force && updateState.requestUrl === custom && updateState.token === token && updateState.checkedAt && now - updateState.checkedAt < UPDATE_CHECK_TTL && (updateState.manifest || updateState.error)) {
+  if (!force && updateState.requestUrl === reg && updateState.checkedAt && now - updateState.checkedAt < UPDATE_CHECK_TTL && (updateState.manifest || updateState.error)) {
     return updateState
   }
   updateState.checking = true
-  updateState.requestUrl = custom
-  updateState.token = token
+  updateState.requestUrl = reg
+  updateState.token = ''
   try {
-    const got = await fetchManifestAuto(custom, token)
+    // 0.6.47：只查 npm。GitHub release 不再参与更新检查。
+    const got = await fetchNpmLatest(reg)
     updateState.manifest = got.manifest
     updateState.url = got.url
     updateState.sources = got.tried
@@ -3075,25 +3113,153 @@ async function checkUpdate({ force = false, url = '', token = '' } = {}) {
   return updateState
 }
 
+/**
+ * 0.6.47：更新检查的唯一实现 —— 读 npm。
+ *
+ * 流程：
+ *   1) dist-tags 拿 latest 的版本号（几十字节）；
+ *   2) 该版本的单版本文档拿 dist.tarball / dist.integrity / dist.shasum（2~3 KB）；
+ *   3) 发布说明从 npm tarball 里的 package/release-notes.json 读（不解包到磁盘，只在内存里解 gzip+tar）。
+ *
+ * 为什么第 3 步要下整包：npm 的单版本文档里没有发布说明（那是 GitHub release 的内容，
+ * 而用户明确要求更新检查不查 GitHub）。tarball 400 多 KB，只在有新版本时才读一次。
+ */
+async function fetchNpmLatest(registry = DEFAULT_NPM_REGISTRY) {
+  const u = npmUrls(registry)
+  const tried = []
+  const record = (url, ok, error) => {
+    let host = url
+    try { host = new URL(url).host } catch { }
+    tried.push({ url, host, ok, ...(error ? { error } : {}) })
+  }
+  let latestVersion = ''
+  try {
+    latestVersion = await fetchNpmLatestVersion(registry)
+    record(u.distTags, true)
+  } catch (error) {
+    record(u.distTags, false, String((error && error.message) || error))
+    const detail = tried.map((x) => `${x.host}：${x.error}`).join('；')
+    const err = new Error(t(`读不到 npm 的版本信息（${detail}）`, `Cannot read the version list from npm (${detail})`))
+    err.sources = tried
+    throw err
+  }
+  if (compareVersion(latestVersion, PLUGIN_VERSION) <= 0) {
+    // 本机已经是 npm 上的最新版：不必再拉版本文档，省一次请求。
+    // 但下载地址要能给出来 —— 面板会显示它，也便于手工核对。
+    return {
+      manifest: {
+        version: latestVersion, notes: '', notesEn: '', releasedAt: '',
+        tgz: u.tarball(latestVersion), sha256: '', integrity: '', sha1: '', source: 'npm',
+      },
+      url: u.distTags,
+      tried,
+    }
+  }
+  let doc = null
+  try {
+    doc = await fetchNpmVersionDoc(latestVersion, registry)
+    record(u.versionDoc(latestVersion), true)
+  } catch (error) {
+    record(u.versionDoc(latestVersion), false, String((error && error.message) || error))
+    const detail = tried.map((x) => `${x.host}：${x.error}`).join('；')
+    const err = new Error(t(`读不到 npm 上 ${latestVersion} 的包信息（${detail}）`, `Cannot read the package info for ${latestVersion} from npm (${detail})`))
+    err.sources = tried
+    throw err
+  }
+  const dist = (doc && doc.dist) || {}
+  const tarball = String(dist.tarball || '')
+  const manifest = {
+    version: String(doc.version || latestVersion),
+    notes: '',
+    notesEn: '',
+    releasedAt: '',
+    tgz: tarball,
+    // npm 给的权威校验值：integrity 是 sha512（SRI），shasum 是 sha1。
+    // 两者都取，下载时优先用 integrity（更强），退回 shasum。
+    integrity: String(dist.integrity || ''),
+    sha1: String(dist.shasum || ''),
+    sha256: '',
+    source: 'npm',
+  }
+  // 发布说明：下 tarball 从里面取 release-notes.json。
+  // 缓存按「版本+integrity」记：同一次会话里反复点「检查更新」不该反复下 400KB。
+  if (tarball) {
+    const cacheKey = `${manifest.version}|${manifest.integrity}`
+    const cached = notesCache.get(cacheKey)
+    if (cached) {
+      manifest.notes = cached.notes
+      manifest.notesEn = cached.notesEn
+      manifest.releasedAt = cached.releasedAt
+      manifest.pkgSha256 = cached.pkgSha256
+    } else {
+      try {
+        const buf = await fetchTarballBuffer(tarball)
+        const inner = extractReleaseNotesFromTarball(buf)
+        if (inner && typeof inner === 'object') {
+          manifest.notes = String(inner.notes || '')
+          manifest.notesEn = String(inner.notesEn || '')
+          manifest.releasedAt = String(inner.releasedAt || '')
+          // 包内 version.json 的 sha256 是打包时那份 tgz 的哈希，和 npm tarball 不是同一份，
+          // 所以**不用**它做校验（校验用 registry 的 integrity/shasum）。
+          manifest.pkgSha256 = String(inner.sha256 || '')
+        }
+        notesCache.set(cacheKey, {
+          notes: manifest.notes, notesEn: manifest.notesEn,
+          releasedAt: manifest.releasedAt, pkgSha256: manifest.pkgSha256,
+        })
+      } catch (error) {
+        record(tarball, false, String((error && error.message) || error))
+        // 取不到说明文字不算失败：版本号与下载地址已经拿到了
+      }
+    }
+  }
+  return { manifest, url: u.versionDoc(manifest.version), tried }
+}
+
+/** 下载 npm tarball 到内存（只用于取包内 release-notes.json）。 */
+async function fetchTarballBuffer(url, timeoutMs = 120 * 1000) {
+  if (typeof fetch !== 'function') throw new Error(t('当前运行环境没有 fetch', 'fetch is unavailable in this runtime'))
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null
+  const timer = ctrl ? setTimeout(() => { try { ctrl.abort() } catch { } }, timeoutMs) : null
+  try {
+    const res = await fetch(url, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (!buf.length) throw new Error(t('下载到的包是空的', 'the downloaded package is empty'))
+    return buf
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+// 发布说明缓存：key = 版本|integrity。同一次会话里反复点「检查更新」不该反复下 400KB 的包。
+const notesCache = new Map()
+
 function updatePayload(state, settings = {}, resolvedToken = null) {
   const remote = state.manifest
-  const custom = String(settings.updateManifestUrl || '')
-  const resolvedUpd = resolvedToken || resolveTokenSpec(settings.updateToken, custom ? [] : GH_TOKEN_ENV_CANDIDATES)
   const installed = state.liveInstall || null
+  const reg = effectiveNpmRegistry(settings)
+  const u = npmUrls(reg)
   // 装好了但进程还在跑旧代码 = 需要重启；重启后 PLUGIN_VERSION 追上来，这条自然消失
   const restartRequired = Boolean(installed && compareVersion(installed.version, PLUGIN_VERSION) > 0)
   return {
     ok: !state.error,
     local: { version: PLUGIN_VERSION || t('未知', 'unknown'), dir: PLUGIN_DIR },
-    // 更新相关的配置集中在这里（清单地址、令牌是否已存），别散到「云端仓库」卡里
+    // 更新相关的配置集中在这里。0.6.47 起更新源固定是 npm：
+    // 清单地址/令牌这两项对 npm 都不再适用（npm 公开包不需要令牌，也没有可换的清单地址）。
+    // registry 可被设置或环境变量覆盖（换镜像 / 夹具用本地服务器），但仍然是「只查 npm」。
     config: {
-      manifestUrl: custom || UPDATE_MANIFEST_MIRRORS[0],
-      manifestUrlIsDefault: !custom,
-      manifestSources: custom ? [] : UPDATE_MANIFEST_MIRRORS.slice(),
-      tokenSet: Boolean(resolvedUpd.token),
-      tokenSaved: Boolean(settings.updateToken && !parseEnvTokenRef(settings.updateToken)),
-      tokenSource: resolvedUpd.source,
-      tokenEnv: resolvedUpd.envName,
+      source: 'npm',
+      packageName: NPM_PACKAGE_NAME,
+      registry: reg,
+      registryIsDefault: reg === DEFAULT_NPM_REGISTRY,
+      manifestUrl: u.distTags,
+      manifestUrlIsDefault: true,
+      manifestSources: [u.distTags],
+      tokenSet: false,
+      tokenSaved: false,
+      tokenSource: resolvedToken && resolvedToken.source ? resolvedToken.source : '',
+      tokenEnv: resolvedToken && resolvedToken.envName ? resolvedToken.envName : '',
     },
     remote: remote ? {
       version: String(remote.version || ''),
@@ -3101,11 +3267,14 @@ function updatePayload(state, settings = {}, resolvedToken = null) {
       // 清单里的说明是中英两份（notes / notesEn），由客户端按自己的语言挑
       notesEn: String(remote.notesEn || ''),
       releasedAt: String(remote.releasedAt || ''),
-      tgz: resolveTgzUrl(remote, state.url),
-      // 0.3.89：GitHub release 不通时的 npm 兜底下载地址（双源，面板显示首选），面板上单独显示一行
-      npmTgz: npmTgzUrl(remote.version),
-      npmTgzUrls: npmTgzUrls(remote.version),
+      tgz: resolveTgzUrl(remote, reg),
+      // npm 下载地址（单一来源，与被校验物同源）
+      npmTgz: String(remote.tgz || ''),
+      npmTgzUrls: remote.tgz ? [String(remote.tgz)] : [],
       sha256: String(remote.sha256 || ''),
+      // registry 给的权威校验值
+      integrity: String(remote.integrity || ''),
+      sha1: String(remote.sha1 || ''),
     } : null,
     hasUpdate: remote ? compareVersion(remote.version, PLUGIN_VERSION) > 0 : false,
     checking: state.checking,
@@ -3122,6 +3291,11 @@ function updatePayload(state, settings = {}, resolvedToken = null) {
         file: String(state.prepared.file || ''),
         size: Number(state.prepared.size) || 0,
         sha256: String(state.prepared.sha256 || ''),
+        // 0.6.47：记下这次是按哪个校验值过的 —— 面板/日志能看出「校验到底做了没有」
+        integrity: String(state.prepared.integrity || ''),
+        sha1: String(state.prepared.sha1 || ''),
+        verifiedBy: String(state.prepared.verifiedBy || ''),
+        verifiedAlgo: String(state.prepared.verifiedAlgo || ''),
         at: Number(state.prepared.at) || 0,
         ready: compareVersion(state.prepared.version, PLUGIN_VERSION) > 0,
       }
@@ -3170,12 +3344,53 @@ async function fetchGithubReleaseAsset(url, token, timeoutMs = 120 * 1000) {
   return Buffer.from(await assetRes.arrayBuffer())
 }
 
-async function downloadPackage({ urls, sha256, version, dshHome, token = '' }) {
+/**
+ * 0.6.47：校验下载到的包。
+ *
+ * 权威校验值取自 npm registry 自己的 dist.integrity（SRI，通常 sha512）/ dist.shasum（sha1），
+ * 与被校验物同源。旧实现用 version.json 里的 sha256 —— 那是**打包时那份 tgz**的哈希，
+ * 而 npm 上的 tarball 与它不是同一份字节流（npm pack 与 registry 上的 tarball 逐字节一致，
+ * 但与 pnpm pack 的资产不同），所以旧校验对 npm 下载必然失败。
+ *
+ * 三种校验值都收：integrity 优先，其次 shasum（sha1），最后才是 sha256（兼容旧路径）。
+ * 一个都没有时**不校验**（放行）—— 但要如实记下来，不能假装校验过。
+ */
+function verifyDownloadedPackage(buf, { integrity = '', sha1 = '', sha256 = '' } = {}) {
+  const sri = String(integrity || '').trim()
+  if (sri) {
+    // SRI 形如 "sha512-<base64>"，可能有多条（空格分隔），任一条对上即可
+    const parts = sri.split(/\s+/).filter(Boolean)
+    for (const part of parts) {
+      const dash = part.indexOf('-')
+      if (dash <= 0) continue
+      const algo = part.slice(0, dash).toLowerCase()
+      const b64 = part.slice(dash + 1)
+      if (!/^sha(?:256|384|512)$/.test(algo)) continue
+      const digest = createHash(algo).update(buf).digest('base64')
+      if (digest === b64) return { ok: true, algo, verified: 'integrity' }
+    }
+    return { ok: false, error: t('包的 integrity 校验不通过', 'integrity verification failed') }
+  }
+  const want1 = String(sha1 || '').trim().toLowerCase()
+  if (want1) {
+    const got = createHash('sha1').update(buf).digest('hex')
+    if (got !== want1) return { ok: false, error: t(`sha1 不一致（拿到 ${got}）`, `sha1 mismatch (got ${got})`) }
+    return { ok: true, algo: 'sha1', verified: 'shasum' }
+  }
+  const want256 = String(sha256 || '').trim().toLowerCase()
+  if (want256) {
+    const got = createHash('sha256').update(buf).digest('hex')
+    if (got !== want256) return { ok: false, error: t(`sha256 不一致（拿到 ${got}）`, `sha256 mismatch (got ${got})`) }
+    return { ok: true, algo: 'sha256', verified: 'sha256' }
+  }
+  return { ok: true, algo: '', verified: 'none' }
+}
+
+async function downloadPackage({ urls, sha256, integrity = '', sha1 = '', version, dshHome, token = '' }) {
   if (typeof fetch !== 'function') return { ok: false, error: t('当前运行环境没有 fetch，无法下载更新包', 'fetch is unavailable in this runtime — cannot download the update package') }
   const dir = join(dshHome, 'update-staging')
   try { mkdirSync(dir, { recursive: true }) } catch { }
   const file = join(dir, `dsh-profile-config-sync-${version}.tgz`)
-  const want = String(sha256 || '').toLowerCase()
   const errors = []
   for (const rawUrl of urls) {
     const url = String(rawUrl || '').trim()
@@ -3200,10 +3415,11 @@ async function downloadPackage({ urls, sha256, version, dshHome, token = '' }) {
         buf = Buffer.from(await res.arrayBuffer())
       }
       if (!buf.length) throw new Error(t('下载到的文件是空的', 'the downloaded file is empty'))
+      const verdict = verifyDownloadedPackage(buf, { integrity, sha1, sha256 })
+      if (!verdict.ok) throw new Error(String(verdict.error))
       const hash = createHash('sha256').update(buf).digest('hex')
-      if (want && hash !== want) throw new Error(t(`sha256 不一致（拿到 ${hash}）`, `sha256 mismatch (got ${hash})`))
       writeFileSync(file, buf)
-      return { ok: true, file, size: buf.length, sha256: hash, url }
+      return { ok: true, file, size: buf.length, sha256: hash, url, verifiedBy: verdict.verified, verifiedAlgo: verdict.algo }
     } catch (error) {
       let host = url
       try { host = new URL(url).host } catch { }
@@ -3226,7 +3442,7 @@ async function downloadPackage({ urls, sha256, version, dshHome, token = '' }) {
  * 备份旧目录（<DshHome>\backups\plugin-<旧版本>-<时间戳>）、覆盖，失败就把备份拷回去。
  * 返回 { ok, version, backup, log, error }
  */
-function runInstallPlugin({ version, sha256, urls, dshHome }) {
+function runInstallPlugin({ version, sha256, integrity = '', sha1 = '', urls, dshHome }) {
   const script = join(PLUGIN_DIR, 'runtime', 'install-plugin.ps1')
   if (!isFile(script)) return Promise.resolve({ ok: false, error: t('插件目录里没有 runtime\\install-plugin.ps1', 'runtime\\install-plugin.ps1 is missing from the plugin directory') })
   const sysRoot = process.env.SystemRoot || 'C:\\Windows'
@@ -3236,6 +3452,8 @@ function runInstallPlugin({ version, sha256, urls, dshHome }) {
     '-PluginDir', PLUGIN_DIR,
     '-Version', String(version || ''),
     '-Sha256', String(sha256 || ''),
+    ...(integrity ? ['-Integrity', String(integrity)] : []),
+    ...(sha1 ? ['-Sha1', String(sha1)] : []),
     '-TgzUrls', urls.join('|'),
     '-DshHome', dshHome,
   ]
@@ -3264,37 +3482,33 @@ function runInstallPlugin({ version, sha256, urls, dshHome }) {
 async function handleUpdate(req, res, config) {
   const dshHome = config?.dshHome || process.env.DSH_HOME || join(homedir(), '.dsh')
   const settings = readSettings(dshHome)
-  // 清单地址允许被设置覆盖：换镜像/自建仓库、或本地搭测试服务时不改动插件源码。
-  // 留空 = 用内置候选列表（GitHub API / gh-proxy / ghfast / raw）
-  const manifestUrl = String(settings.updateManifestUrl || '')
+  // 0.6.47：更新源固定是 npm，没有可配置的清单地址，也不需要令牌。
+  // 旧设置里的 updateManifestUrl / updateToken 保留在配置文件里不删（用户自己填的东西不该被悄悄抹掉），
+  // 但更新检查不再读它们 —— 面板上那两栏也一并撤掉。
   try {
     if (req.method === 'GET') {
-      const resolvedUpd = await resolveUpdateToken(settings, manifestUrl)
-      sendJson(res, 200, updatePayload(await checkUpdate({ url: manifestUrl, token: resolvedUpd.token }), settings, resolvedUpd))
+      sendJson(res, 200, updatePayload(await checkUpdate({ settings }), settings, null))
       return
     }
     if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: 'GET or POST only' }); return }
     if (!originAllowed(req)) { sendJson(res, 403, { ok: false, error: 'cross-origin request rejected' }); return }
-    // 先读 body 再解析令牌：读 body 之前不能有 await，否则请求流可能已经被读空/结束，
+    // 先读 body 再解析：读 body 之前不能有 await，否则请求流可能已经被读空/结束，
     // 事件监听挂晚了就永远等不到 'end'（实测：把令牌解析提到前面会让所有 POST 一直挂住）。
     const raw = await readBody(req)
     const body = raw.trim() ? JSON.parse(raw) : {}
     const action = String(body.action || 'check')
-    const resolvedUpd = await resolveUpdateToken(settings, manifestUrl)
-    const updateToken = resolvedUpd.token
 
     if (action === 'check') {
       clearWinEnvCache()
-      const refreshedUpd = await resolveUpdateToken(settings, manifestUrl)
-      const state = await checkUpdate({ force: true, url: manifestUrl, token: refreshedUpd.token })
-      sendJson(res, 200, { ok: !state.error, action, ...updatePayload(state, settings, refreshedUpd) })
+      const state = await checkUpdate({ force: true, settings })
+      sendJson(res, 200, { ok: !state.error, action, ...updatePayload(state, settings, null) })
       return
     }
 
     // 只下载：把包落到 <DshHome>\update-staging\，校验 sha256，**不动插件目录**。
     // 面板点「下载更新」走这条 —— 页面不会因为插件被改写而重置。
     if (action === 'prepare') {
-      const state = await checkUpdate({ force: true, url: manifestUrl, token: updateToken })
+      const state = await checkUpdate({ force: true, settings })
       const remote = state.manifest
       if (!remote) throw new Error(t(`读不到更新清单：${state.error || '未知原因'}`, `Cannot read the update manifest: ${state.error || 'unknown reason'}`))
       if (compareVersion(remote.version, PLUGIN_VERSION) <= 0) {
@@ -3303,12 +3517,19 @@ async function handleUpdate(req, res, config) {
       // 同一个版本已经下好就不重复下（DSH 一直开着时用户可能点第二次）
       const prev = updateState.prepared
       if (prev && prev.version === String(remote.version) && isFile(prev.file)) {
-        sendJson(res, 200, { ok: true, action, prepared: prev, ...updatePayload(state, settings, resolvedUpd) })
+        sendJson(res, 200, { ok: true, action, prepared: prev, ...updatePayload(state, settings, null) })
         return
       }
-      const urls = resolveTgzCandidates(remote, state.url)
-      if (!urls.length) throw new Error(t('version.json 里没有给 tgz 下载地址', 'version.json gives no tgz download URL'))
-      const got = await downloadPackage({ urls, sha256: String(remote.sha256 || ''), version: String(remote.version), dshHome, token: updateToken })
+      const urls = resolveTgzCandidates(remote, effectiveNpmRegistry(settings))
+      if (!urls.length) throw new Error(t('npm 上没有给下载地址', 'npm gave no download URL'))
+      const got = await downloadPackage({
+        urls,
+        integrity: String(remote.integrity || ''),
+        sha1: String(remote.sha1 || ''),
+        sha256: String(remote.sha256 || ''),
+        version: String(remote.version),
+        dshHome,
+      })
       if (!got.ok) throw new Error(String(got.error || t('下载失败', 'download failed')))
       updateState.prepared = {
         version: String(remote.version),
@@ -3317,8 +3538,12 @@ async function handleUpdate(req, res, config) {
         size: got.size,
         at: Date.now(),
         url: got.url,
+        verifiedBy: got.verifiedBy || '',
+        verifiedAlgo: got.verifiedAlgo || '',
+        integrity: String(remote.integrity || ''),
+        sha1: String(remote.sha1 || ''),
       }
-      sendJson(res, 200, { ok: true, action, prepared: updateState.prepared, ...updatePayload(state, settings, resolvedUpd) })
+      sendJson(res, 200, { ok: true, action, prepared: updateState.prepared, ...updatePayload(state, settings, null) })
       return
     }
 
@@ -3347,28 +3572,36 @@ async function handleUpdate(req, res, config) {
           '-UpdateTgz', prepared.file,
           '-UpdateVersion', String(prepared.version),
           '-UpdateSha256', String(prepared.sha256 || ''),
+          ...(prepared.integrity ? ['-UpdateIntegrity', String(prepared.integrity)] : []),
         ],
       })
       if (!started.ok) throw new Error(started.error)
       autoState.pending = { mode: 'update', at: Date.now(), version: String(prepared.version), restart: true, watcherPid: started.pid, installFrom: prepared.file }
       const closed = closeDsh()
       autoState.pending.closeRequested = closed
-      sendJson(res, 200, { ok: true, action, started: true, pending: autoState.pending, closeRequested: closed, ...updatePayload(await checkUpdate({ force: false, url: manifestUrl, token: updateToken }), settings, resolvedUpd) })
+      sendJson(res, 200, { ok: true, action, started: true, pending: autoState.pending, closeRequested: closed, ...updatePayload(await checkUpdate({ force: false, settings }), settings, null) })
       return
     }
 
     // 运行中直接装（不退出 DSH，**界面已不再使用**，留给 CLI/兼容）：下载 → 校验 sha256 → 备份旧版 → 覆盖插件目录
     if (action === 'install-live') {
-      const state = await checkUpdate({ force: true, url: manifestUrl, token: updateToken })
+      const state = await checkUpdate({ force: true, settings })
       const remote = state.manifest
       if (!remote) throw new Error(t(`读不到更新清单：${state.error || '未知原因'}`, `Cannot read the update manifest: ${state.error || 'unknown reason'}`))
       if (compareVersion(remote.version, PLUGIN_VERSION) <= 0) {
         throw new Error(t(`已经是最新版本（${PLUGIN_VERSION}），无需更新`, `Already on the latest version (${PLUGIN_VERSION}) — no update needed`))
       }
-      const urls = resolveTgzCandidates(remote, state.url)
-      if (!urls.length) throw new Error(t('version.json 里没有给 tgz 下载地址', 'version.json gives no tgz download URL'))
+      const urls = resolveTgzCandidates(remote, effectiveNpmRegistry(settings))
+      if (!urls.length) throw new Error(t('npm 上没有给下载地址', 'npm gave no download URL'))
       // 包只有一百多 KB，同步做完再回包：前端把按钮置灰等这一下就够了
-      const report = await runInstallPlugin({ version: String(remote.version), sha256: String(remote.sha256 || ''), urls, dshHome })
+      const report = await runInstallPlugin({
+        version: String(remote.version),
+        sha256: String(remote.sha256 || ''),
+        integrity: String(remote.integrity || ''),
+        sha1: String(remote.sha1 || ''),
+        urls,
+        dshHome,
+      })
       if (!report.ok) throw new Error(String(report.error || t('安装失败', 'install failed')))
       updateState.liveInstall = {
         version: String(remote.version),
@@ -3378,7 +3611,7 @@ async function handleUpdate(req, res, config) {
       }
       // 注意 hasUpdate 仍是 true：进程里跑的还是旧代码，重启后 PLUGIN_VERSION 才追上来。
       // 面板靠 restartRequired 换成「已装好，重启生效」
-      sendJson(res, 200, { ok: true, action, installed: updateState.liveInstall, ...updatePayload(state, settings, resolvedUpd) })
+      sendJson(res, 200, { ok: true, action, installed: updateState.liveInstall, ...updatePayload(state, settings, null) })
       return
     }
 
@@ -3396,14 +3629,14 @@ async function handleUpdate(req, res, config) {
     }
 
     if (action === 'apply') {
-      const state = await checkUpdate({ force: true, url: manifestUrl, token: updateToken })
+      const state = await checkUpdate({ force: true, settings })
       const remote = state.manifest
       if (!remote) throw new Error(t(`读不到更新清单：${state.error || '未知原因'}`, `Cannot read the update manifest: ${state.error || 'unknown reason'}`))
       if (compareVersion(remote.version, PLUGIN_VERSION) <= 0) {
         throw new Error(t(`已经是最新版本（${PLUGIN_VERSION}），无需更新`, `Already on the latest version (${PLUGIN_VERSION}) — no update needed`))
       }
-      const tgz = resolveTgzUrl(remote, state.url)
-      if (!tgz) throw new Error(t('version.json 里没有给 tgz 下载地址', 'version.json gives no tgz download URL'))
+      const tgz = resolveTgzUrl(remote, effectiveNpmRegistry(settings))
+      if (!tgz) throw new Error(t('npm 上没有给下载地址', 'npm gave no download URL'))
       const notes = String((langStore.getStore() === 'en' ? (remote.notesEn || remote.notes) : remote.notes) || '').trim()
       const yes = await askConfirm(
         t('更新「配置备份与同步」插件', 'Update the Config Backup & Sync plugin'),
@@ -3416,7 +3649,7 @@ async function handleUpdate(req, res, config) {
           + '\n\nSteps: exit DSH → download and verify the package → back up the old version → install over it → relaunch automatically.',
         ),
       )
-      if (!yes) { sendJson(res, 200, { ok: true, action, cancelled: true, ...updatePayload(state, settings, resolvedUpd) }); return }
+      if (!yes) { sendJson(res, 200, { ok: true, action, cancelled: true, ...updatePayload(state, settings, null) }); return }
 
       const repo = resolveRepo(config?.repoPath, dshHome).repo || ''
       const appRoot = resolveAppRoot(config?.appRoot) || ''
@@ -3432,7 +3665,8 @@ async function handleUpdate(req, res, config) {
           '-UpdateVersion', String(remote.version),
           '-UpdateTgz', tgz,
           '-UpdateSha256', String(remote.sha256 || ''),
-          ...(updateToken ? ['-UpdateToken', updateToken] : []),
+          ...(remote.integrity ? ['-UpdateIntegrity', String(remote.integrity)] : []),
+          ...(remote.sha1 ? ['-UpdateSha1', String(remote.sha1)] : []),
         ],
       })
       if (!started.ok) throw new Error(started.error)

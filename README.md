@@ -7,7 +7,7 @@
 [![license](https://img.shields.io/github/license/huanyu-a/dsh-profile-config-sync?style=flat-square&color=3fb950)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-8957e5?style=flat-square)](#同步内容勾选)
 [![groups](https://img.shields.io/badge/%E5%90%8C%E6%AD%A5%E5%86%85%E5%AE%B9-12%20%E7%BB%84-1f6feb?style=flat-square)](#同步内容勾选)
-[![tests](https://img.shields.io/badge/%E8%87%AA%E6%A3%80-64%20%E5%A5%97%20%C2%B7%201061%20%E6%9D%A1-3fb950?style=flat-square)](#自检)
+[![tests](https://img.shields.io/badge/%E8%87%AA%E6%A3%80-64%20%E5%A5%97%20%C2%B7%201064%20%E6%9D%A1-3fb950?style=flat-square)](#自检)
 
 中文 | [English](README.en.md)
 
@@ -34,7 +34,7 @@ DSH 的配置散在 `~/.dsh` 的十几处：profile、全局提示、Skills、Ag
 - **面板体检**：本机 / 云端双徽标（云端每 2 分钟复查）、版本契约、bundle、依赖、备份快照、上次同步、待办跳转。
 - **安全边界**：浏览器剖面与凭据库在抓取、上传、引擎三处独立硬拦；单文件上限三档（>100 MB 抓取即跳过、≥95 MB 提交前剔除、50–95 MB 只警告）；冲突两侧留副本；路径遍历防护。
 - **待推送口径跟执行体一致**：Windows 按 12 组统计，macOS / Linux 只统计引擎真会同步的 4 组，不虚报。
-- **自更新**：读 `version.json` 清单，面板内检查、下载、安装。
+- **自更新**：只查 npm registry（不看 GitHub），面板内检查、下载、安装。
 
 **四个关键词**：**配置**（12 组按需抓取）· **备份**（仓库即快照，Git 有历史）· **同步**（一台推、一台拉）· **还原**（铺回本机，可回滚）。
 
@@ -62,8 +62,8 @@ DSH 的配置散在 `~/.dsh` 的十几处：profile、全局提示、Skills、Ag
 | 方式 | 命令 / 入口 |
 |---|---|
 | npm | `npm i dsh-profile-config-sync`（**已发布到与 GitHub Release 相同的版本**，`latest` 标签指的就是它） |
-| 插件市场 | 客户端「插件市场 → 发现」搜「配置备份与同步」（走 `market-index.json` 登记的 git 提交） |
-| 离线 tgz | `pnpm add ./dsh-profile-config-sync-0.6.46.tgz`（内网机器用这个） |
+| 插件市场 | 客户端「插件市场 → 发现」搜「配置备份与同步」（`market-index.json` 登记的 `source.type` 是 `npm`，装的就是 registry 上的在线版） |
+| 离线 tgz | `pnpm add ./dsh-profile-config-sync-0.6.47.tgz`（内网机器用这个） |
 
 **发布状态**：最新 Release 是 [`v0.6.46`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.46)（2026-11-27），仓库已公开；npm 上的同名包同步发布（`npm i dsh-profile-config-sync`）。
 
@@ -74,7 +74,7 @@ gh release create v<版本> dsh-profile-config-sync-<版本>.tgz \
   --repo huanyu-a/dsh-profile-config-sync --title "v<版本>" --notes-file <发布说明.md>
 # tag 与包名必须是同一个版本号，别像旧文档那样写成 v0.6.39 配 0.6.44 的包
 git tag -a v<版本> -m "v<版本>" && git push origin v<版本>
-# 发布后把仓库根的 version.json 更新到新版本并推上去：面板的更新检查读的是仓库里那份
+# 发布后把仓库根的 version.json 更新到新版本并推上去：它随 npm 包一起发布（files 里有它），面板读的是包内那份
 # （version.json 不在 npm 包里，files 字段没有它）
 ```
 
@@ -188,7 +188,7 @@ pwsh -File runtime\sync.ps1 pull   -RepoRoot <仓库目录> -DshHome <~\.dsh> -A
 | 认证 | SSH 填私钥路径；HTTPS 用 Git 凭据管理器，插件不存密码 |
 | 单文件上限 | 三档：源头 >100 MB 抓取时跳过、≥95 MB 提交前剔除、50–95 MB 只警告 |
 
-私有库：优先 SSH 地址；插件**自身更新清单**默认指向作者公开仓库，改成私有库后只有 Gitee 的 raw 会被自动换成 API + token（GitHub/GitLab 私有 raw 匿名读会失败，已知限制）。
+私有库：优先 SSH 地址。插件**自身更新**只查 npm，与本机配置的 Git 远端无关，所以换成私有库也不影响自更新（也不用再为它配令牌）。
 
 ## 有文件没同步上时
 
@@ -363,19 +363,20 @@ push 失败时会**按真实远端地址归因**：https 走 `ls-remote` 检查�
 
 ## 插件自更新
 
-面板「插件更新」卡：清单与安装包都在公开仓库（`version.json` + `releases/*.tgz`，只读几百字节不拉整包），挂载查一次、之后每 30 分钟复查。
+面板「插件更新」卡：**只查 npm registry，不看 GitHub**。挂载查一次、之后每 30 分钟复查。
 
 | 状态 | 含义 |
 |---|---|
-| 绿色「已是最新」 | 本地版本 ≥ 清单版本 |
-| 橙色「有新版本」 | 清单更大，附说明与「下载更新」 |
+| 绿色「已是最新」 | 本地版本 ≥ npm 上的 `latest` |
+| 橙色「有新版本」 | npm 上更大，附说明与「下载更新」 |
 | 橙色「已下载，待安装」 | 包在 `~\.dsh\update-staging\`，插件目录一字节没改，点「重启并安装」生效 |
 | 橙色「已安装，待重启」 | 运行中装过但没重启 |
-| 红色「检查失败」 | 清单读不到，附「检查更新」逐源列失败原因 |
+| 红色「检查失败」 | npm 读不到，附「检查更新」列出失败原因 |
 
-- **多源按顺序试**：`gh-proxy.com` → `ghfast.top` → GitHub raw（宿主 `fetch` 是 Node 内置实现，**不读系统代理**）。单次 30 秒超时。
-- **别拿 jsDelivr 当清单源**：它对 `@main` 缓存很久，发版后仍返回上一版。
-- **下载与安装分开**：下载只落 `update-staging` 并校验 sha256，宿主不碰插件目录；点安装才退出 → 备份旧目录 → 覆盖 → 自动拉起，全程只重启一次（运行中覆盖会让宿主把面板卸载掉，0.3.4–0.3.6 踩过）。
+- **只查 npm**：版本取 `dist-tags.latest`（几十字节），下载地址与校验值取该版本单版本文档的 `dist.tarball` / `dist.integrity` / `dist.shasum`，发布说明取包内 `version.json`。GitHub 的 raw / API / gh-proxy / ghfast 四条清单源已整体退休。
+- **校验值与被校验物同源**：npm 上的 tarball 与 GitHub release 资产**不是同一份字节流**（实测 `npm pack` 与 registry 上的 tarball 逐字节一致，但与 `pnpm pack` 的资产不同）。所以校验用 registry 自己给的 `integrity`（sha512 SRI）/ `shasum`（sha1），不用打包时算的 sha256 —— 后者对 npm 下载必然对不上。
+- **registry 可换镜像**：设置 `updateRegistry` 或环境变量 `DSH_CONFIG_SYNC_NPM_REGISTRY`。换了也仍然只查 npm（只是换了个 registry）。
+- **下载与安装分开**：下载只落 `update-staging` 并校验，宿主不碰插件目录；点安装才退出 → 备份旧目录 → 覆盖 → 自动拉起，全程只重启一次（运行中覆盖会让宿主把面板卸载掉，0.3.4–0.3.6 踩过）。
 
 <a id="api"></a>
 
@@ -393,6 +394,7 @@ push 失败时会**按真实远端地址归因**：https 走 `ls-remote` 检查�
 
 | 日期 | 版本 | 要点 |
 |---|---|---|
+| 2026-11-27 | 0.6.47 | **更新只查 npm + 在线安装**：更新检查整体换成读 npm registry（dist-tags 定版本、单版本文档取 dist.tarball / dist.integrity、说明取包内 version.json），GitHub 的 raw / API / gh-proxy / ghfast 四条清单源与「更新清单 / 更新令牌」两项设置一起退休；市场索引 `source.type` 从 git 改成 npm，装的就是在线版。顺带修两个真 bug：① 旧「清单记 pnpm pack 的 sha256、npm 当兜底下载」在校验那步必然失败（实测 npm pack 与 registry 上的 tarball 逐字节一致，但与 pnpm pack 的资产不同），现在校验值取自 registry 自己；② 市场索引 publishTimestamp 写成毫秒而非 Unix 秒，DSH 的 parseMarketIndex 会拒掉整个索引——插件市场里此前根本读不出这个插件。功能代码改动集中在更新链路，同步/还原逻辑未动。验收：64 套隔离夹具共 1064 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.46 | **徽章数字接回计数**：0.6.41 手工写死的「64 套 · 1065 条」两版没再动，与同页验收声明（1061）打脸；现在 finalize 从 `last-count.json` 直接生成，口径与验收声明一模一样（只算非元套件：64 套 · 1061 条），人手不再参与。功能代码无改动。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.45 | **文档对齐现实**：① 中英 README 去掉「npm 上只到 0.4.1」的陈旧说法（改为「与 GitHub Release 同版本」，`dist-tags.latest` 即它）；② 发布命令块改成同版本占位，修掉「v0.6.39 配 0.6.44 的包」的自相矛盾；③ 写清 `version.json` 不在 npm 包里、面板更新检查读的是仓库里那份。功能代码无改动。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.44 | **一致性**：历史字段 `dsh.engines.dsh` 对齐顶层 `>=0.2.2-rc.5`；README 中英去掉写死的 10297，改 `127.0.0.1:<端口>`（以 `DSH_WEB_URL` 为准）；审计补 2 条断言。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |

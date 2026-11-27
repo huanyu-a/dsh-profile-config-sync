@@ -43,6 +43,12 @@ param(
   [string]$UpdateVersion = '',
   [string]$UpdateTgz = '',
   [string]$UpdateSha256 = '',
+  # 0.6.47：npm registry 给的权威校验值。integrity 是 SRI（sha512-base64），shasum 是 sha1 十六进制。
+  # 更新源改成 npm 之后，校验值必须与被校验物同源 —— npm 的 tarball 与 GitHub release 资产
+  # 不是同一份字节流（实测 npm pack 与 registry 上的 tarball 逐字节一致，但与 pnpm pack 的不同），
+  # 所以旧的「用打包时的 sha256 校验 npm 下载」必然失败。
+  [string]$UpdateIntegrity = '',
+  [string]$UpdateSha1 = '',
   # 仓库是私有库时必须带的只读令牌（Gitee 私人令牌）；留空就按匿名方式下载
   [string]$UpdateToken = '',
   # 结果展示窗口的停留秒数（默认 360 = 6 分钟）。自动化验收传小值，避免每套夹具干等 6 分钟。
@@ -117,6 +123,8 @@ if ($Phase -eq 'wait') {
   if ($UpdateVersion) { $relay += @('-UpdateVersion', $UpdateVersion) }
   if ($UpdateTgz) { $relay += @('-UpdateTgz', $UpdateTgz) }
   if ($UpdateSha256) { $relay += @('-UpdateSha256', $UpdateSha256) }
+  if ($UpdateIntegrity) { $relay += @('-UpdateIntegrity', $UpdateIntegrity) }
+  if ($UpdateSha1) { $relay += @('-UpdateSha1', $UpdateSha1) }
   if ($UpdateToken) { $relay += @('-UpdateToken', $UpdateToken) }
   # PowerShell 5.1 的 Start-Process -ArgumentList 会直接用空格拼接数组元素，不会自动给含空格的路径加引号；
   # AppRoot（例如 ...\DeepSeek Harness）带空格时直接参数绑定失败退出。这里显式按 Windows argv 规则加引号。
@@ -699,7 +707,74 @@ if ($Mode -eq 'update') {
     Log ("已下载 {0:N0} 字节：{1}" -f (Get-Item -LiteralPath $tmp).Length, $tmp)
   }
 
-  if ($UpdateSha256) {
+  # ---------- 校验安装包 ----------
+  # 0.6.47 起权威校验值来自 npm registry 自己的 dist.integrity（SRI，sha512-base64）/ dist.shasum（sha1）。
+  # 优先用 integrity，其次 sha1，最后才是旧的 sha256（兼容老路径）。
+  # 三个都没有时**跳过校验**并如实记下 —— 不能在校验没做时假装通过。
+  $verifiedBy = ''
+  if ($UpdateIntegrity) {
+    $algo = ''
+    $expectedB64 = ''
+    foreach ($part in ($UpdateIntegrity -split '\s+' | Where-Object { $_ })) {
+      $dash = $part.IndexOf('-')
+      if ($dash -le 0) { continue }
+      $a = $part.Substring(0, $dash).ToLower()
+      if ($a -notin @('sha256', 'sha384', 'sha512')) { continue }
+      $algo = $a
+      $expectedB64 = $part.Substring($dash + 1)
+      break
+    }
+    if (-not $algo) {
+      $msg = '插件更新失败：更新源给的 integrity 格式无法解析'
+      Log $msg
+      Write-Result $false 7 $msg $false
+      Finish 7 '更新失败：integrity 格式不对'
+    }
+    $sha = switch ($algo) {
+      'sha256' { [System.Security.Cryptography.SHA256]::Create() }
+      'sha384' { [System.Security.Cryptography.SHA384]::Create() }
+      'sha512' { [System.Security.Cryptography.SHA512]::Create() }
+    }
+    $gotB64 = ''
+    try {
+      $fs = [System.IO.File]::OpenRead($tmp)
+      try {
+        $ms = New-Object System.IO.MemoryStream
+        $sha.TransformBlock($fs, 0, $fs.Length, $null, 0) | Out-Null
+        $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null
+        $gotB64 = [Convert]::ToBase64String($sha.Hash)
+      } finally { $fs.Dispose() }
+    } catch {
+      $msg = '插件更新失败：本机 PowerShell 无法计算安装包 ' + $algo + '（Get-FileHash 不可用且 .NET 回退也失败）'
+      Log $msg
+      Write-Result $false 7 $msg $false
+      Finish 7 '更新失败：无法校验安装包'
+    }
+    Log ("integrity（{0}）：{1}" -f $algo, $gotB64)
+    if ($gotB64 -ne $expectedB64) {
+      Write-Result $false 7 '插件更新失败：安装包 integrity 校验不通过（可能没下载全或被改动）' $false
+      Finish 7 '更新失败：integrity 不符'
+    }
+    Log 'integrity 校验通过'
+    $verifiedBy = 'integrity'
+  } elseif ($UpdateSha1) {
+    $hash = ''
+    try { $hash = [string]((Get-FileHash -LiteralPath $tmp -Algorithm SHA1).Hash) } catch { $hash = '' }
+    $hash = $hash.Trim().ToLower()
+    Log ("sha1：{0}" -f $(if ($hash) { $hash } else { '（算不出来）' }))
+    if (-not $hash) {
+      $msg = '插件更新失败：本机 PowerShell 无法计算安装包 sha1'
+      Log $msg
+      Write-Result $false 7 $msg $false
+      Finish 7 '更新失败：无法校验安装包'
+    }
+    if ($hash -ne $UpdateSha1.ToLower()) {
+      Write-Result $false 7 '插件更新失败：安装包 sha1 校验不通过（可能没下载全或被改动）' $false
+      Finish 7 '更新失败：sha1 不符'
+    }
+    Log 'sha1 校验通过'
+    $verifiedBy = 'shasum'
+  } elseif ($UpdateSha256) {
     $hash = ''
     try { $hash = [string]((Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash) } catch { $hash = '' }
     $hash = $hash.Trim().ToLower()
@@ -716,6 +791,10 @@ if ($Mode -eq 'update') {
       Finish 7 '更新失败：sha256 不符'
     }
     Log 'sha256 校验通过'
+    $verifiedBy = 'sha256'
+  } else {
+    Log '注意：更新源没有给任何校验值，本次未做完整性校验'
+    $verifiedBy = 'none'
   }
 
   $stage = Join-Path $env:TEMP ("dsh-plugin-stage-" + $stamp)

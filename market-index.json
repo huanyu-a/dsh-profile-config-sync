@@ -27,12 +27,13 @@
       },
       "versions": [
         {
-          "version": "0.6.46",
-          "publishTimestamp": 1795759083950,
+          "version": "0.6.47",
+          "publishTimestamp": 1795767524,
           "source": {
-            "type": "git",
-            "url": "https://github.com/huanyu-a/dsh-profile-config-sync",
-            "commit": "4b9ea1a5ee5df31436e24feea31ba1aa8e4bc884"
+            "type": "npm"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.5"
           }
         }
       ]

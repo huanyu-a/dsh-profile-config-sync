@@ -2742,10 +2742,8 @@ window.__ModuleLoader__.load({
       const [toast, setToast] = react.useState('')
       const [upd, setUpd] = react.useState(null)
       const [updBusy, setUpdBusy] = react.useState(false)
-      // 「插件更新」卡里的配置编辑态：清单地址 + 只读令牌都放这一张卡，不散到云端仓库那去
-      const [updEdit, setUpdEdit] = react.useState(false)
-      const [updManifest, setUpdManifest] = react.useState('')
-      const [updToken, setUpdToken] = react.useState('')
+      // 0.6.47：更新源固定是 npm，「更新清单地址 / 更新令牌」两项配置撤掉，
+      // 所以这里不再有编辑态与对应输入框。旧的本机设置仍留在配置文件里，不主动删。
       const [updMsg, setUpdMsg] = react.useState('')
       const [updErr, setUpdErr] = react.useState('')
       // 「本机路径」平时不占版面：只在标题行按钮被点开时才渲染；按钮本身在
@@ -2910,40 +2908,9 @@ window.__ModuleLoader__.load({
           setUpdBusy(false)
         }
       }
-
-      const startEditUpd = () => {
-        const cfg = (upd && upd.config) || {}
-        setUpdManifest(cfg.manifestUrlIsDefault ? '' : (cfg.manifestUrl || ''))
-        setUpdToken('')
-        setUpdErr('')
-        setUpdMsg('')
-        setUpdEdit(true)
-      }
-      const cancelEditUpd = () => { setUpdEdit(false); setUpdErr(''); setUpdToken('') }
-      const saveUpdConfig = async () => {
-        setUpdBusy(true); setUpdErr(''); setUpdMsg('')
-        try {
-          const payload = { updateManifestUrl: updManifest.trim() }
-          if (updToken.trim()) payload.updateToken = updToken.trim()
-          await callSettings(payload)
-          setUpdEdit(false)
-          setUpdToken('')
-          setUpdMsg(M('已保存', 'Saved'))
-          setUpd(await callUpdate({ action: 'check' }))
-        } catch (e) {
-          setUpdErr(String((e && e.message) || e))
-        } finally { setUpdBusy(false) }
-      }
-      const clearUpdToken = async () => {
-        setUpdBusy(true); setUpdErr(''); setUpdMsg('')
-        try {
-          await callSettings({ clearUpdateToken: true })
-          setUpdMsg(M('已清除本机保存的更新令牌', 'Cleared the update token stored on this machine'))
-          setUpd(await callUpdate({ action: 'check' }))
-        } catch (e) {
-          setUpdErr(String((e && e.message) || e))
-        } finally { setUpdBusy(false) }
-      }
+      // 0.6.47：更新源固定是 npm，不再有「更新清单地址 / 更新令牌」可配。
+      // 旧的设置项仍留在本机配置文件里（不主动删用户填过的东西），但更新检查不读它们。
+      // 需要换源时用 npm 自己的 registry 配置（.npmrc），不在插件里另开一套。
 
       // 打开面板就自动检查一次云端，之后每 2 分钟复查一次（只读，不改仓库、不动 profile）
       react.useEffect(() => {
@@ -3131,8 +3098,8 @@ window.__ModuleLoader__.load({
                 `Current ${local} → can update to ${remote}${notesText ? ` · ${notesText}` : ''}`,
               )
               : (failed
-                ? M(`读不到更新清单：${u.error || '未知原因'}${sourceNote}`, `Cannot read the manifest: ${u.error || 'unknown reason'}${sourceNote}`)
-                : (u.checkedAt ? M(`当前 ${local}，云端没有更新的版本`, `Current ${local}; no newer version upstream`) : M('正在读云端版本清单…', 'Reading the cloud manifest…')))))
+                ? M(`读不到 npm 上的版本信息：${u.error || '未知原因'}${sourceNote}`, `Cannot read the version info from npm: ${u.error || 'unknown reason'}${sourceNote}`)
+                : (u.checkedAt ? M(`当前 ${local}，npm 上没有更新的版本`, `Current ${local}; no newer version on npm`) : M('正在读 npm 上的版本…', 'Reading the version list from npm…')))))
         return h('div', { style: S.card },
           h('div', { style: S.cardHead },
             h('div', { style: S.cardTitle }, M('插件更新', 'Plugin update')),
@@ -3154,90 +3121,38 @@ window.__ModuleLoader__.load({
                     onClick: downloadUpdate,
                   }, updBusy ? M('下载中…', 'Downloading…') : M(`下载更新 ${remote}`, `Download ${remote}`)) : null)),
               h('button', { type: 'button', style: S.btn, disabled: updBusy, onClick: checkUpdateNow }, M('检查更新', 'Check for updates')),
-              updEdit
-                ? null
-                : h('button', { type: 'button', style: S.btn, disabled: !u.local, onClick: startEditUpd }, M('修改配置', 'Edit config')),
             ),
           ),
           h('div', { style: S.hint }, text),
-          updEdit
-            ? h('div', null,
-              h('div', { style: S.kvRow },
-                h('div', { style: S.kvKey }, M('更新清单', 'Manifest')),
-                h('input', {
-                  type: 'text', style: S.input, value: updManifest, spellCheck: false,
-                  placeholder: cfg.manifestUrlIsDefault
-                    ? M(`留空 = 用内置默认（${cfg.manifestUrl || ''}）`, `Leave empty = built-in default (${cfg.manifestUrl || ''})`)
-                    : 'https://…/version.json',
-                  onChange: (e) => setUpdManifest(e.target.value),
-                }),
-              ),
-              h('div', { style: S.kvRow },
-                h('div', { style: S.kvKey }, M('更新令牌', 'Token')),
-                h('input', {
-                  type: 'text', style: S.input, value: updToken, spellCheck: false,
-                  placeholder: cfg.tokenSet
-                    ? M('已配置；留空表示不改（支持 $GITHUB_TOKEN 读取环境变量）', 'Already set; leave empty to keep (or enter $GITHUB_TOKEN for env var)')
-                    : M('GitHub / Gitee 令牌，或填 $GITHUB_TOKEN 读取本机环境变量', 'GitHub / Gitee token, or $GITHUB_TOKEN to read from env'),
-                  onChange: (e) => setUpdToken(e.target.value),
-                }),
-              ),
-              h('div', { style: S.actions },
-                h('button', { type: 'button', style: S.btnPrimary, disabled: updBusy, onClick: saveUpdConfig }, updBusy ? M('保存中…', 'Saving…') : M('保存', 'Save')),
-                h('button', { type: 'button', style: S.btn, disabled: updBusy, onClick: cancelEditUpd }, M('取消', 'Cancel')),
-                cfg.tokenSaved
-                  ? h('button', { type: 'button', style: S.btn, disabled: updBusy, onClick: clearUpdToken }, M('清除已存令牌', 'Clear stored token'))
-                  : null,
-              ),
-            )
-            : h('div', null,
-              h(Kv, {
-                k: M('更新清单', 'Manifest'),
-                v: cfg.manifestUrlIsDefault
-                  ? M('内置默认（GitHub API / gh-proxy / ghfast / GitHub raw 依次尝试）', 'Built-in default (GitHub API / gh-proxy / ghfast / GitHub raw in order)')
-                  : (cfg.manifestUrl || '…'),
-              }),
-              h(Kv, {
-                k: M('更新源', 'Source'),
-                v: u.sourceUsed
-                  ? u.sourceUsed
-                  : M('本次检查还没读到清单', 'No source reached yet'),
-              }),
-              h(Kv, {
-                k: M('更新令牌', 'Token'),
-                v: cfg.tokenSource === 'env' && cfg.tokenEnv
-                  ? M(`已从环境变量 ${cfg.tokenEnv} 读取（不落盘、绝不推送）`, `From env var ${cfg.tokenEnv} (not stored, never pushed)`)
-                  : cfg.tokenSource === 'git-credential'
-                    ? M('已从本机 git 凭据自动读取（不落盘、绝不推送）', 'From local git credential (not stored, never pushed)')
-                    : cfg.tokenSource === 'gh-cli'
-                      ? M('已从 GitHub CLI (gh) 自动读取（不落盘、绝不推送）', 'From GitHub CLI (gh) (not stored, never pushed)')
-                      : cfg.tokenSet
-                        ? M('已配置（仅存本机，绝不推送）', 'Set (local only, never pushed)')
-                        : M('未配置（公开库可不填；私有库可用本机 GitHub 登录、$GITHUB_TOKEN 或填入令牌）', 'Not set (optional for public repos; private repos use local GitHub login, $GITHUB_TOKEN, or a token)'),
-              }),
-              u.remote && u.remote.npmTgzUrls && u.remote.npmTgzUrls.length
-                ? h(Kv, {
-                    k: M('npm 下载路径', 'npm download URL'),
-                    v: h('span', { style: { display: 'inline-flex', flexDirection: 'column', gap: '2px' } },
-                      u.remote.npmTgzUrls.map((url, i) =>
-                        h('span', { key: i, title: url }, url)
-                      )
-                    ),
-                  })
-                : u.remote && u.remote.npmTgz
-                  ? h(Kv, {
-                      k: M('npm 下载路径', 'npm download URL'),
-                      v: u.remote.npmTgz,
-                    })
-                  : null,
-            ),
+          h('div', null,
+            h(Kv, {
+              k: M('更新源', 'Source'),
+              v: M('npm（只查 npm，不查 GitHub）', 'npm only (GitHub is not checked)'),
+            }),
+            h(Kv, {
+              k: M('npm 包', 'npm package'),
+              v: (cfg.packageName || 'dsh-profile-config-sync'),
+            }),
+            h(Kv, {
+              k: M('本次查询', 'Last query'),
+              v: u.sourceUsed
+                ? u.sourceUsed
+                : M('本次检查还没读到版本信息', 'No version info reached yet'),
+            }),
+            u.remote && u.remote.npmTgz
+              ? h(Kv, {
+                k: M('下载地址', 'Download URL'),
+                v: u.remote.npmTgz,
+              })
+              : null,
+          ),
           h('div', { style: S.footnote },
             M(
-              '下载只写 update-staging 并校验 sha256，插件目录不动；「重启并安装」在退出后覆盖安装并自动重开，失败自动回滚。令牌只存本机。',
-              'Download only writes to update-staging and verifies sha256; "Restart & install" overwrites after exit and relaunches, rolling back on failure. The token stays local.',
+              '更新只查 npm registry，不看 GitHub。下载只写 update-staging 并按 npm 给的 integrity 校验，插件目录不动；「重启并安装」在退出后覆盖安装并自动重开，失败自动回滚。',
+              'Updates are checked against the npm registry only, never GitHub. The download only writes to update-staging and is verified with the integrity value npm provides; "Restart & install" overwrites after exit and relaunches, rolling back on failure.',
             )),
-          updErr ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-error-primary)' } }, M(`保存失败：${updErr}`, `Save failed: ${updErr}`)) : null,
           updMsg ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-success-primary)' } }, updMsg) : null,
+          updErr ? h('div', { style: { ...S.footnote, color: 'var(--dsw-alias-state-error-primary)' } }, updErr) : null,
         )
       })()
 

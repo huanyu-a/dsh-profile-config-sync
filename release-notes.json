@@ -1,0 +1,6 @@
+{
+  "version": "0.6.47",
+  "releasedAt": "2026-11-27",
+  "notes": "0.6.47：按你的要求，插件更新只查 npm，不再查 GitHub。① 版本判定改用 npm 的 dist-tags.latest；下载地址与校验值取该版本单版本文档里的 dist.tarball / dist.integrity / dist.shasum；发布说明从 npm 包内的 version.json 读（已加进 files）。GitHub 的 raw / API / gh-proxy / ghfast 四条清单源整体退休——那套代码连同「更新清单 / 更新令牌」两个设置项一起撤了。② 插件改为在线安装：市场索引的 source 从 git 改成 npm，profile 里也从 registry 装而不是本地 tgz。顺带修掉两个真 bug：(a) 旧实现「清单记 pnpm pack 的 sha256、npm 当兜底下载源」在校验那步必然失败——实测 npm pack 产物与 registry 上的 tarball 逐字节一致，但与 pnpm pack 的资产不同；现在校验值取自 registry 自己，权威值与被校验物同源。(b) 市场索引的 publishTimestamp 写的是毫秒而非 Unix 秒，DSH 的 parseMarketIndex 会直接拒掉整个索引，也就是说插件市场里此前根本读不出这个插件。",
+  "notesEn": "0.6.47: as requested, the plugin now checks npm only and never GitHub. (1) The version comes from npm's dist-tags.latest; the download URL and checksums come from that version's document (dist.tarball / dist.integrity / dist.shasum); release notes come from version.json inside the npm package (now listed in files). The four GitHub manifest sources (raw / API / gh-proxy / ghfast) are retired, together with the \"update manifest\" and \"update token\" settings. (2) The plugin is installed from the registry: the market index source changed from git to npm, and the profile installs from the registry i…"
+}

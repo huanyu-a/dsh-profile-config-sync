@@ -19,6 +19,9 @@ param(
   [Parameter(Mandatory = $true)][string]$PluginDir,
   [string]$Version = '',
   [string]$Sha256 = '',
+  # 0.6.47：npm registry 的权威校验值（integrity = SRI sha512-base64，sha1 = dist.shasum）
+  [string]$Integrity = '',
+  [string]$Sha1 = '',
   # 候选下载地址，用 | 分隔
   [string]$TgzUrls = '',
   # 已经下好的本地包（有就不用下载）
@@ -195,7 +198,63 @@ if ($TgzFile -and (Test-Path -LiteralPath $TgzFile)) {
   }
 }
 
-if ($Sha256) {
+# ---------- 校验安装包 ----------
+# 0.6.47 起权威校验值来自 npm registry 自己的 dist.integrity（SRI，sha512-base64）/ dist.shasum（sha1），
+# 与被校验物同源。旧路径用打包时的 sha256 —— npm tarball 与 GitHub release 资产不是同一份字节流，
+# 那个校验对 npm 下载必然失败。优先 integrity，其次 sha1，最后 sha256（兼容老路径）。
+if ($Integrity) {
+  $algo = ''
+  $expectedB64 = ''
+  foreach ($part in ($Integrity -split '\s+' | Where-Object { $_ })) {
+    $dash = $part.IndexOf('-')
+    if ($dash -le 0) { continue }
+    $a = $part.Substring(0, $dash).ToLower()
+    if ($a -notin @('sha256', 'sha384', 'sha512')) { continue }
+    $algo = $a
+    $expectedB64 = $part.Substring($dash + 1)
+    break
+  }
+  if (-not $algo) {
+    EmitResult $false '更新源给的 integrity 格式无法解析' ''
+  }
+  $sha = switch ($algo) {
+    'sha256' { [System.Security.Cryptography.SHA256]::Create() }
+    'sha384' { [System.Security.Cryptography.SHA384]::Create() }
+    'sha512' { [System.Security.Cryptography.SHA512]::Create() }
+  }
+  $gotB64 = ''
+  try {
+    $fs = [System.IO.File]::OpenRead($pkgPath)
+    try {
+      $sha.TransformBlock($fs, 0, $fs.Length, $null, 0) | Out-Null
+      $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null
+      $gotB64 = [Convert]::ToBase64String($sha.Hash)
+    } finally { $fs.Dispose() }
+  } catch {
+    EmitResult $false ('本机 PowerShell 无法计算安装包 ' + $algo) ''
+  }
+  Log ("integrity（{0}）：{1}" -f $algo, $gotB64)
+  if ($gotB64 -ne $expectedB64) {
+    Log 'integrity 与更新源不一致，放弃安装'
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    EmitResult $false '安装包 integrity 校验不通过（没下载全或被改动）' ''
+  }
+  Log 'integrity 校验通过'
+} elseif ($Sha1) {
+  $hash = ''
+  try { $hash = [string]((Get-FileHash -LiteralPath $pkgPath -Algorithm SHA1).Hash) } catch { $hash = '' }
+  $hash = $hash.Trim().ToLower()
+  Log ("sha1：{0}" -f $(if ($hash) { $hash } else { '（算不出来）' }))
+  if (-not $hash) {
+    EmitResult $false '本机 PowerShell 无法计算安装包 sha1' ''
+  }
+  if ($hash -ne $Sha1.ToLower()) {
+    Log 'sha1 与更新源不一致，放弃安装'
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    EmitResult $false '安装包 sha1 校验不通过（没下载全或被改动）' ''
+  }
+  Log 'sha1 校验通过'
+} elseif ($Sha256) {
   $hash = ''
   try { $hash = [string]((Get-FileHash -LiteralPath $pkgPath -Algorithm SHA256).Hash) } catch { $hash = '' }
   $hash = $hash.Trim().ToLower()

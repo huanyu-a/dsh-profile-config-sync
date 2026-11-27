@@ -32,7 +32,7 @@ Based on [QcWyGm/dsh-config-sync-plugin](https://github.com/QcWyGm/dsh-config-sy
 - **Panel health check**: local / cloud badges (cloud re-checked every two minutes), version contract, bundle, dependencies, backup snapshots, last sync, and a to-do list with jump links.
 - **Safety boundaries**: browser profiles and credential stores are blocked at three independent layers (capture, upload, engine); three per-file size tiers (>100 MB skipped at capture, ≥95 MB dropped before commit, 50–95 MB warn only); both sides of a conflict are kept; path-traversal guards.
 - **Pending counts match the executor**: 12 groups on Windows, only the four groups the engine really syncs on macOS/Linux.
-- **Self-update**: reads the `version.json` manifest and checks / downloads / installs from the panel.
+- **Self-update**: checks the npm registry only (never GitHub) and downloads / installs from the panel.
 
 **Four keywords**: **configure** · **back up** · **sync** · **restore**.
 
@@ -44,8 +44,8 @@ Package name **`dsh-profile-config-sync`** (the npm package `dsh-config-sync` is
 
 | Method | Entry |
 |---|---|
-| npm | `npm i dsh-profile-config-sync` — **published at the same version as the GitHub release**; the `latest` tag points at it |
-| Plugin market | Search “Config Backup & Sync” in the client's plugin market (via the git commit registered in `market-index.json`) |
+| npm | `npm i dsh-profile-config-sync` — **the same version the panel self-update checks**; the `latest` tag points at it |
+| Plugin market | Search “Config Backup & Sync” in the client's plugin market — `market-index.json` registers `source.type: npm`, so the online registry version is what gets installed |
 | Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.46.tgz` |
 
 **Release status**: the latest release is [`v0.6.46`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.46) (2026-11-27); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
@@ -175,9 +175,12 @@ Details (process detection, lock file, environment cleanup, exit codes): [docs/R
 
 ## Self-update
 
-The panel card shows local and cloud versions; the manifest and packages live in the public repo (`version.json` + `releases/*.tgz`, a few hundred bytes to check). Status is one of: up to date / update available / downloaded (in `~\.dsh\update-staging\`) / installed pending restart / check failed.
+The panel card shows the local version and the version on **npm only — GitHub is never checked**. Status is one of: up to date / update available / downloaded (in `~\.dsh\update-staging\`) / installed pending restart / check failed.
 
-Manifest sources are tried in order (`gh-proxy.com` → `ghfast.top` → GitHub raw); download and install are separate steps, and installing quits the client, backs up the old directory, overwrites and relaunches once.
+- The version comes from npm's `dist-tags.latest`; the download URL and checksums come from that version's document (`dist.tarball` / `dist.integrity` / `dist.shasum`); release notes come from `version.json` inside the package. The old GitHub manifest sources (`gh-proxy` / `ghfast` / raw / API) are retired.
+- **The checksum comes from the same source as the artifact.** The npm tarball is not the same byte stream as the GitHub release asset — measured: `npm pack` is byte-identical to the registry tarball, but both differ from the `pnpm pack` asset. Verifying an npm download against the packaging-time sha256 can therefore never succeed; the registry's own `integrity` (sha512 SRI) / `shasum` (sha1) is used instead.
+- The registry can be overridden (`updateRegistry` setting, or the `DSH_CONFIG_SYNC_NPM_REGISTRY` env var) — still npm-only, just a different registry.
+- Download and install are separate steps, and installing quits the client, backs up the old directory, overwrites and relaunches once.
 
 ## Upstream & license
 

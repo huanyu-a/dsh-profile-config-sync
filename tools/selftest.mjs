@@ -658,16 +658,21 @@ if (prevScope === null) { try { unlinkSync(scopeFile) } catch { } } else writeFi
       && postExitSrc.indexOf("$sync = Find-PluginScript 'sync.ps1'") < postExitSrc.indexOf('if (-not $sync -and $RepoRoot)'),
     postExit || 'post-exit.ps1')
 
-  // 更新源自检：raw.githubusercontent.com 在部分网络下直连不通，而 Node 的 fetch 不读系统代理，
-  // 超时一到就 abort（面板上那句 "This operation was aborted"）。所以内置候选必须带实时反代排在前面。
-  // 不要用 jsDelivr 兜清单：它对 @main 这类分支别名缓存很久，发版后仍返回上一版清单（实测 + purge 也没立刻刷新）。
+  // 更新源自检（0.6.47 起：更新检查只查 npm，不再读 GitHub 清单）
+  //
+  // 旧断言盯的是「清单带 gh-proxy / ghfast 实时反代，raw 兜底」——那是读 GitHub 仓库根
+  // version.json 的年代。用户明确要求「插件更新只检查 npm，不检查 GitHub」，所以整条线退休：
+  // 更新检查读 npm 的 dist-tags + 单版本文档，校验值取 registry 自己的 dist.integrity / dist.shasum。
   const indexSrc = readFileSync(join(pluginRoot, 'index.js'), 'utf8')
-  check('更新清单带实时反代候选（gh-proxy 排在最前，raw 兜底）',
-    indexSrc.includes('gh-proxy.com') && indexSrc.includes('ghfast.top') &&
-    indexSrc.includes('UPDATE_MANIFEST_MIRRORS') && !indexSrc.includes('cdn.jsdelivr.net/gh/huanyu-a'),
+  check('更新检查只查 npm（dist-tags + 单版本文档），不再读 GitHub 清单',
+    indexSrc.includes('NPM_DIST_TAGS_URL') && indexSrc.includes('async function fetchNpmLatest') &&
+    !indexSrc.includes('async function fetchManifestAuto') && !indexSrc.includes('UPDATE_MANIFEST_MIRRORS') &&
+    !indexSrc.includes('gh-proxy.com') && !indexSrc.includes('raw.githubusercontent.com/' + 'huanyu-a'),
     'index.js')
-  check('清单按候选依次尝试并汇总失败原因', indexSrc.includes('async function fetchManifestAuto'), 'index.js')
-  check('清单超时放宽到 30 秒（raw 慢链路 10 秒会假失败）',
+  check('更新校验用 registry 的 integrity / shasum（与被校验物同源）',
+    indexSrc.includes('function verifyDownloadedPackage') && indexSrc.includes('dist.integrity') &&
+    /function verifyDownloadedPackage[\s\S]{0,900}integrity/.test(indexSrc), 'index.js')
+  check('清单超时放宽到 30 秒（慢链路 10 秒会假失败）',
     indexSrc.includes('UPDATE_FETCH_TIMEOUT = 30 * 1000'), 'index.js')
   // 0.3.7：更新拆成「只下载」和「退出后安装」两段。
   // 为什么：DSH 开着的时候覆盖插件目录，宿主会重新同步插件树、把「配置同步」面板卸载掉 ——
@@ -1963,13 +1968,19 @@ console.log('== 0.5.1：环境变量读取令牌 + 防令牌/凭据推入仓库 
     && !/withAccessToken[\s\S]{0,200}gh-proxy\.com/.test(idxSrc),
     'index.js 环境变量解析或代理防泄漏逻辑缺失')
 
-  check('FeedbackCard / UpdateCard 展示令牌来源并支持绑定环境变量与清除已存明文令牌',
+  check('FeedbackCard 展示令牌来源并支持绑定环境变量与清除已存明文令牌',
     cliSrc.includes('st.tokenSource')
     && cliSrc.includes('st.envCandidates')
     && cliSrc.includes('clearToken: true')
-    && cliSrc.includes('$GITHUB_TOKEN')
-    && cliSrc.includes('gh-proxy / ghfast / GitHub raw'),
-    'client.js 缺少环境变量交互或仍残留 jsDelivr 旧文案')
+    && cliSrc.includes('$GITHUB_TOKEN'),
+    'client.js 缺少环境变量交互')
+
+  // 0.6.47：UpdateCard 的更新源固定是 npm，旧的「更新清单 / 更新令牌」两栏撤掉，
+  // 面板上要写明来源是 npm（不能让人以为还在查 GitHub）。
+  check('UpdateCard 标明更新源是 npm，且不再有清单地址 / 令牌输入框',
+    cliSrc.includes('npm') && !cliSrc.includes('gh-proxy / ghfast / GitHub raw') &&
+    !cliSrc.includes("M('更新清单', 'Manifest')"),
+    'client.js 的更新卡仍显示旧的清单/令牌配置')
 
   check('capture / sync / webdav 全链路包含私密文件名黑名单与 GitHub 令牌防泄漏门禁',
     commonSrc.includes('Test-PrivateSecretFileName')
