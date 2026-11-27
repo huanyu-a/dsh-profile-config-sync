@@ -61,18 +61,21 @@ DSH 的配置散在 `~/.dsh` 的十几处：profile、全局提示、Skills、Ag
 
 | 方式 | 命令 / 入口 |
 |---|---|
-| npm | `npm i dsh-profile-config-sync`（**npm 上只到 `0.4.1`**，不含 0.6.x 的安全修复与多端能力） |
+| npm | `npm i dsh-profile-config-sync`（**已发布到与 GitHub Release 相同的版本**，`latest` 标签指的就是它） |
 | 插件市场 | 客户端「插件市场 → 发现」搜「配置备份与同步」（走 `market-index.json` 登记的 git 提交） |
-| 离线 tgz | `pnpm add ./dsh-profile-config-sync-0.6.44.tgz`（内网机器用这个） |
+| 离线 tgz | `pnpm add ./dsh-profile-config-sync-0.6.45.tgz`（内网机器用这个） |
 
-**发布状态**：最新 Release 是 [`v0.6.44`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.44)（2026-11-27），仓库已公开；npm 上的同名包同步发布（`npm i dsh-profile-config-sync`）。
+**发布状态**：最新 Release 是 [`v0.6.45`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.45)（2026-11-27），仓库已公开；npm 上的同名包同步发布（`npm i dsh-profile-config-sync`）。
 
 要正式发布时（需要有权限的账号，我不会擅自 push）：
 
 ```bash
-gh release create v0.6.39 dsh-profile-config-sync-0.6.44.tgz \
-  --repo huanyu-a/dsh-profile-config-sync --title v0.6.39 --notes-file <(sed -n '/0.6.39/p' README.md)
-# 发布后把 version.json 推到仓库根（面板的更新检查读它）
+gh release create v<版本> dsh-profile-config-sync-<版本>.tgz \
+  --repo huanyu-a/dsh-profile-config-sync --title "v<版本>" --notes-file <发布说明.md>
+# tag 与包名必须是同一个版本号，别像旧文档那样写成 v0.6.39 配 0.6.44 的包
+git tag -a v<版本> -m "v<版本>" && git push origin v<版本>
+# 发布后把仓库根的 version.json 更新到新版本并推上去：面板的更新检查读的是仓库里那份
+# （version.json 不在 npm 包里，files 字段没有它）
 ```
 
 装好后插件目录是 `<客户端根>\dsh-profile-config-sync-<ver>`，`appRoot` 留空时由插件位置反推客户端根。
@@ -390,6 +393,7 @@ push 失败时会**按真实远端地址归因**：https 走 `ls-remote` 检查�
 
 | 日期 | 版本 | 要点 |
 |---|---|---|
+| 2026-11-27 | 0.6.45 | **文档对齐现实**：① 中英 README 去掉「npm 上只到 0.4.1」的陈旧说法（改为「与 GitHub Release 同版本」，`dist-tags.latest` 即它）；② 发布命令块改成同版本占位，修掉「v0.6.39 配 0.6.44 的包」的自相矛盾；③ 写清 `version.json` 不在 npm 包里、面板更新检查读的是仓库里那份。功能代码无改动。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.44 | **一致性**：历史字段 `dsh.engines.dsh` 对齐顶层 `>=0.2.2-rc.5`；README 中英去掉写死的 10297，改 `127.0.0.1:<端口>`（以 `DSH_WEB_URL` 为准）；审计补 2 条断言。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.43 | **修正下限**：0.6.42 的 `engines.dsh: ">=0.2.3"` 会在 0.2.2-rc.5 运行时上被 DSH 按兼容性规则拒绝加载，改为 `">=0.2.2-rc.5"`（准入接口在该版本已存在，实测假插件复现拒绝流程）；准入代码不变。验收：64 套隔离夹具共 1059 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.42 | **安全**：13 条 HTTP 路由接进宿主准入（`ctx.connection.requestRejection`），裸 curl 从 200 变 401、拒绝体不含业务字段；补 `engines.dsh: ">=0.2.3"`；新增 `route-admission` 审计套件（16 条，含「每条注册都套准入」的结构断言）。验收：64 套隔离夹具共 1059 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
