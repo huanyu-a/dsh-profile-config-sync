@@ -63,20 +63,39 @@ DSH 的配置散在 `~/.dsh` 的十几处：profile、全局提示、Skills、Ag
 |---|---|
 | npm | `npm i dsh-profile-config-sync`（**npm 上只到 `0.4.1`**，不含 0.6.x 的安全修复与多端能力） |
 | 插件市场 | 客户端「插件市场 → 发现」搜「配置备份与同步」（走 `market-index.json` 登记的 git 提交） |
-| 离线 tgz | `pnpm add ./dsh-profile-config-sync-0.6.41.tgz`（内网机器用这个） |
+| 离线 tgz | `pnpm add ./dsh-profile-config-sync-0.6.42.tgz`（内网机器用这个） |
 
-**发布状态**：最新 Release 是 [`v0.6.41`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.41)（2026-11-26），仓库已公开；npm 上的同名包同步发布（`npm i dsh-profile-config-sync`）。
+**发布状态**：最新 Release 是 [`v0.6.42`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.42)（2026-11-27），仓库已公开；npm 上的同名包同步发布（`npm i dsh-profile-config-sync`）。
 
 要正式发布时（需要有权限的账号，我不会擅自 push）：
 
 ```bash
-gh release create v0.6.39 dsh-profile-config-sync-0.6.41.tgz \
+gh release create v0.6.39 dsh-profile-config-sync-0.6.42.tgz \
   --repo huanyu-a/dsh-profile-config-sync --title v0.6.39 --notes-file <(sed -n '/0.6.39/p' README.md)
 # 发布后把 version.json 推到仓库根（面板的更新检查读它）
 ```
 
 装好后插件目录是 `<客户端根>\dsh-profile-config-sync-<ver>`，`appRoot` 留空时由插件位置反推客户端根。
 
+## 面板路由的准入
+
+13 条 `/config-sync/*` 路由在进入处理器之前，先由宿主 Connection 判定：
+`ctx.connection.requestRejection(request)` —— DSH 官方的 Host/Origin 围栏加浏览器会话鉴权，
+和 GUI 自己的 `/api` 通道是同一套。宿主没有 `connection` 服务时（非 Web 载体），才退回插件自己的
+`originAllowed`（只认本机 Host、拒绝跨站与 `Sec-Fetch-Site: cross-site`）。
+
+**为什么要有这一层**：`webServer.register` 只是裸 HTTP 载体，DSH 文档写得很直白——
+「The carrier owns no authentication or Origin policy」，路由鉴权是组合层的责任。
+0.6.41 及之前只靠插件自己写的 `originAllowed`：缺 `Origin` 头的请求（本机任意进程、`curl`）
+会被当成可信来源放行，实测裸 `curl http://127.0.0.1:10297/config-sync/status` 返回 **200**，
+能读到仓库路径、配置摘要、待同步清单，也能触发推送与还原。
+现在同一请求得到 **401**，拒绝响应体只有 `{ ok: false, error: "unauthorized" | "forbidden" }`，不含任何业务字段。
+
+因为依赖 `requestRejection` / `connection.fetch` 这组准入接口，`package.json` 声明了 `engines.dsh: ">=0.2.3"`；
+低于该版本的客户端会按 DSH 的插件兼容性规则拒绝加载，而不是带着裸路由跑起来。
+
+自检里有专门的一套（`route-admission`，16 条断言）：13 条路由在 403 / 401 / 放行 / 无 connection 四种情形下逐一验证，
+并做结构断言「每条 `webServer.register` 的 handler 都套了准入」，防止以后新增路由时漏掉这一层。
 ## 已知限制
 
 - **非 Windows 没有互斥**：Windows 的 capture / apply 走 `Lock-SyncRun`（命名 Mutex），同一 `~/.dsh` 并发时后来者以退出码 3 结束；macOS / Linux 的引擎没有这层锁，两个动作同时跑仍可能撞文件。
@@ -369,6 +388,7 @@ push 失败时会**按真实远端地址归因**：https 走 `ls-remote` 检查�
 
 | 日期 | 版本 | 要点 |
 |---|---|---|
+| 2026-11-27 | 0.6.42 | **安全**：13 条 HTTP 路由接进宿主准入（`ctx.connection.requestRejection`），裸 curl 从 200 变 401、拒绝体不含业务字段；补 `engines.dsh: ">=0.2.3"`；新增 `route-admission` 审计套件（16 条，含「每条注册都套准入」的结构断言）。验收：64 套隔离夹具共 1059 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-26 | 0.6.41 | WebDAV 模式下面板不再显示「? @ ?」与「落后 ? · 领先 ?」：仓库目录只是普通文件夹（无 .git）时，两行改成「WebDAV 模式：这个目录不是 git 仓库，没有分支」/「WebDAV 模式不比提交前后」，未提交数量照常显示；元信息行的 `branch @ head` 尾巴只在真有分支时追加。顺带把市场索引图标从 1240×1696 整屏长图换成 180×180 图标、撤掉三张旧版截图、README 加六枚徽章。验收：63 套隔离夹具共 1043 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-26 | 0.6.40 | 只修工具链，插件行为与 0.6.39 完全一致。① `tools/clientcheck.mjs` 里一条按实现细节写的断言（查 `missing ? null :`），0.6.36 合并「云端仓库」与「同步方式（WebDAV）」两张卡后代码形状变了、行为没变，断言失效让 CI 的 publish 门禁变红；现在盯实际那道门（`(!wdConfigured && !gitConfigured) ? null :` 取消按钮）并补一条 `forced ? null` 断言。② `selftest.mjs` 的留窗断言还钉着字面量 `Start-Sleep -Seconds 360`，而 0.6.37 起停留时长可配（`-HoldSeconds`，默认仍是 360），改成盯默认值与变量。③ `tools/fix-session-cwd.mjs` 镜像副本自 0.6.34 起与 `runtime/tools/` 漂移（9989B vs 10636B），已按正本覆盖，并把提示里不存在的 `sync-plugin-mirror.ps1` 改成真实做法。验收：63 套隔离夹具共 1043 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-26 | 0.6.39 | 更名与文档：面板 / 侧栏 / 设置摘要行统一改成「**配置备份与同步**」（Config Backup & Sync），副标题改成「多端配置备份、同步与还原：本机 → 仓库 → 云端 → 另一台机器」，退出后同步窗口标题一起改名（`== DSH 配置同步 / x ==` 这类日志 banner 不动——面板靠它解析结果）。README 重排：定位段 + **主要功能** 10 条 + 四个关键词 + 目录锚点 + 发布状态压成一张表 + 新增**「来源与版权」**（上游 QcWyGm/dsh-config-sync-plugin，MIT，LICENSE 同步列出两行版权）；**实测记录改版本倒叙**。**正文从 921 行压到 392 行**：历史细节 → `docs/HISTORY.md`，完整记录 → `docs/CHANGELOG.md`，字段/接口/进程细节 → `docs/REFERENCE.md`（三份随包发布）；README 只留当前行为。验收：63 套隔离夹具共 1043 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |

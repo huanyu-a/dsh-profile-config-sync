@@ -1441,6 +1441,42 @@ function originAllowed(req) {
   try { return new URL(String(origin)).host === host } catch { return false }
 }
 
+/**
+ * 准入判定：先问宿主 Connection 的围栏，只有在宿主没提供 connection 服务时才退回本地围栏。
+ *
+ * 为什么必须问宿主：`webServer.register` 只是裸 HTTP 载体，官方文档写明「The carrier owns no
+ * authentication or Origin policy」——路由鉴权是组合层的责任。宿主为此提供了
+ * `ctx.connection.requestRejection(request)`（Host/Origin 围栏 + 浏览器会话鉴权，返回
+ * 401/403/undefined）与 `ctx.connection.admit(request)`。不接它，等于只靠自己写的
+ * `originAllowed`：缺 Origin 头的请求（curl、非浏览器进程、部分沙箱 iframe 的 `null`）
+ * 会被当成可信来源放行，本机上任何能发 HTTP 的东西都能读配置、触发推送/还原。
+ *
+ * @returns {0|401|403} 0 表示放行
+ */
+function admissionVerdict(ctx, req) {
+  try {
+    const conn = ctx && typeof ctx.get === 'function' ? ctx.get('connection', false) : null
+    if (conn && typeof conn.requestRejection === 'function') {
+      const verdict = conn.requestRejection({ headers: req.headers })
+      if (verdict === 401 || verdict === 403) return verdict
+      return 0
+    }
+  } catch { /* connection 在激活中/不可用：落到下面的本地围栏，不让请求变成 500 */ }
+  return originAllowed(req) ? 0 : 403
+}
+
+/** 给一条路由套上准入判定：拒绝时只回状态码与原因，不执行处理器。 */
+function admitWrap(ctx, handler) {
+  return (req, res) => {
+    const verdict = admissionVerdict(ctx, req)
+    if (verdict) {
+      sendJson(res, verdict, { ok: false, error: verdict === 401 ? 'unauthorized' : 'forbidden' })
+      return undefined
+    }
+    return handler(req, res)
+  }
+}
+
 function sendJson(res, code, body) {
   try {
     res.statusCode = code
@@ -6148,73 +6184,76 @@ export function apply(ctx, config) {
       // 每个请求按 accept-language 决定返回中文还是英文：AsyncLocalStorage 让 t() 在
       // 任何异步后续里都能读到本次请求的语言，不用把语言参数一层层往下传。
       const withLang = (handler) => (req, res) => langStore.run(pickLang(req), () => handler(req, res, config))
+      // 每条路由都过准入：先由宿主 Connection 判定（Host/Origin 围栏 + 浏览器会话鉴权），
+      // 宿主没提供 connection 时退回本地 originAllowed。少套一层就等于本机任何进程都能进来。
+      const guarded = (handler) => admitWrap(ctx, withLang(handler))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_STATUS,
-        handler: withLang(handleStatus),
+        handler: guarded(handleStatus),
       }))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_PREPARE,
-        handler: withLang(handlePrepare),
+        handler: guarded(handlePrepare),
       }))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_SETTINGS,
-        handler: withLang(handleSettings),
+        handler: guarded(handleSettings),
       }))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_AUTO,
-        handler: withLang(handleAuto),
+        handler: guarded(handleAuto),
       }))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_UPDATE,
-        handler: withLang(handleUpdate),
+        handler: guarded(handleUpdate),
       }))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_SCOPE,
-        handler: withLang(handleScope),
+        handler: guarded(handleScope),
       }))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_EXTRA_CONFIG,
-        handler: withLang(handleExtraConfig),
+        handler: guarded(handleExtraConfig),
       }))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_CONFLICT,
-        handler: withLang(handleConflict),
+        handler: guarded(handleConflict),
       }))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_ROOTS,
-        handler: withLang(handleRoots),
+        handler: guarded(handleRoots),
       }))
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_FEEDBACK,
-        handler: withLang(handleFeedback),
+        handler: guarded(handleFeedback),
       }))
       // 0.3.76：会话投影缓存守卫（GET 只读扫描 / POST scan|sweep|clear|busy）
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_CACHE_GUARD,
-        handler: withLang(handleCacheGuard),
+        handler: guarded(handleCacheGuard),
       }))
       // 0.3.76：工作区显示状态卡片
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_WORKSPACE_VIEW,
-        handler: withLang(handleWorkspaceView),
+        handler: guarded(handleWorkspaceView),
       }))
       // 0.4.0：WebDAV 通道（连通性测试 / 立即上传 / 立即下载 / 保存设置）
       scoped.effect(() => scoped.webServer.register({
         kind: 'exact',
         path: ROUTE_WEBDAV,
-        handler: withLang(handleWebdav),
+        handler: guarded(handleWebdav),
       }))
     })
     // 开关打开才排一次启动检查（默认关 = 什么都不做）

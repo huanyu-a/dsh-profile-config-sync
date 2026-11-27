@@ -46,10 +46,26 @@ Package name **`dsh-profile-config-sync`** (the npm package `dsh-config-sync` is
 |---|---|
 | npm | `npm i dsh-profile-config-sync` — **npm only has `0.4.1`**, without the 0.6.x safety fixes |
 | Plugin market | Search “Config Backup & Sync” in the client's plugin market (via the git commit registered in `market-index.json`) |
-| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.41.tgz` |
+| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.42.tgz` |
 
-**Release status**: the latest release is [`v0.6.41`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.41) (2026-11-26); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
+**Release status**: the latest release is [`v0.6.42`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.42) (2026-11-27); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
 
+## HTTP route admission
+
+Every `/config-sync/*` route asks the Host Connection before the handler runs:
+`ctx.connection.requestRejection(request)` — DSH's own Host/Origin fence plus browser-session authentication,
+the same gate the GUI's `/api` channel uses. Only when the Host offers no `connection` service does the plugin fall
+back to its own `originAllowed` (loopback Host, cross-site and `Sec-Fetch-Site: cross-site` refused).
+
+**Why this layer exists**: `webServer.register` is a bare HTTP carrier — the DSH docs say the carrier "owns no
+authentication or Origin policy", so route authentication belongs to the composition. Through 0.6.41 the plugin relied
+only on its own `originAllowed`, which treats a request without an `Origin` header as trustworthy; a bare
+`curl http://127.0.0.1:10297/config-sync/status` returned **200** and exposed repo paths, config digests and the pending
+list, and could trigger push or restore. The same request now answers **401**, and a refusal body carries only
+`{ ok: false, error: "unauthorized" | "forbidden" }` — no business fields.
+
+Because the gate depends on `requestRejection` / `connection.fetch`, `package.json` declares `engines.dsh: ">=0.2.3"`;
+older clients refuse the plugin under DSH's plugin-compatibility rules instead of running it with open routes.
 ## Known limits
 
 - **No mutex off Windows**: Windows capture/apply use a named mutex (`Lock-SyncRun`, exit code 3 for a second runner); the macOS/Linux engine has no such lock.
