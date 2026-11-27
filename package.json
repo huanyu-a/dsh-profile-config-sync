@@ -1,6 +1,6 @@
 {
   "name": "dsh-profile-config-sync",
-  "version": "0.6.42",
+  "version": "0.6.43",
   "type": "module",
   "description": "DeepSeek Harness 客户端的多端配置备份、同步与还原插件：把本机配置按 12 组内容抓取成 Git 仓库快照（profile、全局提示、Skills、Agent 预设、插件设置与工作流、插件数据、工作区、会话记录等），可推送到 GitHub / Gitee / GitLab 或上传 WebDAV；换机重装后一条命令拉回并铺开，误改可选档回滚。同步动作在客户端退出后执行（PowerShell on Windows，Node 引擎 on macOS / Linux），面板与文案跟随客户端语言。",
   "main": "./index.js",
@@ -33,7 +33,7 @@
   ],
   "engines": {
     "node": ">=22",
-    "dsh": ">=0.2.3"
+    "dsh": ">=0.2.2-rc.5"
   },
   "dsh": {
     "engines": {

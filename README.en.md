@@ -46,9 +46,9 @@ Package name **`dsh-profile-config-sync`** (the npm package `dsh-config-sync` is
 |---|---|
 | npm | `npm i dsh-profile-config-sync` — **npm only has `0.4.1`**, without the 0.6.x safety fixes |
 | Plugin market | Search “Config Backup & Sync” in the client's plugin market (via the git commit registered in `market-index.json`) |
-| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.42.tgz` |
+| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.43.tgz` |
 
-**Release status**: the latest release is [`v0.6.42`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.42) (2026-11-27); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
+**Release status**: the latest release is [`v0.6.43`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.43) (2026-11-27); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
 
 ## HTTP route admission
 
@@ -64,8 +64,12 @@ only on its own `originAllowed`, which treats a request without an `Origin` head
 list, and could trigger push or restore. The same request now answers **401**, and a refusal body carries only
 `{ ok: false, error: "unauthorized" | "forbidden" }` — no business fields.
 
-Because the gate depends on `requestRejection` / `connection.fetch`, `package.json` declares `engines.dsh: ">=0.2.3"`;
-older clients refuse the plugin under DSH's plugin-compatibility rules instead of running it with open routes.
+Because the gate depends on `requestRejection` / `connection.fetch`, `package.json` declares `engines.dsh: ">=0.2.2-rc.5"`.
+The floor is measured, not guessed: the admission APIs already exist in 0.2.2-rc.5 (`requestRejection` / `admit` in
+`dsh-client-connection/src/rpc-host.ts`), while DSH enforces `engines.dsh` at install and at profile startup — a fake
+plugin declaring `>=99.0.0` is refused with `incompatible-version` on a scratch profile — so `>=0.2.3` would lock out the
+machine currently running 0.2.2-rc.5. Once the runtime moves to 0.2.3+, the floor can be tightened in one line.
+
 ## Known limits
 
 - **No mutex off Windows**: Windows capture/apply use a named mutex (`Lock-SyncRun`, exit code 3 for a second runner); the macOS/Linux engine has no such lock.
