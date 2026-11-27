@@ -46,9 +46,9 @@ Package name **`dsh-profile-config-sync`** (the npm package `dsh-config-sync` is
 |---|---|
 | npm | `npm i dsh-profile-config-sync` — **published at the same version as the GitHub release**; the `latest` tag points at it |
 | Plugin market | Search “Config Backup & Sync” in the client's plugin market (via the git commit registered in `market-index.json`) |
-| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.45.tgz` |
+| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.46.tgz` |
 
-**Release status**: the latest release is [`v0.6.45`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.45) (2026-11-27); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
+**Release status**: the latest release is [`v0.6.46`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.46) (2026-11-27); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
 
 ## HTTP route admission
 

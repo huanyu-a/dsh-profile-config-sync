@@ -7,7 +7,7 @@
 [![license](https://img.shields.io/github/license/huanyu-a/dsh-profile-config-sync?style=flat-square&color=3fb950)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-8957e5?style=flat-square)](#同步内容勾选)
 [![groups](https://img.shields.io/badge/%E5%90%8C%E6%AD%A5%E5%86%85%E5%AE%B9-12%20%E7%BB%84-1f6feb?style=flat-square)](#同步内容勾选)
-[![tests](https://img.shields.io/badge/%E8%87%AA%E6%A3%80-64%20%E5%A5%97%20%C2%B7%201065%20%E6%9D%A1-3fb950?style=flat-square)](#自检)
+[![tests](https://img.shields.io/badge/%E8%87%AA%E6%A3%80-64%20%E5%A5%97%20%C2%B7%201061%20%E6%9D%A1-3fb950?style=flat-square)](#自检)
 
 中文 | [English](README.en.md)
 
@@ -63,9 +63,9 @@ DSH 的配置散在 `~/.dsh` 的十几处：profile、全局提示、Skills、Ag
 |---|---|
 | npm | `npm i dsh-profile-config-sync`（**已发布到与 GitHub Release 相同的版本**，`latest` 标签指的就是它） |
 | 插件市场 | 客户端「插件市场 → 发现」搜「配置备份与同步」（走 `market-index.json` 登记的 git 提交） |
-| 离线 tgz | `pnpm add ./dsh-profile-config-sync-0.6.45.tgz`（内网机器用这个） |
+| 离线 tgz | `pnpm add ./dsh-profile-config-sync-0.6.46.tgz`（内网机器用这个） |
 
-**发布状态**：最新 Release 是 [`v0.6.45`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.45)（2026-11-27），仓库已公开；npm 上的同名包同步发布（`npm i dsh-profile-config-sync`）。
+**发布状态**：最新 Release 是 [`v0.6.46`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.46)（2026-11-27），仓库已公开；npm 上的同名包同步发布（`npm i dsh-profile-config-sync`）。
 
 要正式发布时（需要有权限的账号，我不会擅自 push）：
 
@@ -393,6 +393,7 @@ push 失败时会**按真实远端地址归因**：https 走 `ls-remote` 检查�
 
 | 日期 | 版本 | 要点 |
 |---|---|---|
+| 2026-11-27 | 0.6.46 | **徽章数字接回计数**：0.6.41 手工写死的「64 套 · 1065 条」两版没再动，与同页验收声明（1061）打脸；现在 finalize 从 `last-count.json` 直接生成，口径与验收声明一模一样（只算非元套件：64 套 · 1061 条），人手不再参与。功能代码无改动。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.45 | **文档对齐现实**：① 中英 README 去掉「npm 上只到 0.4.1」的陈旧说法（改为「与 GitHub Release 同版本」，`dist-tags.latest` 即它）；② 发布命令块改成同版本占位，修掉「v0.6.39 配 0.6.44 的包」的自相矛盾；③ 写清 `version.json` 不在 npm 包里、面板更新检查读的是仓库里那份。功能代码无改动。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.44 | **一致性**：历史字段 `dsh.engines.dsh` 对齐顶层 `>=0.2.2-rc.5`；README 中英去掉写死的 10297，改 `127.0.0.1:<端口>`（以 `DSH_WEB_URL` 为准）；审计补 2 条断言。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.43 | **修正下限**：0.6.42 的 `engines.dsh: ">=0.2.3"` 会在 0.2.2-rc.5 运行时上被 DSH 按兼容性规则拒绝加载，改为 `">=0.2.2-rc.5"`（准入接口在该版本已存在，实测假插件复现拒绝流程）；准入代码不变。验收：64 套隔离夹具共 1059 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
