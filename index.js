@@ -1412,6 +1412,9 @@ async function inspect(config) {
       lastCheckError: autoState.lastCheckError,
       drift: autoState.drift,
       pending: autoState.pending,
+      // 0.6.49：后台自动拉取（启动时那条，没有请求也没有面板）在 macOS 上不再弹原生框，
+      // 而是把这个提示挂出来，由面板的「立即拉取」接手 —— 否则对话框被窗口挡住就等于永不发生。
+      pullPrompt: autoState.pullPrompt || null,
       watcherStartedAt: autoState.watcherStartedAt,
       script: autoScript(dshHome, repo),
       // post-exit.ps1 上次执行的结果（成功/失败/是否回滚），客户端启动后据此弹 5 秒提示
@@ -5058,6 +5061,7 @@ async function handleAuto(req, res, config) {
       autoState.checking = false
       autoState.lastCheckAt = Date.now()
       autoState.drift = drift
+      if (!drift || !(drift.behind > 0)) autoState.pullPrompt = null
       sendJson(res, 200, { ok: true, action, drift, error: autoState.lastCheckError || null })
       return
     }
@@ -5118,6 +5122,7 @@ async function handleAuto(req, res, config) {
       const started = await spawnWatcher({ mode, repo, appRoot, dshHome, restart, closeRequested: closeNow })
       if (!started.ok) throw new Error(started.error)
       autoState.pending = { mode, at: Date.now(), restart, watcherPid: started.pid, closeRequested: false }
+      autoState.pullPrompt = null
       // 用户明确要求"现在就同步"：排队后请求客户端退出（不带 /F，走正常关闭，配置能存下来）
       let closed = false
       if (body.closeNow !== false) {
@@ -5175,20 +5180,35 @@ function scheduleAutoStart(config) {
         }
       }
       autoState.drift = drift
+      if (!drift || !(drift.behind > 0)) autoState.pullPrompt = null
       const appRoot = resolveAppRoot(config?.appRoot) || ''
 
       if (settings.autoPull && drift.behind > 0) {
-        const yes = await askConfirm(
-          t('云端有更新，要同步到本机吗？', 'The cloud has new commits — sync them to this machine?'),
-          t(
-            `云端比本机多 ${drift.behind} 个提交。\n`
-            + '同步需要先完全退出 DSH：确认后客户端会自动关闭，拉取完成后按设置自动重新打开。\n'
-            + `（本机领先 ${drift.ahead} 个提交，拉取不会动它们）`,
-            `The cloud is ${drift.behind} commit(s) ahead of this machine.\n`
-            + 'Syncing requires DSH to fully exit first: after you confirm, the client closes itself and reopens according to your settings once the pull finishes.\n'
-            + `(This machine is ${drift.ahead} commit(s) ahead — pulling leaves those alone.)`,
-          ),
+        const title = t('云端有更新，要同步到本机吗？', 'The cloud has new commits — sync them to this machine?')
+        const text = t(
+          `云端比本机多 ${drift.behind} 个提交。\n`
+          + '同步需要先完全退出 DSH：确认后客户端会自动关闭，拉取完成后按设置自动重新打开。\n'
+          + `（本机领先 ${drift.ahead} 个提交，拉取不会动它们）`,
+          `The cloud is ${drift.behind} commit(s) ahead of this machine.\n`
+          + 'Syncing requires DSH to fully exit first: after you confirm, the client closes itself and reopens according to your settings once the pull finishes.\n'
+          + `(This machine is ${drift.ahead} commit(s) ahead — pulling leaves those alone.)`,
         )
+        // 0.6.49：启动时的自动拉取不再在 macOS 上弹原生框。这条路径是**没有请求、没有面板**的
+        // 后台流程，osascript 的 display dialog 往往落在应用窗口后面甚至不出现在前台 —— 用户看
+        // 不见就等于「自动拉取从来不会发生」，而 DSH 还以为在等确认（12 分钟超时）。
+        // 现在改成把提示挂进状态，面板的「不一致 · 立即拉取」一键接手；Windows 保持原样。
+        let yes = false
+        if (IS_WIN) {
+          yes = await askConfirm(title, text)
+        } else {
+          autoState.pullPrompt = { behind: drift.behind, ahead: drift.ahead, at: Date.now(), title, message: text }
+          try {
+            const logDir = join(dshHome, 'logs')
+            mkdirSync(logDir, { recursive: true })
+            writeFileSync(join(logDir, 'auto-sync-pull-prompt.log'),
+              `[${new Date().toISOString()}] 云端领先 ${drift.behind} 个提交：等用户在面板里点「立即拉取」\n`, { flag: 'a' })
+          } catch { }
+        }
         if (yes) {
           // 用户点了确认，插件随后自己关客户端 → 允许守护进程在窗口消失后清残留
           const started = await spawnWatcher({ mode: 'pull', repo, appRoot, dshHome, restart: settings.autoRestart, closeRequested: true })

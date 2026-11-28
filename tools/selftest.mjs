@@ -2479,6 +2479,21 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
   check('pgrep 用的模式里带可执行文件路径（不是光秃秃的进程名）',
     /Contents.*MacOS|DeepSeek Harness/.test(pf.clientProcessPattern(appRoot)), pf.clientProcessPattern(appRoot))
 
+  // 后台自动拉取（启动时那条）在 macOS 上不能弹原生框：那条路径没有请求也没有面板，
+  // osascript 的 display dialog 常被窗口挡住 → 用户看不见、自动拉取永不发生（实测踩过）。
+  // 现在 POSIX 只挂 status.auto.pullPrompt + 日志，由面板一键接手；Windows 保持原样。
+  const hostSrc = readFileSync(join(repoRootOfTools, 'index.js'), 'utf8')
+  check('后台自动拉取：只在 Windows 弹原生确认框',
+    /if \(IS_WIN\) \{\s*\r?\n\s*yes = await askConfirm\(title, text\)/.test(hostSrc),
+    'index.js 的 scheduleAutoStart 分支没有按平台区分确认方式')
+  check('后台自动拉取：POSIX 挂 pullPrompt 并写日志（面板可接手）',
+    hostSrc.includes('autoState.pullPrompt = { behind: drift.behind')
+    && hostSrc.includes('auto-sync-pull-prompt.log'))
+  check('status 暴露 auto.pullPrompt（否则面板无从提示）',
+    /pullPrompt: autoState\.pullPrompt \|\| null/.test(hostSrc))
+  check('排队拉取后清掉 pullPrompt（不然提示一直挂着）',
+    /autoState\.pullPrompt = null/.test(hostSrc))
+
   // 私钥判据必须两处共用同一份正则（webdav 上传侧 + capture 侧），否则一边加了
   // id_ed25519、另一边照旧放行 —— 用户把 ~/.ssh 加进额外路径就会漏传私钥。
   const engineSrc = readFileSync(join(runtimeDir, 'sync-engine.mjs'), 'utf8')

@@ -400,8 +400,15 @@ window.__ModuleLoader__.load({
       return body
     }
 
-    /** 自动同步接口：check / pull-now / push-now / push-live / cancel。 */
-    async function callAuto(payload) {
+    /**
+     * 自动同步接口：check / pull-now / push-now / push-live / cancel。
+     *
+     * 0.6.49：宿主在 macOS 上用 osascript 弹原生确认框（display dialog）。面板点按钮时那个框
+     * 可能被应用窗口挡住、甚至根本不出现在前台 —— 请求就这么挂到 12 分钟超时，用户看到的是
+     * 「按钮转圈、没反应」。现在改成两段式：宿主第一遍回 needConfirm + 文案，面板自己问
+     * （window.confirm），确认后带 confirmed:true 重发同一请求。命令行/curl 调用仍然走原生框。
+     */
+    async function autoFetch(payload, depth = 0) {
       const res = await fetch('/config-sync/auto', {
         method: 'POST',
         cache: 'no-store',
@@ -412,9 +419,17 @@ window.__ModuleLoader__.load({
       const text = await res.text()
       let body
       try { body = text ? JSON.parse(text) : null } catch { throw badJson(res) }
+      if (body && body.needConfirm && depth < 2) {
+        const canAsk = typeof window !== 'undefined' && typeof window.confirm === 'function'
+        const ok = canAsk ? window.confirm(String(body.message || body.title || '继续？')) : false
+        // 用户点了取消：不抛错（取消不是失败），把决定原样交回调用方
+        if (!ok) return { ok: true, action: payload.action, cancelled: true, needConfirm: true }
+        return autoFetch({ ...payload, confirmed: true }, depth + 1)
+      }
       if (!res.ok || !body || body.ok !== true) throw new Error((body && body.error) || `${res.status}`)
       return body
     }
+    async function callAuto(payload) { return autoFetch(payload) }
 
     /**
      * 同步内容勾选：GET 取十组内容与当前勾选，POST 落盘 `<DshHome>\config-sync-scope.json`。
@@ -2456,17 +2471,9 @@ window.__ModuleLoader__.load({
           })
         }
         try {
-          const res = await fetch('/config-sync/auto', {
-            method: 'POST', cache: 'no-store', credentials: 'same-origin',
-            headers: jsonHeaders(),
-            body: JSON.stringify({ action, ...(extra || {}) }),
-          })
-          const text = await res.text()
-          let body
-          // 这一处原来是全文件唯一没有 try 的 JSON.parse：宿主代理回一页 HTML 错误时，
-          // 用户看到的是 "Unexpected token '<'" 这种噪声，而不是「500 返回非 JSON」。
-          try { body = text ? JSON.parse(text) : null } catch { throw badJson(res) }
-          if (!res.ok || !body || body.ok !== true) throw new Error((body && body.error) || `${res.status}`)
+          // 0.6.49：走 autoFetch —— 需要确认时在面板里问，不再依赖宿主弹的原生框
+          const body = await autoFetch({ action, ...(extra || {}) })
+          if (body && body.cancelled) { setBusy(''); setMsg(M('已取消', 'Cancelled')); return }
           if (action === 'check') {
             const d = body.drift
             setMsg(d
@@ -2571,6 +2578,16 @@ window.__ModuleLoader__.load({
               `Queued: ${pending.mode === 'pull' ? 'pull' + (pending.restart ? ' and relaunch the client' : '') : 'push'} after exit `
               + `(${new Date(pending.at).toLocaleTimeString(localeNow(), { hour12: false })}`
               + `${pendingReason ? `, reason: ${pendingReason}` : ''})`,
+            ))
+          : null,
+        // 0.6.49：后台自动拉取在 macOS 上不再弹原生框（启动时的对话框常被窗口挡住，
+        // 用户看不见就等于永不发生）。宿主把提示挂进 status.auto.pullPrompt，这里明说一句，
+        // 让用户知道「该点下面那个按钮」——而不是以为自动同步在工作。
+        auto.pullPrompt && !pending
+          ? h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warn-primary)' } },
+            M(
+              `云端领先 ${auto.pullPrompt.behind} 个提交：自动拉取需要你点一下「立即拉取」（退出后才会执行）`,
+              `The cloud is ${auto.pullPrompt.behind} commit(s) ahead — click "Pull now" to sync (it runs after DSH exits)`,
             ))
           : null,
         !auto.script

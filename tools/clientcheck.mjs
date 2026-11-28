@@ -288,6 +288,16 @@ try {
   check('体检数据字段齐全', false, String(e && e.message))
 }
 
+// 0.6.49：/config-sync/auto 走同一个 autoFetch（两段式确认 + 取消不抛错），
+// 面板不再依赖宿主弹的原生框 —— 否则 macOS 上框被挡住时按钮只会转圈。
+{
+  check('auto 接口收口到 autoFetch（不再各处手写 fetch）',
+    source.includes('async function autoFetch(') && !source.includes("fetch('/config-sync/auto', {\n            method: 'POST', cache: 'no-store'"))
+  check('autoFetch 支持 needConfirm 的两段式确认', source.includes('body.needConfirm && depth < 2'))
+  check('用户取消确认时返回 cancelled 而不是抛错', source.includes('cancelled: true, needConfirm: true'))
+  check('面板会提示「云端领先 N 个提交，请点立即拉取」', source.includes('auto.pullPrompt && !pending'))
+}
+
 // 0.6.49：云端目标卡的「强制编辑态」回归（用户实测：选 WebDAV 但字段还是 Git 那套，
 // 保存报「请填写 WebDAV 地址」，因为 activeMode 只认 editing、不认强制编辑态）
 {
