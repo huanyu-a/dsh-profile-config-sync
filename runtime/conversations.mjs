@@ -239,6 +239,9 @@ export function captureConversations({ repoRoot, dshHome, scope = null, log = co
     const wanted = new Map()
     for (const abs of listFiles(srcRoot)) {
       const relLocal = relative(srcRoot, abs).split(BS).join('/')
+      // 运行期锁文件不进仓库：`session.lock` 只是「这个会话正被某个进程打开」的标记，
+      // 铺到另一台机器上会变成一条指向不存在的 pid 的陈旧锁，DSH 可能据此以为会话在占用。
+      if (/(^|\/)session\.lock$/.test(relLocal)) continue
       const parts = relLocal.split('/')
       if (parts.length > 1 && isDefaultWorkspaceDir(parts[0])) continue
       if (block.remap && parts.length > 1 && plan.skipLocal.has(parts[0])) continue
@@ -335,6 +338,8 @@ export function applyConversations({ repoRoot, dshHome, scope = null, backupRoot
     if (!existsSync(srcRoot)) continue
     for (const abs of listFiles(srcRoot)) {
       const relRepo = relative(srcRoot, abs).split(BS).join('/')
+      // 仓库里可能还留着老版本抓进去的 session.lock：铺回去会变成陈旧锁，直接跳过
+      if (/(^|\/)session\.lock$/.test(relRepo)) continue
       let rel = relRepo
       if (block.remap) {
         rel = mapFirst(relRepo)

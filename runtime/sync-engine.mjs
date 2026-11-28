@@ -31,7 +31,7 @@ import {
 import { buildContract, checkContract, contractPath, contractText, readContract } from './contract.mjs'
 import { listMachines, localMachineInfo, writeMachineInfo } from './machines.mjs'
 import {
-  downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive, purgeForbiddenFromCloud,
+  downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive, purgeForbiddenFromCloud, purgeStaleLocksFromCloud,
   PRIVATE_KEY_BODY_RE, SSH_KEY_NAME_RE,
 } from './webdav.mjs'
 import { applyConversations, captureConversations, conversationPendingRoots, resolveGuardScript } from './conversations.mjs'
@@ -2266,8 +2266,11 @@ export async function runCli(argv) {
         console.log(`WebDAV 上传：上传 ${up.uploaded.length} · 跳过 ${up.skipped.length} · 错误 ${up.errors.length}`)
         // 顺手清掉老版本推上去的浏览器剖面（Login Data / Cookies 不该待在云端）
         const purge = await purgeForbiddenFromCloud(w)
+        const lockPurge = await purgeStaleLocksFromCloud(w)
         if (purge.deleted.length) console.log(`云端清理：删除 ${purge.deleted.length} 个历史文件（浏览器剖面）`)
         for (const e of purge.errors) console.error(`  [!] ${e}`)
+        if (lockPurge.deleted.length) console.log(`云端清理：删除 ${lockPurge.deleted.length} 个历史 session.lock（陈旧锁）`)
+        for (const e of lockPurge.errors) console.error(`  [!] ${e}`)
         return up.ok ? 0 : 1
       }
       return 0

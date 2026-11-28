@@ -59,6 +59,7 @@ import { checkContract, readContract } from './runtime/contract.mjs'
 import {
   downloadRepo, isSecureUrl, normalizeWebdav, sanitizeUserAgent, testConnection, uploadRepo, webdavActive,
   purgeForbiddenFromCloud,
+  purgeStaleLocksFromCloud,
 } from './runtime/webdav.mjs'
 
 const pluginRequire = createRequire(import.meta.url)
@@ -5660,11 +5661,13 @@ async function handleWebdav(req, res, config) {
     const r = await uploadRepo(w, repo)
     // 顺手清掉老版本推上去的浏览器剖面（Login Data / Cookies 不该待在云端）
     const purge = await purgeForbiddenFromCloud(w)
+    const lockPurge = await purgeStaleLocksFromCloud(w)
     sendJson(res, 200, {
       ok: r.ok,
       uploaded: r.uploaded.length,
       skipped: r.skipped.length,
       purged: purge.deleted.length,
+      purgedLocks: lockPurge.deleted.length,
       errors: r.errors.slice(0, 20),
     })
     return

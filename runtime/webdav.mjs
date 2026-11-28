@@ -945,10 +945,25 @@ export async function deletePrefixes(w, prefixes = []) {
 export const FORBIDDEN_CLOUD_PREFIXES = ['plugin-data/browser-profiles', 'plugin-data/User Data', 'plugin-data/user data']
 
 /**
- * 推送后清云端的历史遗留：老版本（0.6.4x 之前）会把插件的浏览器剖面整个推上去，
- * 里面有 Login Data / Cookies / Local State，等于把凭据放到网盘上。
- * 现在 capture 已经不抓了，但云端那份还在 —— 每次推送顺手删掉，不用用户自己找。
+ * 推送时顺带清掉云端的历史锁文件：`conversations/sessions/<目录>/session.lock`（旧版连运行期锁一起传了）。
+ *
+ * 这些是运行期标记（哪个进程正打开这个会话），0.6.49 之前被一并抓进仓库上传了。
+ * 铺回另一台机器就成了一条指向不存在 pid 的陈旧锁，所以按后缀精确删，不动别的东西。
  */
+export async function purgeStaleLocksFromCloud(w) {
+  const deleted = [], errors = []
+  if (!w || !w.enabled) return { ok: true, deleted, errors }
+  const meta = await listRemoteMeta(w, '')
+  if (!meta || typeof meta.keys !== 'function') return { ok: true, deleted, errors }
+  for (const k of meta.keys()) {
+    if (!/(^|\/)session\.lock$/.test(String(k))) continue
+    const r = await deleteRemote(w, k)
+    if (r && r.ok) deleted.push(k)
+    else errors.push(`${k}: ${(r && (r.error || r.status)) || '删除失败'}`)
+  }
+  return { ok: errors.length === 0, deleted, errors }
+}
+
 export async function purgeForbiddenFromCloud(w, prefixes = FORBIDDEN_CLOUD_PREFIXES) {
   const deleted = [], errors = []
   if (!w || !w.enabled) return { ok: true, deleted, errors }
@@ -994,7 +1009,9 @@ export async function runWebdavCli(argv) {
       },
     })
     const purge = await purgeForbiddenFromCloud(w)
+    const lockPurge = await purgeStaleLocksFromCloud(w)
     if (purge.deleted.length) console.log(`云端清理：删除 ${purge.deleted.length} 个历史文件（浏览器剖面）`)
+    if (lockPurge.deleted.length) console.log(`云端清理：删除 ${lockPurge.deleted.length} 个历史 session.lock（陈旧锁）`)
     console.log(`WebDAV 上传：上传 ${r.uploaded.length} · 跳过 ${r.skipped.length} · 错误 ${r.errors.length}`)
     for (const e of r.errors.slice(0, 20)) console.error(`  [!] ${e}`)
     return r.ok ? 0 : 1

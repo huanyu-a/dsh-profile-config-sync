@@ -248,6 +248,20 @@ try {
       `deleted=${JSON.stringify(pr.deleted)} left=${profLeft} errors=${JSON.stringify(pr.errors)}`)
   }
 
+  // 4c) 历史 session.lock：老版本连运行期锁一起传了，铺回另一台机器会变成陈旧锁
+  {
+    const { purgeStaleLocksFromCloud } = await import('../runtime/webdav.mjs')
+    const sessDir = join(davRoot, 'dsh-config-sync', 'conversations', 'sessions', '--ws-1--', 's1')
+    mkdirSync(sessDir, { recursive: true })
+    writeFileSync(join(sessDir, 'session.lock'), '12345')
+    writeFileSync(join(sessDir, 'session.v4.jsonl.zstd'), 'log')
+    const lr = await purgeStaleLocksFromCloud(w)
+    check('推送后清理云端历史 session.lock（陈旧锁不该铺回另一台机器）',
+      lr.deleted.length === 1 && !existsSync(join(sessDir, 'session.lock'))
+      && existsSync(join(sessDir, 'session.v4.jsonl.zstd')),
+      `deleted=${JSON.stringify(lr.deleted)} errors=${JSON.stringify(lr.errors)}`)
+  }
+
   // 5) 同长度不同内容也必须重传（etag 是 size+mtime 拼的，不信它）
   put(repoA, 'prompt/AGENTS.md', '# agents v2\n') // 与 v1 等长
   const up3 = await uploadRepo(w, repoA)

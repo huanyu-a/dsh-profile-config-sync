@@ -2518,6 +2518,7 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     writeFileSync(join(homeA, 'storages', 'workspace.json'), JSON.stringify({ tables: { workspaces: { 'ws-1': { path: wsA } } } }))
     mkdirSync(join(homeA, 'sessions', conv.sessionDirName(wsA), 's1'), { recursive: true })
     writeFileSync(join(homeA, 'sessions', conv.sessionDirName(wsA), 's1', 'session.v4.jsonl'), '{"seq":1}\n{"seq":2}\n')
+    writeFileSync(join(homeA, 'sessions', conv.sessionDirName(wsA), 's1', 'session.lock'), '12345')
     mkdirSync(join(homeA, 'sessions', '--Users-alpha-Documents-default-workspace--', 's2'), { recursive: true })
     writeFileSync(join(homeA, 'sessions', '--Users-alpha-Documents-default-workspace--', 's2', 'session.v4.jsonl'), '{"seq":1}\n')
     mkdirSync(join(homeA, 'attachments', 's1'), { recursive: true })
@@ -2527,6 +2528,8 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       cap.ok === true && existsSync(join(repoC, 'conversations', 'sessions', '--ws-ws-1--', 's1', 'session.v4.jsonl'))
       && !JSON.stringify(readdirSync(join(repoC, 'conversations', 'sessions'))).includes('default-workspace'),
       JSON.stringify(cap.notes))
+    check('会话抓取：session.lock 运行期锁文件不入库（陈旧锁会让另一台机器以为会话被占用）',
+      !JSON.stringify(readdirSync(join(repoC, 'conversations', 'sessions'), { recursive: true })).includes('session.lock'))
     check('会话抓取：写出 session-index.json（记 workspaceId）',
       JSON.parse(readFileSync(join(repoC, 'conversations', 'session-index.json'), 'utf8')).entries
         .some((e) => e.dir === '--ws-ws-1--' && e.workspaceId === 'ws-1'))

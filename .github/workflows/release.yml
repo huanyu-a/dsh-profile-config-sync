@@ -125,7 +125,8 @@ jobs:
                     runtime/sync-engine.mjs runtime/platform.mjs runtime/machines.mjs \
                     runtime/contract.mjs runtime/webdav.mjs \
                     runtime/post-exit.mjs runtime/install-plugin.mjs \
-                    runtime/conversations.mjs \
+                    runtime/conversations.mjs runtime/extra-rules.mjs \
+                    runtime/settings-sources.mjs runtime/zip.mjs runtime/porting.mjs \
                     runtime/tools/session-log-guard.mjs runtime/tools/session-log-lib.mjs; do
             if ! grep -qx "package/$f" contents.txt; then
               echo "::error::tarball is missing $f"
