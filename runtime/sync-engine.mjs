@@ -20,7 +20,7 @@ import {
 } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { homedir, hostname } from 'node:os'
-import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
@@ -37,6 +37,7 @@ import {
 import { applyConversations, captureConversations, conversationPendingRoots, resolveGuardScript } from './conversations.mjs'
 import { extraSkipReason, listPluginDataSlots, looksSecretFile, readExtraConfig } from './extra-rules.mjs'
 import { SETTINGS_SOURCES, settingsSourcePath, zeroVolatileFields } from './settings-sources.mjs'
+import { zipBuild, zipExtract } from './zip.mjs'
 
 /** 占位符：仓库里存这些，落地时展开成本机路径。 */
 export const TOKENS = {
@@ -716,6 +717,73 @@ function captureExtraPaths({ repoRoot, dshHome, cfg, scope, roots }) {
 
 function isDir2(p) { try { return statSync(p).isDirectory() } catch { return false } }
 
+/** 本地源码插件打包时跳过的目录段（与 capture.ps1 的 $skipSegs 一致）。 */
+const LOCAL_PLUGIN_SKIP_SEGS = new Set(['.git', 'node_modules', 'releases', '.cache'])
+
+/**
+ * 本地源码插件（profile 里 `link:` 指向的那几个目录）→ `local-plugins/<名字>.zip`。
+ *
+ * 为什么打包而不是拷目录：换台机器的路径肯定不同，`link:` 是绝对路径；
+ * 打成 zip 之后对方解出来自己重新 link。Windows 侧用 Expand-Archive 解，所以必须是 zip。
+ */
+function captureLocalPlugins({ repoRoot, profileDir, dshHome, scope }) {
+  const dstRoot = join(repoRoot, 'local-plugins')
+  const result = { files: 0, bytes: 0, changed: [], errors: [], notes: [] }
+  const pkgPath = join(profileDir, 'package.json')
+  let deps = null
+  try { deps = JSON.parse(readFileSync(pkgPath, 'utf8')).dependencies } catch { deps = null }
+  if (!deps || typeof deps !== 'object') { result.notes.push('本机 profile 没有 package.json.dependencies，跳过本地插件'); return result }
+  const links = []
+  for (const [name, spec] of Object.entries(deps)) {
+    const raw = String(spec || '')
+    if (!raw.startsWith('link:')) continue
+    const target = raw.slice(5)
+    const abs = isAbsolute(target) ? target : join(profileDir, target)
+    links.push({ name, abs, dirName: basename(abs) })
+  }
+  if (!links.length) { result.notes.push('本机没有 link: 形式的本地源码插件'); return result }
+  mkdirSync(dstRoot, { recursive: true })
+  const kept = new Set()
+  for (const link of links) {
+    if (!scopeItemEnabled(scope, 'local-plugins', link.dirName)) { result.notes.push(`本地插件 ${link.dirName}: 未勾选`); continue }
+    if (!existsSync(link.abs)) { result.notes.push(`link 目标不存在，跳过：${link.abs}`); continue }
+    kept.add(`${link.dirName}.zip`)
+    const entries = []
+    for (const f of walk(link.abs)) {
+      const segs = f.rel.split('/')
+      if (segs.some((seg) => LOCAL_PLUGIN_SKIP_SEGS.has(seg.toLowerCase()))) continue
+      if (looksSecretFile(f.full, f.rel)) { result.notes.push(`本地插件 ${link.dirName} 跳过含凭据的文件：${f.rel}`); continue }
+      try { entries.push({ name: `${link.dirName}/${f.rel}`, data: readFileSync(f.full), mtime: statSync(f.full).mtime }) } catch { /* 读不了的跳过 */ }
+    }
+    if (!entries.some((e) => e.name === `${link.dirName}/package.json`)) {
+      result.errors.push(`本地插件 ${link.dirName}: 打包结果里没有 ${link.dirName}/package.json（跳过，避免换机解出坏目录）`)
+      continue
+    }
+    const zip = zipBuild(entries)
+    const dst = join(dstRoot, `${link.dirName}.zip`)
+    let same = false
+    // 比的是「要写下去的字节」：fileHash 对二进制按 sha256 算，这里也必须用 sha256（早先写了 sha1，永远不相等）
+    try { same = existsSync(dst) && fileHash(dst) === createHash('sha256').update(zip).digest('hex') } catch { same = false }
+    if (!same) {
+      writeFileSync(dst, zip)
+      result.changed.push(`local-plugins/${link.dirName}.zip`)
+      result.files += 1
+      result.bytes += zip.length
+    }
+    // 旧版发过 .tgz，留着会被另一台机器当成另一份插件
+    const staleTgz = join(dstRoot, `${link.dirName}.tgz`)
+    if (existsSync(staleTgz)) { try { rmSync(staleTgz, { force: true }); result.changed.push(`local-plugins/${link.dirName}.tgz（删除）`) } catch { /* 删不掉不影响 */ } }
+  }
+  // 镜像：当前 profile 里已经没有的 link 目标，其 zip 也删
+  let names = []
+  try { names = readdirSync(dstRoot, { withFileTypes: true }).filter((e) => e.isFile()).map((e) => e.name) } catch { names = [] }
+  for (const name of names) {
+    if (kept.has(name)) continue
+    try { rmSync(join(dstRoot, name), { force: true }); result.changed.push(`local-plugins/${name}（删除）`) } catch { /* 忽略 */ }
+  }
+  return result
+}
+
 export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName = 'desktop' } = {}) {
   const local = probeLocal({ dshHome, appRoot, workspaceHome })
   // 用「用户确认过的根」（config-sync-roots.json）：自选目录必须变成 {{ROOT:x}}，
@@ -860,6 +928,52 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
     }
   }
 
+  // 3.3) 本地源码插件（profile 里 link: 指向的目录，打包成 zip 随仓库走）
+  if (gated('local-plugins')) skipScopedGroup(scope, repoRoot, 'local-plugins', skippedByScope)
+  else {
+    try {
+      const r = captureLocalPlugins({ repoRoot, profileDir, dshHome: local.dshHome, scope })
+      files += r.files
+      bytes += r.bytes
+      changed.push(...r.changed)
+      errors.push(...r.errors)
+      for (const n of r.notes) skippedByScope.push(`local-plugins: ${n}`)
+    } catch (e) {
+      errors.push(`local-plugins: ${(e && e.message) || e}`)
+    }
+  }
+
+  // 3.4) 技能市场台账（两个小 json；装在 storages/@montersy123/dsh-skill-market/data 下）
+  if (gated('storages-record')) skipScopedGroup(scope, repoRoot, 'storages-record', skippedByScope)
+  else {
+    const dataDir = join(local.dshHome, 'storages', '@montersy123', 'dsh-skill-market', 'data')
+    const pairs = [['installed.json', 'skill-market-installed.json'], ['panel.json', 'skill-market-panel.json']]
+    let any = false
+    for (const [leaf, repoLeaf] of pairs) {
+      if (gatedItem('storages-record', repoLeaf)) { skippedByScope.push(`storages-record/${repoLeaf}: 未勾选`); continue }
+      if (!existsSync(join(dataDir, leaf))) continue
+      copy(join(dataDir, leaf), `storages-record/${repoLeaf}`)
+      any = true
+    }
+    if (!any) skippedByScope.push('storages-record: 本机没有技能市场台账（没装这个市场插件）')
+  }
+
+  // 3.45) 记忆数据：<AppRoot>/mnemon（记忆插件的数据目录，需要跨机一致）
+  if (gated('mnemon')) skipScopedGroup(scope, repoRoot, 'mnemon', skippedByScope)
+  else {
+    const mnSrc = join(local.appRoot || '', 'mnemon')
+    if (!local.appRoot || !existsSync(mnSrc)) {
+      skippedByScope.push(`mnemon: 本机没有 ${mnSrc}（macOS 上记忆数据不在 .app 包内），跳过`)
+    } else {
+      copy(mnSrc, 'mnemon')
+      // 镜像：本机已删的记忆文件仓库里也删（否则两台机器对不上）
+      for (const f of walk(join(repoRoot, 'mnemon'))) {
+        if (existsSync(join(mnSrc, ...f.rel.split('/')))) continue
+        try { rmSync(f.full, { force: true }); changed.push(`mnemon/${f.rel}（删除）`) } catch { /* 删不掉不影响其余 */ }
+      }
+    }
+  }
+
   // 3.6) 插件数据 / 额外路径（规则与面板、PowerShell 共用 runtime/extra-rules.mjs）
   try {
     const extraCfg = readExtraConfig(local.dshHome)
@@ -995,6 +1109,48 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   pull('profile/cordis.patch.yml', join(profileDir, 'cordis.patch.yml'))
   pull('profile/cordis.yml', join(profileDir, 'cordis.yml'))
   pull('profile/pnpm-workspace.yaml', join(profileDir, 'pnpm-workspace.yaml'))
+
+  // 本地源码插件：解到 <DshHome>/local-plugins-restore/<名字>/，再由用户决定 link 到 profile
+  // （不硬写进客户端包：macOS 上是签名过的 .app，写进去会破坏签名，而且 DSH 也不从那里加载插件）
+  if (scopeGroupEnabled(scope, 'local-plugins')) {
+    const lpRoot = join(repoRoot, 'local-plugins')
+    if (existsSync(lpRoot)) {
+      const restoreRoot = join(local.dshHome, 'local-plugins-restore')
+      let zips = []
+      try { zips = readdirSync(lpRoot, { withFileTypes: true }).filter((e) => e.isFile() && /\.zip$/i.test(e.name)).map((e) => e.name) } catch { zips = [] }
+      for (const name of zips) {
+        const dirName = name.replace(/\.zip$/i, '')
+        if (!scopeItemEnabled(scope, 'local-plugins', dirName)) { skippedByScope.push(`local-plugins/${name}: 未勾选`); continue }
+        if (dryRun) { skipped.push(`local-plugins/${name}: 会解到 ${join(restoreRoot, dirName)}`); continue }
+        try {
+          const r = zipExtract(readFileSync(join(lpRoot, name)), restoreRoot)
+          if (r.files > 0) skippedByScope.push(`local-plugins/${name}: 已解到 ${join(restoreRoot, dirName)}（需要在 profile 里重新 link）`)
+        } catch (e) {
+          errors.push(`local-plugins/${name}: 解包失败 ${(e && e.message) || e}`)
+        }
+      }
+      if (!zips.length) skippedByScope.push('local-plugins: 仓库里没有本地插件归档')
+    }
+  } else skippedByScope.push('local-plugins: 未勾选同步')
+
+  // 技能市场台账 / 记忆数据
+  if (scopeGroupEnabled(scope, 'storages-record')) {
+    const dataDir = join(local.dshHome, 'storages', '@montersy123', 'dsh-skill-market', 'data')
+    const pairs = [['installed.json', 'skill-market-installed.json'], ['panel.json', 'skill-market-panel.json']]
+    for (const [leaf, repoLeaf] of pairs) {
+      if (!scopeItemEnabled(scope, 'storages-record', repoLeaf)) continue
+      pull(`storages-record/${repoLeaf}`, join(dataDir, leaf))
+    }
+  } else skippedByScope.push('storages-record: 未勾选同步')
+  if (scopeGroupEnabled(scope, 'mnemon')) {
+    const mnDst = join(local.appRoot || '', 'mnemon')
+    if (!local.appRoot || (!IS_WIN && !existsSync(mnDst))) {
+      // macOS / Linux 上 <AppRoot> 是 .app 包或只读安装目录，往里写会破坏签名/权限：只提示，不动手
+      skippedByScope.push('mnemon: 本机记忆数据目录不在客户端包内，未写入（需要时请手动放置）')
+    } else {
+      pull('mnemon', mnDst)
+    }
+  } else skippedByScope.push('mnemon: 未勾选同步')
 
   // 插件设置与工作流：仓库里有的才铺；缺占位符路径的由 pull 记进 skipped，不写半成品
   if (scopeGroupEnabled(scope, 'settings')) {

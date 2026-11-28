@@ -162,6 +162,20 @@ const SECRET_MARKERS = [
 const GITHUB_TOKEN_RE = /gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}/
 const PEM_HEAD_RE = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----|PuTTY-User-Key-File-[0-9]/
 
+/**
+ * 源码类文件不做「字段名」扫描（那道门是给配置/数据文件用的）。
+ *
+ * 实测踩到的坑：本地源码插件这一组按目录打包时，插件自己的 `dsh-sync-common.ps1`
+ * （里面定义了一张名为 "$SyncExtraSecretMarkers" 的名单，字面量就含 "password" / "apikey"）、
+ * `runtime/extra-rules.mjs`、`tools/selftest.mjs` 全被判成凭据文件跳过 —— 打出来的 zip 缺关键文件，
+ * 对方机器解出来是个装不上的插件。真实令牌（GitHub 前缀）和私钥头仍然一律拦，那道门不看扩展名。
+ */
+const CODE_EXTS = new Set([
+  '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.vue', '.svelte', '.css', '.scss', '.less',
+  '.html', '.md', '.ps1', '.psm1', '.sh', '.bash', '.zsh', '.py', '.rb', '.go', '.rs', '.java',
+  '.c', '.h', '.cpp', '.bat', '.cmd', '.sql', '.proto',
+])
+
 export function looksPrivateName(relOrPath) {
   const leaf = String(relOrPath || '').split(/[\\/]/).pop() || ''
   if (!leaf) return false
@@ -192,8 +206,14 @@ export function looksSecretFile(full, relOrPath) {
     const buf = sampleBytes(full)
     // latin1（码位 = 字节）：二进制里的 ASCII 令牌照样命中，也不会因非法 UTF-8 抛错
     const raw = buf.toString('latin1')
+    // 显式豁免：文件里写了 dsh-sync-allow-secret 说明里面的令牌是**测试夹具**（本仓库的 selftest 就是），
+    // 由作者自己担这个责任；真实令牌不会自带这行。
+    if (/dsh-sync-allow-secret/i.test(raw)) return false
     if (GITHUB_TOKEN_RE.test(raw)) return true
     if (PEM_HEAD_RE.test(raw)) return true
+    const leaf = String(relOrPath || full).split(/[\\/]/).pop() || ''
+    const ext = leaf.includes('.') ? leaf.slice(leaf.lastIndexOf('.')).toLowerCase() : ''
+    if (CODE_EXTS.has(ext)) return false
     const lower = raw.toLowerCase()
     return SECRET_MARKERS.some((m) => lower.includes(m))
   } catch {

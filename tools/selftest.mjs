@@ -1,3 +1,4 @@
+// dsh-sync-allow-secret: 本文件含**假的**令牌/私钥字符串（自检夹具），打包本地插件时不算凭据。
 /**
  * 无 UI 环境下的宿主半身自检：
  *   node tools/selftest.mjs [repoPath]
@@ -2603,6 +2604,66 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     }
     check('易变计数清零只动数字', src.zeroVolatileFields('{"reloadCount": 42, "catalogSyncedAt": 1734567890, "keep": 7}', 'our-free-model.json')
       === '{"reloadCount": 0, "catalogSyncedAt": 0, "keep": 7}')
+  }
+
+  // ── 本地源码插件（local-plugins）+ 最小 zip 读写（0.6.49 起 Node 引擎也做）──
+  {
+    const zip = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'zip.mjs')).href)
+    const zt = mkdtempSync(join(tmpdir(), 'cfg-sync-zip-'))
+    const buf = zip.zipBuild([
+      { name: 'plug/package.json', data: Buffer.from('{"name":"plug"}') },
+      { name: 'plug/中文.md', data: Buffer.from('# 你好') },
+      { name: 'plug/bin.dat', data: Buffer.from([0, 1, 255]) },
+    ])
+    const zout = join(zt, 'out')
+    mkdirSync(zout, { recursive: true })
+    const zr = zip.zipExtract(buf, zout)
+    check('zip 读写：文本 / 中文名 / 二进制都能原样回来',
+      zr.files === 3 && readFileSync(join(zout, 'plug/package.json'), 'utf8') === '{"name":"plug"}'
+      && readFileSync(join(zout, 'plug/中文.md'), 'utf8') === '# 你好'
+      && [...readFileSync(join(zout, 'plug/bin.dat'))].join(',') === '0,1,255')
+    check('zip 解包会做 CRC 校验（坏包直接报错，不写半截文件）', (() => {
+      // 单文件、名字最短：数据紧跟在 30+1 字节头后面，改第 40 个字节一定落在数据区
+      const one = zip.zipBuild([{ name: 'a', data: Buffer.from(Array.from({ length: 200 }, (_, i) => (i * 7) % 251)) }])
+      const broken = Buffer.from(one)
+      broken[40] = broken[40] ^ 0xff
+      try { zip.zipExtract(broken, join(zt, 'broken-one')); return false } catch { return true }
+    })())
+
+    // 打包一个 link: 插件：node_modules / .git / 私钥要排除，第二次打包不该再报改动
+    const rules = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'extra-rules.mjs')).href)
+    const lpStage = mkdtempSync(join(tmpdir(), 'cfg-sync-lp-'))
+    const plug = join(lpStage, 'my-plugin')
+    mkdirSync(join(plug, 'src'), { recursive: true })
+    writeFileSync(join(plug, 'package.json'), '{"name":"my-plugin","version":"0.0.1"}')
+    writeFileSync(join(plug, 'src', 'index.js'), 'export const x = 1')
+    mkdirSync(join(plug, 'node_modules', 'dep'), { recursive: true })
+    writeFileSync(join(plug, 'node_modules', 'dep', 'i.js'), 'x')
+    mkdirSync(join(plug, '.git'), { recursive: true })
+    writeFileSync(join(plug, '.git', 'HEAD'), 'ref: x')
+    writeFileSync(join(plug, 'id_rsa'), '-----BEGIN OPENSSH PRIVATE KEY-----')
+    writeFileSync(join(lpStage, 'src-like.mjs'), "const markers = ['\"apikey\"', '\"password\"']\nexport default markers\n")
+    writeFileSync(join(lpStage, 'tok.mjs'), "const t = 'ghp_abcdefghijklmnopqrstuvwxyz'\n")
+    writeFileSync(join(lpStage, 'ok.mjs'), "// dsh-sync-allow-secret\nconst t = 'ghp_abcdefghijklmnopqrstuvwxyz'\n")
+    const lpHome = join(lpStage, 'homeA'), lpRepo = join(lpStage, 'repo')
+    mkdirSync(join(lpHome, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(lpHome, 'profiles', 'desktop', 'package.json'), JSON.stringify({ name: 'dsh-profile-desktop', dependencies: { 'my-plugin': `link:${plug}` } }))
+    const lpEng = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'sync-engine.mjs')).href)
+    const cap = lpEng.capture({ repoRoot: lpRepo, dshHome: lpHome, appRoot: '/Applications/DeepSeek Harness.app' })
+    const lpZip = join(lpRepo, 'local-plugins', 'my-plugin.zip')
+    const names = zip.zipExtract(readFileSync(lpZip), join(lpStage, 'chk')).names.join(',')
+    check('本地插件打包：含源码、排除 node_modules/.git/私钥、顶层带 package.json',
+      cap.ok === true && existsSync(lpZip)
+      && names.includes('my-plugin/package.json') && names.includes('my-plugin/src/index.js')
+      && !names.includes('node_modules') && !names.includes('.git') && !names.includes('id_rsa'),
+      names)
+    const cap2 = lpEng.capture({ repoRoot: lpRepo, dshHome: lpHome, appRoot: '/Applications/DeepSeek Harness.app' })
+    check('本地插件打包幂等（内容没变不重写 zip）',
+      cap2.changed.filter((x) => x.startsWith('local-plugins')).length === 0, String(cap2.changed))
+    check('源码里的字段名不算凭据，真实令牌仍拦（含显式豁免标记）',
+      rules.looksSecretFile(join(lpStage, 'src-like.mjs'), 'src-like.mjs') === false
+      && rules.looksSecretFile(join(lpStage, 'tok.mjs'), 'tok.mjs') === true
+      && rules.looksSecretFile(join(lpStage, 'ok.mjs'), 'ok.mjs') === false)
   }
 
   // profile 组要带上「哪些插件开着」：cordis.yml 丢了，换台机器就不是同一套插件
