@@ -14,7 +14,7 @@
  * 平台相关断言按 process.platform 分支：Windows 生成 .cmd，POSIX 生成 .sh。
  */
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -2480,6 +2480,66 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     /Contents.*MacOS|DeepSeek Harness/.test(pf.clientProcessPattern(appRoot)), pf.clientProcessPattern(appRoot))
 
   const hostSrc = readFileSync(join(repoRootOfTools, 'index.js'), 'utf8')
+
+  // ── 会话记录（conversations 组）：0.6.49 起 Node 引擎也做，跨机往返要能对上 ──
+  {
+    const conv = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'conversations.mjs')).href)
+    // 编码：POSIX 绝对路径要丢掉开头那个 `/`，否则会多出一根横线（`---Users-…--`），
+    // DSH 自己的目录名是 `--Users-…--` —— 差这一个字符，工作区映射全线对不上（实测 0/5 命中）。
+    check('会话目录编码：POSIX 绝对路径不多出前导横线',
+      conv.sessionDirName('/Users/huanyu/projects/x') === '--Users-huanyu-projects-x--',
+      conv.sessionDirName('/Users/huanyu/projects/x'))
+    check('会话目录编码：Windows 盘符路径与 PowerShell 版一致',
+      conv.sessionDirName('D:\\DeepSeekHarness\\SquadLink') === '--D-DeepSeekHarness-SquadLink--',
+      conv.sessionDirName('D:\\DeepSeekHarness\\SquadLink'))
+    check('仓库稳定目录名：--ws-<id>-- / --im-- / 原名穿透',
+      conv.repoSessionDirName('ws', 'abc-123', 'local') === '--ws-abc-123--'
+      && conv.repoSessionDirName('im', '', 'local') === '--im--'
+      && conv.repoSessionDirName('', '', 'local') === 'local')
+    check('默认工作区判定', conv.isDefaultWorkspaceDir('--x-default-workspace--') === true
+      && conv.isDefaultWorkspaceDir('--Users-x--') === false)
+    // 真实文件名长这样：session.v4.jsonl.zstd / session.v12.jsonl（`session-<uuid>` 是**目录名**，不是文件）
+    check('会话日志文件名判定只认 session[.vN].jsonl(.zstd)',
+      conv.isSessionLogFile('s/session.v4.jsonl.zstd') === true
+      && conv.isSessionLogFile('s/session.v12.jsonl') === true
+      && conv.isSessionLogFile('s/notes.md') === false
+      && conv.isSessionLogFile('s/session.v4.jsonl.bak') === false)
+
+    // 端到端：A 机抓取 → B 机（工作区路径不同）铺回
+    const stage = mkdtempSync(join(tmpdir(), 'cfg-sync-conv-'))
+    const homeA = join(stage, 'homeA'), homeB = join(stage, 'homeB'), repoC = join(stage, 'repo')
+    const wsA = '/Users/alpha/projects/demo'
+    const wsB = '/Users/beta/work/demo'
+    mkdirSync(join(homeA, 'storages'), { recursive: true })
+    writeFileSync(join(homeA, 'storages', 'workspace.json'), JSON.stringify({ tables: { workspaces: { 'ws-1': { path: wsA } } } }))
+    mkdirSync(join(homeA, 'sessions', conv.sessionDirName(wsA), 's1'), { recursive: true })
+    writeFileSync(join(homeA, 'sessions', conv.sessionDirName(wsA), 's1', 'session.v4.jsonl'), '{"seq":1}\n{"seq":2}\n')
+    mkdirSync(join(homeA, 'sessions', '--Users-alpha-Documents-default-workspace--', 's2'), { recursive: true })
+    writeFileSync(join(homeA, 'sessions', '--Users-alpha-Documents-default-workspace--', 's2', 'session.v4.jsonl'), '{"seq":1}\n')
+    mkdirSync(join(homeA, 'attachments', 's1'), { recursive: true })
+    writeFileSync(join(homeA, 'attachments', 's1', 'shot.png'), 'png\n')
+    const cap = conv.captureConversations({ repoRoot: repoC, dshHome: homeA })
+    check('会话抓取：默认工作区不入库、已登记工作区用稳定名',
+      cap.ok === true && existsSync(join(repoC, 'conversations', 'sessions', '--ws-ws-1--', 's1', 'session.v4.jsonl'))
+      && !JSON.stringify(readdirSync(join(repoC, 'conversations', 'sessions'))).includes('default-workspace'),
+      JSON.stringify(cap.notes))
+    check('会话抓取：写出 session-index.json（记 workspaceId）',
+      JSON.parse(readFileSync(join(repoC, 'conversations', 'session-index.json'), 'utf8')).entries
+        .some((e) => e.dir === '--ws-ws-1--' && e.workspaceId === 'ws-1'))
+    const cap2 = conv.captureConversations({ repoRoot: repoC, dshHome: homeA })
+    check('会话抓取幂等（内容没变不重写）', cap2.files === 0, `files=${cap2.files}`)
+    mkdirSync(join(homeB, 'storages'), { recursive: true })
+    writeFileSync(join(homeB, 'storages', 'workspace.json'), JSON.stringify({ tables: { workspaces: { 'ws-1': { path: wsB } } } }))
+    const guardScript = conv.resolveGuardScript([join(repoRootOfTools, 'runtime', 'tools', 'session-log-guard.mjs')])
+    const app = conv.applyConversations({ repoRoot: repoC, dshHome: homeB, guardScript, backupRoot: join(homeB, 'backups', 'apply-test') })
+    check('会话铺回：按本机工作区路径重新编码目录名',
+      app.ok === true && existsSync(join(homeB, 'sessions', conv.sessionDirName(wsB), 's1', 'session.v4.jsonl')),
+      JSON.stringify(app.errors))
+    check('会话铺回：内容字节一致 + 附件一起回来',
+      readFileSync(join(homeB, 'sessions', conv.sessionDirName(wsB), 's1', 'session.v4.jsonl'), 'utf8')
+        === readFileSync(join(homeA, 'sessions', conv.sessionDirName(wsA), 's1', 'session.v4.jsonl'), 'utf8')
+      && existsSync(join(homeB, 'attachments', 's1', 'shot.png')))
+  }
 
   // 同步范围卡必须按平台说实话：非 Windows 只同步四组，其余八组要在 GET /scope 里
   // 带 supported:false，面板据此禁用勾选 —— 让人勾着却永不生效是最糟的「看起来能用」。

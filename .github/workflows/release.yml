@@ -124,7 +124,9 @@ jobs:
           for f in index.js client.js cordis.patch.yml \
                     runtime/sync-engine.mjs runtime/platform.mjs runtime/machines.mjs \
                     runtime/contract.mjs runtime/webdav.mjs \
-                    runtime/post-exit.mjs runtime/install-plugin.mjs; do
+                    runtime/post-exit.mjs runtime/install-plugin.mjs \
+                    runtime/conversations.mjs \
+                    runtime/tools/session-log-guard.mjs runtime/tools/session-log-lib.mjs; do
             if ! grep -qx "package/$f" contents.txt; then
               echo "::error::tarball is missing $f"
               exit 1

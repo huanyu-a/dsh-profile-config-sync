@@ -34,6 +34,7 @@ import {
   downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive,
   PRIVATE_KEY_BODY_RE, SSH_KEY_NAME_RE,
 } from './webdav.mjs'
+import { applyConversations, captureConversations, conversationPendingRoots, resolveGuardScript } from './conversations.mjs'
 
 /** 占位符：仓库里存这些，落地时展开成本机路径。 */
 export const TOKENS = {
@@ -662,6 +663,27 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
   if (gated('presets')) skipScopedGroup(scope, repoRoot, 'presets', skippedByScope)
   else copy(join(local.dshHome, '.agent-presets'), 'presets')
 
+  // 3.5) 会话记录（0.6.49 起 Node 引擎也做，见 runtime/conversations.mjs）：
+  //      四块数据字节保真 + 仓库稳定目录名（--ws-<id>--）+ session-index.json；
+  //      会话日志走 seq 护栏，避免两台机器各 append 一段后互相覆盖出 seq gap。
+  if (gated('conversations')) skipScopedGroup(scope, repoRoot, 'conversations', skippedByScope)
+  else {
+    try {
+      const conv = captureConversations({
+        repoRoot,
+        dshHome: local.dshHome,
+        scope: scope.groups && typeof scope.groups === 'object' ? scope.groups.conversations : null,
+      })
+      files += conv.files
+      bytes += conv.bytes
+      changed.push(...conv.changed)
+      errors.push(...conv.errors)
+      for (const n of conv.notes) skippedByScope.push(`conversations: ${n}`)
+    } catch (e) {
+      errors.push(`conversations: ${(e && e.message) || e}`)
+    }
+  }
+
   // 4) 本机身份（不是配置，是元数据）：让别的机器知道「这份配置来自哪」
   try {
     writeMachineInfo(repoRoot, localMachineInfo({
@@ -725,7 +747,7 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   // 用「用户确认过的根」（config-sync-roots.json）：自选目录必须变成 {{ROOT:x}}，
   // 否则会把本机绝对路径原样带进仓库，换机后对方文件指向一个不存在的目录。
   const roots = readSyncRoots(local.dshHome, local)
-  const written = [], skipped = [], errors = []
+  const written = [], skipped = [], errors = [], conflicts = []
   let files = 0, bytes = 0
   applyBackupDir = ''
   // 同步内容勾选：与 capture 同一套判定，别让「没勾的组」在 apply 侧又被铺回来
@@ -782,13 +804,47 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   if (scopeGroupEnabled(scope, 'presets')) pull('presets', join(local.dshHome, '.agent-presets'))
   else skippedByScope.push('presets: 未勾选同步')
 
-  return { ok: errors.length === 0, written, skipped, errors, files, bytes, local, backupDir: applyBackupDir, skippedByScope }
+  // 会话记录：目录名按本机工作区 ID 重编码，会话日志走 seq 护栏（见 runtime/conversations.mjs）
+  if (scopeGroupEnabled(scope, 'conversations')) {
+    try {
+      const conv = applyConversationsWithGuard({
+        repoRoot, dshHome: local.dshHome, backupRoot: applyBackupDir, dryRun,
+        scope: scope.groups && typeof scope.groups === 'object' ? scope.groups.conversations : null,
+      })
+      files += conv.copied
+      for (const c of conv.conflicts) conflicts.push(c)
+      errors.push(...conv.errors)
+      for (const n of conv.notes) skippedByScope.push(`conversations: ${n}`)
+    } catch (e) {
+      errors.push(`conversations: ${(e && e.message) || e}`)
+    }
+  } else skippedByScope.push('conversations: 未勾选同步')
+
+  return { ok: errors.length === 0, written, skipped, errors, conflicts, files, bytes, local, backupDir: applyBackupDir, skippedByScope }
 }
 
 /**
  * 只读体检（面板 status 路由用）。
  * 不做任何写操作，可以安全地在客户端运行时调用。
  */
+/**
+ * 会话还原 + seq 护栏脚本定位。
+ * 顺序：插件自带的 tools/ → 插件上一级的 tools/（仓库工作副本就是这种布局）→
+ * 仓库里的 tools/ → 仓库根（老仓库把脚本平铺在根上）。找不到就退回整文件覆盖，
+ * 并把这件事记进 notes —— 不静默降级。
+ */
+function applyConversationsWithGuard(opts) {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const guardScript = resolveGuardScript([
+    // runtime/tools/ 才是发布包里那份（npm 包不含仓库根的 tools/）；其余是仓库工作副本与老仓库布局
+    join(here, 'tools', 'session-log-guard.mjs'),
+    join(here, '..', 'tools', 'session-log-guard.mjs'),
+    opts.repoRoot ? join(opts.repoRoot, 'tools', 'session-log-guard.mjs') : '',
+    opts.repoRoot ? join(opts.repoRoot, 'session-log-guard.mjs') : '',
+  ])
+  return applyConversations({ ...opts, guardScript })
+}
+
 export function status({ repoRoot, dshHome, appRoot, workspaceHome } = {}) {
   const local = probeLocal({ dshHome, appRoot, workspaceHome })
   const contract = repoRoot ? readContract(repoRoot) : null
@@ -900,7 +956,8 @@ function buildWarnings({ local, contract, repoRoot }) {
  */
 export function ensureRepoRunner(repoRoot) {
   const here = dirname(fileURLToPath(import.meta.url))
-  const names = ['sync-engine.mjs', 'platform.mjs', 'contract.mjs', 'machines.mjs', 'webdav.mjs']
+  // 会话记录组的实现也是随仓库走的（另一台机器没有插件副本时靠仓库这份跑 apply）
+  const names = ['sync-engine.mjs', 'platform.mjs', 'contract.mjs', 'machines.mjs', 'webdav.mjs', 'conversations.mjs']
   const written = []
   for (const name of names) {
     const src = join(here, name)
