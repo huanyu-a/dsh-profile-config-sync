@@ -17,6 +17,10 @@ export const EXTRA_DEFAULT_SKIP_DIRS = [
   'profiles', 'skills', '.agent-presets', 'storages', 'sessions', 'attachments', 'logs', 'backups',
   'update-staging', 'electron', 'dsh-runtimes', 'dsh-market', '.dsh-plugin-market', 'dsh-session-manager',
   'browser-profiles', 'im', 'node_modules',
+  // 插件自己产出的暂存目录不能当成「插件数据」再传上去：
+  // profile-from-cloud / prompt-from-cloud 是跨平台移植时摊出来的对照件，
+  // local-plugins-restore 是解包出来的本地插件副本 —— 传上去既没用又会来回翻倍。
+  'profile-from-cloud', 'prompt-from-cloud', 'local-plugins-restore',
 ]
 export const EXTRA_DEFAULT_EXCLUDE = [
   '*.db', '*.db-*', '*.db3', '*.sqlite', '*.sqlite3', '*.sqlite-*', '*.db-shm', '*.db-wal',
@@ -118,6 +122,16 @@ export function extraSkipReason(relName, size, cfg) {
  * 插件数据槽：`<DshHome>` 的一级目录（跳过系统/已覆盖目录与隐藏目录）。
  * 与 dsh-sync-common.ps1 的 Get-PluginDataSlots 同一份语义，只是不带统计（引擎不需要）。
  */
+/**
+ * 无论用户配置里怎么写都必须跳过的目录：这些是**插件自己的暂存产物**，
+ * 不是别人家的插件数据。传上去再拉下来只会来回翻倍，还会把移植对照件当配置铺回去。
+ * （老的 config-sync-extra.json 已经把旧默认名单抄进去了，topUp 不会补新项，所以这里硬拦。）
+ */
+export const PLUGIN_DATA_HARD_SKIP = new Set([
+  'profile-from-cloud', 'prompt-from-cloud', 'local-plugins-restore',
+  'browser-profiles', 'user data', 'User Data',
+])
+
 export function listPluginDataSlots(dshHome, cfg) {
   const skip = new Set((cfg && cfg.pluginData && cfg.pluginData.skipDirs) || [])
   let entries = []
@@ -126,6 +140,7 @@ export function listPluginDataSlots(dshHome, cfg) {
   for (const e of entries) {
     if (!e.isDirectory()) continue
     if (skip.has(e.name)) continue
+    if (PLUGIN_DATA_HARD_SKIP.has(e.name)) continue
     if (e.name.startsWith('.')) continue
     out.push({ id: e.name, src: join(dshHome, e.name) })
   }

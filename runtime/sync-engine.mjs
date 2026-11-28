@@ -718,6 +718,41 @@ function captureExtraPaths({ repoRoot, dshHome, cfg, scope, roots }) {
 
 function isDir2(p) { try { return statSync(p).isDirectory() } catch { return false } }
 
+/**
+ * 平台分区（0.6.49）：同一份仓库要能让 Windows / macOS / Linux 三个客户端各自还原，
+ * 所以**机器相关**的文件按平台分目录存，互不覆盖：
+ *
+ *   profile/darwin/package.json      profile/win32/package.json      profile/linux/...
+ *   prompt/darwin/AGENTS.md          ...
+ *   settings/darwin/dsh-workspaces.json  ...
+ *
+ * 其它（skills / plugin-data / settings 里与路径无关的 / 会话 / 工作区登记表）仍然共用一份。
+ * 根目录那份 profile/package.json 是老版本（Windows 0.6.47 的 PowerShell 引擎）写的位置：
+ * 我们只读不写，避免两边互相覆盖 —— 老客户端继续读它自己的那份，谁也不打扰谁。
+ */
+const PLATFORM_LANE = process.platform
+
+/** 机器相关的仓库相对路径 → 带平台分区的那份：profile/package.json → profile/darwin/package.json */
+function lanePathOf(rel) {
+  const i = String(rel).indexOf('/')
+  if (i < 0) return `${PLATFORM_LANE}/${rel}`
+  return `${rel.slice(0, i)}/${PLATFORM_LANE}/${rel.slice(i + 1)}`
+}
+
+/**
+ * 读的时候先看本平台分区，再看根目录那份老位置。
+ * 返回 { rel, lane } 或 null。
+ */
+function pickRepoRel(repoRoot, rel) {
+  const laned = lanePathOf(rel)
+  if (existsSync(join(repoRoot, fromRepoPath(laned)))) return { rel: laned, lane: true }
+  if (existsSync(join(repoRoot, fromRepoPath(rel)))) return { rel, lane: false }
+  return null
+}
+
+/** 这些设置文件里写着绝对路径（工作区根），三端不能共用一份 → 按平台分区存。 */
+const LANED_SETTINGS = new Set(['dsh-workspaces.json', 'dsh-qq-workspaces.json', 'workspace-archives.json'])
+
 /** 本地源码插件打包时跳过的目录段（与 capture.ps1 的 $skipSegs 一致）。 */
 const LOCAL_PLUGIN_SKIP_SEGS = new Set(['.git', 'node_modules', 'releases', '.cache'])
 
@@ -914,14 +949,15 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
   // 1) profile：本机 profile 目录（必需组，钉死开启）
   const profileDir = join(local.dshHome, 'profiles', profileName)
   if (isDir(profileDir)) {
-    copy(join(profileDir, 'package.json'), 'profile/package.json')
-    copy(join(profileDir, 'cordis.patch.yml'), 'profile/cordis.patch.yml')
-    copy(join(profileDir, 'package-lock.json'), 'profile/package-lock.json')
-    copy(join(profileDir, 'pnpm-lock.yaml'), 'profile/pnpm-lock.yaml')
+    // 机器相关的文件进本平台分区（profile/<platform>/...），根目录那份留给老客户端
+    copy(join(profileDir, 'package.json'), lanePathOf('profile/package.json'))
+    copy(join(profileDir, 'cordis.patch.yml'), lanePathOf('profile/cordis.patch.yml'))
+    copy(join(profileDir, 'package-lock.json'), lanePathOf('profile/package-lock.json'))
+    copy(join(profileDir, 'pnpm-lock.yaml'), lanePathOf('profile/pnpm-lock.yaml'))
     // 0.6.49 补：`cordis.yml` 是「哪些插件开着」的名单、`pnpm-workspace.yaml` 是 hoisted 布局，
     // 两者丢了换台机器就不是同一套插件。Windows 版一直抓这两个（capture.ps1 的 profile 文件表）。
-    copy(join(profileDir, 'cordis.yml'), 'profile/cordis.yml')
-    copy(join(profileDir, 'pnpm-workspace.yaml'), 'profile/pnpm-workspace.yaml')
+    copy(join(profileDir, 'cordis.yml'), lanePathOf('profile/cordis.yml'))
+    copy(join(profileDir, 'pnpm-workspace.yaml'), lanePathOf('profile/pnpm-workspace.yaml'))
   }
 
   // 1.2) 插件设置与工作流（14 个插件各自的配置文件；散落在 <DshHome> 树里，不能整目录抓）
@@ -933,8 +969,9 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
         if (gatedItem('settings', entry.id)) { skippedByScope.push(`settings/${entry.id}: 未勾选`); continue }
         const src = settingsSourcePath(local.dshHome, profileDir, entry)
         if (!existsSync(src)) continue
+        const setDir = LANED_SETTINGS.has(entry.id) ? join(repoRoot, 'settings', PLATFORM_LANE) : join(repoRoot, 'settings')
         if (looksSecretFile(src, entry.id)) {
-          const stale = join(repoRoot, 'settings', entry.id)
+          const stale = join(setDir, entry.id)
           if (existsSync(stale)) { try { rmSync(stale, { force: true }); changed.push(`settings/${entry.id}（含凭据，已从仓库移除）`) } catch { /* 删不掉不影响其余 */ } }
           skippedByScope.push(`settings/${entry.id}: 含令牌/凭据，已跳过（仓库里若有旧副本同时移除）`)
           continue
@@ -942,7 +979,7 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
         {
           const text = zeroVolatileFields(readFileSync(src, 'utf8'), entry.id)
           const out = toTokenText(text, roots).replace(/\r\n/g, '\n')
-          const dst = join(repoRoot, 'settings', entry.id)
+          const dst = join(setDir, entry.id)
           let before = ''
           try { before = readFileSync(dst, 'utf8') } catch { /* 新文件 */ }
           if (before !== out) {
@@ -978,13 +1015,22 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
         os: local.os, osFamily: local.osFamily, arch: local.arch,
       }, repoRoot)
       const text = contractText(merged)
-      const p = contractPath(repoRoot)
+      const laned = join(repoRoot, fromRepoPath(lanePathOf('profile/host-contract.json')))
       let before = ''
-      try { before = readFileSync(p, 'utf8') } catch { /* 没有就写 */ }
+      try { before = readFileSync(laned, 'utf8') } catch { /* 没有就写 */ }
       if (before !== text) {
-        mkdirSync(dirname(p), { recursive: true })
-        writeFileSync(p, text, 'utf8')
-        changed.push('profile/host-contract.json')
+        mkdirSync(dirname(laned), { recursive: true })
+        writeFileSync(laned, text, 'utf8')
+        changed.push(lanePathOf('profile/host-contract.json'))
+      }
+      // 根目录那份只补不改：老版本 PowerShell 引擎读的是它，别拿本平台的东西盖掉
+      const rootContract = contractPath(repoRoot)
+      if (!existsSync(rootContract)) {
+        try {
+          mkdirSync(dirname(rootContract), { recursive: true })
+          writeFileSync(rootContract, text, 'utf8')
+          changed.push('profile/host-contract.json（根目录首份）')
+        } catch { /* 写不进去不影响同步 */ }
       }
     }
   } catch (e) {
@@ -995,7 +1041,7 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
   if (gated('prompt')) skipScopedGroup(scope, repoRoot, 'prompt', skippedByScope)
   else {
     if (gatedItem('prompt', 'AGENTS.md')) skippedByScope.push('prompt/AGENTS.md: 未勾选')
-    else copy(join(local.dshHome, 'AGENTS.md'), 'prompt/AGENTS.md')
+    else copy(join(local.dshHome, 'AGENTS.md'), lanePathOf('prompt/AGENTS.md'))
     if (gatedItem('prompt', 'prompt-inject.md')) skippedByScope.push('prompt/prompt-inject.md: 未勾选')
     else copy(join(local.dshHome, 'prompt-inject.md'), 'prompt/prompt-inject.md')
   }
@@ -1208,6 +1254,10 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   const skippedByScope = []
 
   const pull = (srcRel, dst) => {
+    // 机器相关的文件优先读本平台分区（profile/darwin/…），没有再回落到根目录那份老位置
+    const picked = pickRepoRel(repoRoot, srcRel)
+    if (!picked) { skipped.push(`${srcRel}: 仓库里没有`); return }
+    srcRel = picked.rel
     const src = join(repoRoot, fromRepoPath(srcRel))
     if (!existsSync(src)) { skipped.push(`${srcRel}: 仓库里没有`); return }
     try {
@@ -1653,6 +1703,9 @@ function foreignRepoEvidence(repoRoot, local) {
   if (contract && contract.platformFamily && String(contract.platformFamily).toLowerCase() !== String(mine).toLowerCase()) {
     reasons.push(`仓库契约记录的平台是 ${contract.platformFamily}，本机是 ${mine}`)
   }
+  // 本平台分区存在 → 那份就是本平台写的，不算外来
+  const myLane = join(repoRoot, fromRepoPath(lanePathOf('profile/package.json')))
+  if (existsSync(myLane)) return { foreign: false, reasons: [] }
   const pkgPath = join(repoRoot, 'profile', 'package.json')
   if (existsSync(pkgPath) && !IS_WIN) {
     let text = ''

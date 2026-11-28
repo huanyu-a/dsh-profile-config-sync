@@ -2620,6 +2620,44 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     check('执行体幂等：内容没变不重写', again.length === 0, again.join(','))
   }
 
+  // ── 平台分区（0.6.49）：机器相关的文件按平台分目录，三端共用一份仓库而不互相覆盖 ──
+  {
+    const lane = process.platform
+    const lStage = mkdtempSync(join(tmpdir(), 'cfg-sync-lane-'))
+    const lHome = join(lStage, 'home'), lRepo = join(lStage, 'repo')
+    mkdirSync(join(lHome, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(lHome, 'profiles', 'desktop', 'package.json'), '{"name":"dsh-profile-desktop","dependencies":{"only-me":"1.0.0"}}')
+    writeFileSync(join(lHome, 'profiles', 'desktop', 'cordis.patch.yml'), '# mine\n')
+    writeFileSync(join(lHome, 'AGENTS.md'), '# 本机全局提示\n')
+    const lEng = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'sync-engine.mjs')).href)
+    const lcap = lEng.capture({ repoRoot: lRepo, dshHome: lHome, appRoot: '/Applications/DeepSeek Harness.app' })
+    check('平台分区：capture 把 profile / 全局提示写进 <平台>/ 子目录，根目录那份老位置不建',
+      lcap.ok === true
+      && existsSync(join(lRepo, 'profile', lane, 'package.json'))
+      && existsSync(join(lRepo, 'prompt', lane, 'AGENTS.md'))
+      && !existsSync(join(lRepo, 'profile', 'package.json'))
+      && !existsSync(join(lRepo, 'prompt', 'AGENTS.md')))
+
+    // 同一份仓库里同时存在老客户端写的根目录那份（Windows 形状）时，本平台必须优先用自己那份
+    writeFileSync(join(lRepo, 'profile', 'package.json'), '{"dependencies":{"@local/x":"link:C:\\\\Users\\\\bob\\\\AppData\\\\Local\\\\x"}}')
+    const lHome2 = join(lStage, 'home2')
+    mkdirSync(join(lHome2, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(lHome2, 'profiles', 'desktop', 'package.json'), '{"name":"dsh-profile-desktop"}')
+    const lapp = lEng.apply({ repoRoot: lRepo, dshHome: lHome2, appRoot: '/Applications/DeepSeek Harness.app' })
+    const lpkg = readFileSync(join(lHome2, 'profiles', 'desktop', 'package.json'), 'utf8')
+    check('平台分区：apply 读本平台那份，不被根目录的 Windows 形状覆盖，也不算跨平台移植',
+      lapp.ok === true && lpkg.includes('only-me') && !lpkg.includes('AppData')
+      && !existsSync(join(lHome2, 'profile-from-cloud')))
+
+    const rulesMod = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'extra-rules.mjs')).href)
+    mkdirSync(join(lStage, 'slots', 'bot'), { recursive: true })
+    mkdirSync(join(lStage, 'slots', 'profile-from-cloud'), { recursive: true })
+    mkdirSync(join(lStage, 'slots', 'local-plugins-restore'), { recursive: true })
+    const slots = rulesMod.listPluginDataSlots(join(lStage, 'slots'), { pluginData: { skipDirs: [] } }).map((x) => x.id)
+    check('插件数据槽硬拦自己的暂存目录（profile-from-cloud / local-plugins-restore 不会被当插件数据传上去）',
+      slots.includes('bot') && !slots.includes('profile-from-cloud') && !slots.includes('local-plugins-restore'), slots.join(','))
+  }
+
   // ── 跨平台移植（runtime/porting.mjs）：能翻的翻，翻不出来的丢掉 ──
   {
     const port = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'porting.mjs')).href)
@@ -2870,9 +2908,9 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
   // profile 组要带上「哪些插件开着」：cordis.yml 丢了，换台机器就不是同一套插件
   {
     const engText = readFileSync(join(repoRootOfTools, 'runtime', 'sync-engine.mjs'), 'utf8')
-    check('引擎抓取 profile 文件含 cordis.yml / pnpm-workspace.yaml',
-      engText.includes("copy(join(profileDir, 'cordis.yml'), 'profile/cordis.yml')")
-      && engText.includes("copy(join(profileDir, 'pnpm-workspace.yaml'), 'profile/pnpm-workspace.yaml')")
+    check('引擎抓取 profile 文件含 cordis.yml / pnpm-workspace.yaml（写进平台分区）',
+      engText.includes("copy(join(profileDir, 'cordis.yml'), lanePathOf('profile/cordis.yml'))")
+      && engText.includes("copy(join(profileDir, 'pnpm-workspace.yaml'), lanePathOf('profile/pnpm-workspace.yaml'))")
       && engText.includes("pull('profile/cordis.yml', join(profileDir, 'cordis.yml'))"))
   }
 
