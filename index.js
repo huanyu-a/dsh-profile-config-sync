@@ -23,6 +23,7 @@ import { createRequire } from 'node:module'
 import { gunzipSync } from 'node:zlib'
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs'
 import { writeFileAtomicSync } from './runtime/atomic-write.mjs'
+import { SETTINGS_SOURCES, settingsSourcePath as settingsSourcePathOf, zeroVolatileFields } from './runtime/settings-sources.mjs'
 import {
   EXTRA_CONFIG_NAME, EXTRA_DEFAULT_EXCLUDE, EXTRA_DEFAULT_SKIP_DIRS, EXTRA_HARD_MAX_BYTES,
   EXTRA_MANDATORY_EXCLUDES, EXTRA_MANDATORY_SKIP_DIRS, extraConfigPath, extraSkipReason,
@@ -4075,7 +4076,7 @@ function countEntries(dir) {
  * profile（4 个文件）/ prompt / skills / presets —— 别的组在那台机器上根本不会被同步。
  * null 表示「全部组」，非 Windows 时是白名单。
  */
-const ENGINE_SYNCED_GROUPS = IS_WIN ? null : new Set(['profile', 'prompt', 'skills', 'presets', 'conversations', 'plugin-data', 'extra'])
+const ENGINE_SYNCED_GROUPS = IS_WIN ? null : new Set(['profile', 'prompt', 'skills', 'presets', 'settings', 'plugin-data', 'extra', 'conversations'])
 
 /** profile 目录：优先 desktop，其次 profiles 下唯一的那一个 */
 function resolveProfileDir(dshHome) {
@@ -4171,26 +4172,9 @@ function isBlockedProfilePath(rel) {
  * 以前 JS 只写了 4 条，capture 却抓 14 条：面板少列了 10 个文件，用户既看不到也勾不掉它们。
  * 每条 { id, rel }：rel 是相对 <DshHome> 的路径；profileRel 表示相对 profile 目录。
  */
-const SYNC_SETTINGS_SOURCES = [
-  { id: 'our-free-model.json', rel: ['our-free-model', 'settings.json'] },
-  { id: 'comfyui-workflows.json', rel: ['data', 'dsh-comfyui', 'workflows.json'] },
-  { id: 'dsh-pet-main-config.jsonc', rel: ['dsh-pet', 'main-config.jsonc'] },
-  { id: 'dsh-market-state.json', profileRel: ['.dsh-market', 'state.json'] },
-  { id: 'dsh-pet-memory.json', rel: ['dsh-pet', 'memory.json'] },
-  { id: 'our-free-model-picks.json', rel: ['our-free-model', 'picks.json'] },
-  { id: 'dsh-im-interface-language.json', rel: ['integrations', 'dsh-im', 'interface-language.json'] },
-  { id: 'dsh-qq-config.json', rel: ['integrations', 'dsh-qq', 'config.json'] },
-  { id: 'dsh-qq-workspaces.json', rel: ['integrations', 'dsh-qq', 'workspaces.json'] },
-  { id: 'redteam-preset-declare.json', rel: ['redteam', 'preset-declare.json'] },
-  { id: 'task-board-ledger.json', rel: ['task-board', 'ledger-v2.json'] },
-  { id: 'task-board-scheduler.json', rel: ['task-board', 'scheduler-v2.json'] },
-  { id: 'dsh-workspaces.json', rel: ['storages', 'workspace.json'] },
-  { id: 'workspace-archives.json', rel: ['dsh-session-manager', 'workspace-archives.v1.json'] },
-]
+const SYNC_SETTINGS_SOURCES = SETTINGS_SOURCES
 
-function settingsSourcePath(dshHome, profileDir, entry) {
-  return entry.profileRel ? join(profileDir, ...entry.profileRel) : join(dshHome, ...entry.rel)
-}
+const settingsSourcePath = settingsSourcePathOf
 
 
 function saveExtraConfig(dshHome, cfg) {

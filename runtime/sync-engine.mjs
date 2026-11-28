@@ -35,7 +35,8 @@ import {
   PRIVATE_KEY_BODY_RE, SSH_KEY_NAME_RE,
 } from './webdav.mjs'
 import { applyConversations, captureConversations, conversationPendingRoots, resolveGuardScript } from './conversations.mjs'
-import { extraSkipReason, listPluginDataSlots, readExtraConfig } from './extra-rules.mjs'
+import { extraSkipReason, listPluginDataSlots, looksSecretFile, readExtraConfig } from './extra-rules.mjs'
+import { SETTINGS_SOURCES, settingsSourcePath, zeroVolatileFields } from './settings-sources.mjs'
 
 /** 占位符：仓库里存这些，落地时展开成本机路径。 */
 export const TOKENS = {
@@ -601,7 +602,7 @@ function mirrorSlotInto({ srcRoot, dstRoot, cfg, roots, label }) {
     const why = extraSkipReason(f.rel, st.size, cfg)
     if (why === 'too-big') { out.notes.push(`${label}/${f.rel}: 超过单文件上限，未进仓库`); continue }
     if (why) continue
-    if (isSecretFile(f.full, f.rel)) { out.notes.push(`${label}/${f.rel}: 像是凭据文件，已跳过`); continue }
+    if (looksSecretFile(f.full, f.rel)) { out.notes.push(`${label}/${f.rel}: 像是凭据文件，已跳过`); continue }
     wanted.set(f.rel, { full: f.full, size: st.size })
   }
   for (const [rel, info] of wanted) {
@@ -632,19 +633,6 @@ function mirrorSlotInto({ srcRoot, dstRoot, cfg, roots, label }) {
   return out
 }
 
-/** 名字或内容像凭据（PEM / PuTTY 私钥、SSH 私钥文件名）→ 不进仓库。 */
-function isSecretFile(full, rel) {
-  const name = String(rel || '').split('/').pop() || ''
-  if (SSH_KEY_NAME_RE.test(name)) return true
-  if (isBinaryName(name)) return false
-  try {
-    const fd = openSync(full, 'r')
-    const buf = Buffer.alloc(4096)
-    const n = readSync(fd, buf, 0, 4096, 0)
-    closeSync(fd)
-    return PRIVATE_KEY_BODY_RE.test(buf.subarray(0, n).toString('utf8'))
-  } catch { return false }
-}
 
 /** 插件数据组（<DshHome> 一级目录，跳过规则里的系统目录与隐藏目录）。 */
 function capturePluginData({ repoRoot, dshHome, cfg, scope, roots }) {
@@ -705,7 +693,7 @@ function captureExtraPaths({ repoRoot, dshHome, cfg, scope, roots }) {
       result.errors.push(...r.errors)
       result.notes.push(...r.notes)
     } else {
-      if (isSecretFile(p.src, basename(p.src))) { result.notes.push(`额外路径 ${p.id}: 像凭据文件，已跳过`); continue }
+      if (looksSecretFile(p.src, basename(p.src))) { result.notes.push(`额外路径 ${p.id}: 像凭据文件，已跳过`); continue }
       const ext = p.src.includes('.') ? p.src.slice(p.src.lastIndexOf('.')) : ''
       const dst = join(dstRoot, `${p.id}${ext}`)
       try {
@@ -769,6 +757,42 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
     // 两者丢了换台机器就不是同一套插件。Windows 版一直抓这两个（capture.ps1 的 profile 文件表）。
     copy(join(profileDir, 'cordis.yml'), 'profile/cordis.yml')
     copy(join(profileDir, 'pnpm-workspace.yaml'), 'profile/pnpm-workspace.yaml')
+  }
+
+  // 1.2) 插件设置与工作流（14 个插件各自的配置文件；散落在 <DshHome> 树里，不能整目录抓）
+  if (gated('settings')) skipScopedGroup(scope, repoRoot, 'settings', skippedByScope)
+  else {
+    try {
+      let wrote = 0
+      for (const entry of SETTINGS_SOURCES) {
+        if (gatedItem('settings', entry.id)) { skippedByScope.push(`settings/${entry.id}: 未勾选`); continue }
+        const src = settingsSourcePath(local.dshHome, profileDir, entry)
+        if (!existsSync(src)) continue
+        if (looksSecretFile(src, entry.id)) {
+          const stale = join(repoRoot, 'settings', entry.id)
+          if (existsSync(stale)) { try { rmSync(stale, { force: true }); changed.push(`settings/${entry.id}（含凭据，已从仓库移除）`) } catch { /* 删不掉不影响其余 */ } }
+          skippedByScope.push(`settings/${entry.id}: 含令牌/凭据，已跳过（仓库里若有旧副本同时移除）`)
+          continue
+        }
+        {
+          const text = zeroVolatileFields(readFileSync(src, 'utf8'), entry.id)
+          const out = toTokenText(text, roots).replace(/\r\n/g, '\n')
+          const dst = join(repoRoot, 'settings', entry.id)
+          let before = ''
+          try { before = readFileSync(dst, 'utf8') } catch { /* 新文件 */ }
+          if (before !== out) {
+            mkdirSync(dirname(dst), { recursive: true })
+            writeFileSync(dst, out, 'utf8')
+            changed.push(`settings/${entry.id}`)
+            wrote += 1
+          }
+          files += 1
+        }
+      }
+      if (wrote === 0) skippedByScope.push('settings: 本机没有需要同步的插件设置文件（或全部无变化）')
+    } catch (e) {
+      errors.push(`settings: ${(e && e.message) || e}`)
+    }
   }
 
   // 1.5) 执行体：把 Node 引擎写进仓库根（Windows 版一直这么干，POSIX 之前漏了）
@@ -971,6 +995,14 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   pull('profile/cordis.patch.yml', join(profileDir, 'cordis.patch.yml'))
   pull('profile/cordis.yml', join(profileDir, 'cordis.yml'))
   pull('profile/pnpm-workspace.yaml', join(profileDir, 'pnpm-workspace.yaml'))
+
+  // 插件设置与工作流：仓库里有的才铺；缺占位符路径的由 pull 记进 skipped，不写半成品
+  if (scopeGroupEnabled(scope, 'settings')) {
+    for (const entry of SETTINGS_SOURCES) {
+      if (!scopeItemEnabled(scope, 'settings', entry.id)) { skippedByScope.push(`settings/${entry.id}: 未勾选`); continue }
+      pull(`settings/${entry.id}`, settingsSourcePath(local.dshHome, profileDir, entry))
+    }
+  } else skippedByScope.push('settings: 未勾选同步')
   if (!scopeGroupEnabled(scope, 'prompt')) skippedByScope.push('prompt: 未勾选同步')
   else {
     if (scopeItemEnabled(scope, 'prompt', 'AGENTS.md')) pull('prompt/AGENTS.md', join(local.dshHome, 'AGENTS.md'))

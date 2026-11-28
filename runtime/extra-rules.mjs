@@ -7,7 +7,7 @@
 //   面板把几千个文件的 mtime 算成「待推送」，而 capture 根本不会抓它们）。
 //   所以规则只认这个文件，engine 与 index.js 都从这里 import。
 
-import { readdirSync as readdirSyncImpl, readFileSync } from 'node:fs'
+import { closeSync, openSync, readdirSync as readdirSyncImpl, readFileSync, readSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const EXTRA_CONFIG_NAME = 'config-sync-extra.json'
@@ -133,3 +133,71 @@ export function listPluginDataSlots(dshHome, cfg) {
 }
 
 function readdirSync2(dir) { return readdirSyncImpl(dir, { withFileTypes: true }) }
+/**
+ * 凭据 / 私有文件的判定 —— 与 PowerShell 的 Test-PrivateSecretFileName + Test-SyncExtraSecret 对齐。
+ *
+ * 两道门：
+ *   1) 名字（自家私有 json / .env / *.pem / *.key / *.p12 / *.pfx / SSH 私钥名）；
+ *   2) 内容嗅探（GitHub 令牌前缀 + accessToken / apiKey / password 这类字段名）——
+ *      名字看不出来的才算「嗅探」，但漏了它就把登录态搬进仓库了。
+ *
+ * 读不出来的文件一律当凭据（旧实现「读不了就放行」，超长路径 / 独占 / 权限不足的文件会静默进仓库）。
+ */
+export const PRIVATE_FILE_NAMES = [
+  'config-sync-gh.json', 'config-sync-feedback-outbox.json', 'dsh-config-sync.json',
+  'config-sync-state.json', 'config-sync-roots.json', 'config-sync-scope.json',
+  'config-sync-delete-cloud.json', 'config-sync-extra.json', 'sync-notices.json',
+  '.credentials.yaml', '.env', 'dsh-ssh-master.key',
+]
+
+const PRIVATE_NAME_PATTERNS = [/\.env\..*$/i, /\.pem$/i, /\.key$/i, /\.p12$/i, /\.pfx$/i, /^(id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?|identity|.*\.ppk)$/i]
+
+/** 内容里的凭据标记（小写匹配；GitHub 令牌按正则单独判） */
+const SECRET_MARKERS = [
+  '"accesstoken"', '"refreshtoken"', '"idtoken"', '"apikey"', '"api_key"',
+  '"clientsecret"', '"privatekey"', '"password"', '"webdavpass"', '"updatetoken"',
+  'authorization: bearer', 'github_token=', 'gh_token=',
+]
+
+const GITHUB_TOKEN_RE = /gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}/
+const PEM_HEAD_RE = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----|PuTTY-User-Key-File-[0-9]/
+
+export function looksPrivateName(relOrPath) {
+  const leaf = String(relOrPath || '').split(/[\\/]/).pop() || ''
+  if (!leaf) return false
+  const lower = leaf.toLowerCase()
+  if (PRIVATE_FILE_NAMES.includes(lower)) return true
+  return PRIVATE_NAME_PATTERNS.some((re) => re.test(leaf))
+}
+
+/** 读一段样本：≤2 MB 整份，更大的取头尾各 512 KB（令牌常落在头部或日志尾部）。 */
+function sampleBytes(full) {
+  const st = statSync(full)
+  const len = st.size
+  if (len <= 2100000) return readFileSync(full)
+  const chunk = 512 * 1024
+  const head = Buffer.alloc(Math.min(chunk, len))
+  const tail = Buffer.alloc(Math.min(chunk, len - Math.max(0, len - chunk)))
+  const fd = openSync(full, 'r')
+  try {
+    const headRead = readSync(fd, head, 0, head.length, 0)
+    readSync(fd, tail, 0, tail.length, Math.max(0, len - chunk))
+    return Buffer.concat([head.subarray(0, headRead), tail])
+  } finally { closeSync(fd) }
+}
+
+export function looksSecretFile(full, relOrPath) {
+  if (looksPrivateName(relOrPath || full)) return true
+  try {
+    const buf = sampleBytes(full)
+    // latin1（码位 = 字节）：二进制里的 ASCII 令牌照样命中，也不会因非法 UTF-8 抛错
+    const raw = buf.toString('latin1')
+    if (GITHUB_TOKEN_RE.test(raw)) return true
+    if (PEM_HEAD_RE.test(raw)) return true
+    const lower = raw.toLowerCase()
+    return SECRET_MARKERS.some((m) => lower.includes(m))
+  } catch {
+    // 读不了 = 判不了 → 宁可跳过（调用方会记进未同步清单）
+    return true
+  }
+}

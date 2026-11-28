@@ -2582,6 +2582,29 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       && rules.extraSkipReason('a/x.json', 10, cfg) === '')
   }
 
+  // ── 插件设置与工作流（settings 组）+ 凭据嗅探（0.6.49 起 Node 引擎也做）──
+  {
+    const rules = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'extra-rules.mjs')).href)
+    const secStage = mkdtempSync(join(tmpdir(), 'cfg-sync-sec-'))
+    const put = (name, content) => { const p = join(secStage, name); writeFileSync(p, content); return p }
+    check('凭据：名字与内容两道门都生效（.env / 私钥名 / apiKey / GH 令牌 / PEM 头）',
+      rules.looksSecretFile(put('.env', 'A=1'), '.env') === true
+      && rules.looksSecretFile(put('id_rsa', 'x'), 'id_rsa') === true
+      && rules.looksSecretFile(put('s1.json', '{"apiKey":"sk-1"}'), 's1.json') === true
+      && rules.looksSecretFile(put('s2.json', '{"t":"ghp_abcdefghijklmnopqrstuvwxyz"}'), 's2.json') === true
+      && rules.looksSecretFile(put('s3.txt', '-----BEGIN OPENSSH PRIVATE KEY-----'), 's3.txt') === true
+      && rules.looksSecretFile(put('ok.json', '{"theme":"dark"}'), 'ok.json') === false)
+    const src = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'settings-sources.mjs')).href)
+    {
+      const hostText = readFileSync(join(repoRootOfTools, 'index.js'), 'utf8')
+      check('设置源清单 14 项，且与面板共用一份', src.SETTINGS_SOURCES.length === 14
+        && hostText.includes("from './runtime/settings-sources.mjs'")
+        && hostText.includes('const SYNC_SETTINGS_SOURCES = SETTINGS_SOURCES'))
+    }
+    check('易变计数清零只动数字', src.zeroVolatileFields('{"reloadCount": 42, "catalogSyncedAt": 1734567890, "keep": 7}', 'our-free-model.json')
+      === '{"reloadCount": 0, "catalogSyncedAt": 0, "keep": 7}')
+  }
+
   // profile 组要带上「哪些插件开着」：cordis.yml 丢了，换台机器就不是同一套插件
   {
     const engText = readFileSync(join(repoRootOfTools, 'runtime', 'sync-engine.mjs'), 'utf8')
