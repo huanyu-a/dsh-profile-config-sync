@@ -2479,6 +2479,18 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
   check('pgrep 用的模式里带可执行文件路径（不是光秃秃的进程名）',
     /Contents.*MacOS|DeepSeek Harness/.test(pf.clientProcessPattern(appRoot)), pf.clientProcessPattern(appRoot))
 
+  const hostSrc = readFileSync(join(repoRootOfTools, 'index.js'), 'utf8')
+
+  // 同步范围卡必须按平台说实话：非 Windows 只同步四组，其余八组要在 GET /scope 里
+  // 带 supported:false，面板据此禁用勾选 —— 让人勾着却永不生效是最糟的「看起来能用」。
+  // 直接用字符串包含比正则稳（这行里有 ? : . ( ) 五类元字符，写正则容易自己咬自己）
+  check('scope GET 按引擎能力给出 supported（非 Windows 只认四组）',
+    hostSrc.includes('supported: ENGINE_SYNCED_GROUPS ? ENGINE_SYNCED_GROUPS.has(g.id) : true')
+    && hostSrc.includes('engineGroups: ENGINE_SYNCED_GROUPS ? [...ENGINE_SYNCED_GROUPS] : null'))
+  check('面板：不支持的组禁用勾选并写明原因',
+    readFileSync(join(repoRootOfTools, 'client.js'), 'utf8').includes('!supported')
+    && readFileSync(join(repoRootOfTools, 'client.js'), 'utf8').includes('此平台暂不支持'))
+
   // 符号链接形式的仓库路径（macOS 实测）：/var 与 /tmp 都指向 /private/...，git 报真实路径，
   // 只比字面量会把用户填的路径判成「不是仓库根」，面板「立即推送」直接失败。
   if (!IS_WIN) {
@@ -2513,7 +2525,6 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
   // 后台自动拉取（启动时那条）在 macOS 上不能弹原生框：那条路径没有请求也没有面板，
   // osascript 的 display dialog 常被窗口挡住 → 用户看不见、自动拉取永不发生（实测踩过）。
   // 现在 POSIX 只挂 status.auto.pullPrompt + 日志，由面板一键接手；Windows 保持原样。
-  const hostSrc = readFileSync(join(repoRootOfTools, 'index.js'), 'utf8')
   check('后台自动拉取：只在 Windows 弹原生确认框',
     /if \(IS_WIN\) \{\s*\r?\n\s*yes = await askConfirm\(title, text\)/.test(hostSrc),
     'index.js 的 scheduleAutoStart 分支没有按平台区分确认方式')

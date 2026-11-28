@@ -2349,6 +2349,9 @@ window.__ModuleLoader__.load({
             const excluded = items.filter((i) => i.enabled === false).length
             const expanded = open[g.id] === true
             const groupOn = g.enabled !== false
+            // 0.6.49：宿主会按平台告诉这一组「本机引擎到底会不会同步」（非 Windows 只有四组）。
+            // 不支持的组一律禁用勾选并标注原因 —— 让人勾着却永远不生效是最糟的那种"看起来能用"。
+            const supported = g.supported !== false
             const canExpand = items.length > 0
             return h('div', {
               key: g.id,
@@ -2365,10 +2368,13 @@ window.__ModuleLoader__.load({
                   }, expanded ? '▾' : '▸')
                   : h('span', { style: { flexShrink: 0, width: '10px' } }),
                 h('input', {
-                  type: 'checkbox', checked: groupOn, disabled: busy || !editing || g.required === true,
-                  title: g.required === true
-                    ? M('必需内容：取消会让另一台机器拉取时直接报错', 'Required: unchecking it makes the other machine fail on pull')
-                    : (editing ? '' : M('只读：先点「修改」', 'Read-only: click Edit first')),
+                  type: 'checkbox', checked: groupOn,
+                  disabled: busy || !editing || g.required === true || !supported,
+                  title: !supported
+                    ? M('此平台暂不支持：要 Windows 版才会同步这一组', 'Not supported on this platform yet — this group syncs on Windows')
+                    : (g.required === true
+                      ? M('必需内容：取消会让另一台机器拉取时直接报错', 'Required: unchecking it makes the other machine fail on pull')
+                      : (editing ? '' : M('只读：先点「修改」', 'Read-only: click Edit first'))),
                   onClick: (e) => e.stopPropagation(),   // 勾选别当成"点行展开"
                   onChange: () => toggleGroup(g.id), style: { flexShrink: 0 },
                 }),
@@ -2379,7 +2385,9 @@ window.__ModuleLoader__.load({
                       color: groupOn ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-tertiary)',
                       textDecoration: groupOn ? 'none' : 'line-through',
                     },
-                  }, g.required === true ? `${g.title} · ${M('必需', 'required')}` : g.title),
+                  }, g.required === true
+                    ? `${g.title} · ${M('必需', 'required')}`
+                    : (supported ? g.title : `${g.title} · ${M('此平台暂不支持', 'not on this platform')}`)),
                   g.desc
                     ? h('div', { style: S.footnote },
                       g.required === true

@@ -4459,8 +4459,12 @@ async function handleScope(req, res, config) {
           desc: t(g.descZh, g.descEn),
           enabled: g.enabled,
           required: g.required === true,
+          // 0.6.49：这台机器上的引擎会不会真的同步这一组。非 Windows 只有四组（ENGINE_SYNCED_GROUPS），
+          // 面板据此把其余组标成「此平台暂不支持」并禁用勾选 —— 让人勾上却永远不生效，比不给勾更糟。
+          supported: ENGINE_SYNCED_GROUPS ? ENGINE_SYNCED_GROUPS.has(g.id) : true,
           items: g.items.map((it) => ({ id: it.id, label: it.label, enabled: it.enabled, excludable: it.excludable !== false })),
         })),
+        engineGroups: ENGINE_SYNCED_GROUPS ? [...ENGINE_SYNCED_GROUPS] : null,
       })
       return
     }
