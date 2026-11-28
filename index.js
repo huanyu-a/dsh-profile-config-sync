@@ -1446,7 +1446,7 @@ async function inspect(config) {
     // 0.4.0：跨端信息。面板据此显示「本机平台 / 仓库契约来自哪个平台 / 已登记哪些机器」。
     // 这里刻意不显示本机绝对路径的明文（那是本机私有），只给平台族与版本。
     platform: (() => {
-      const contract = repo ? readContract(repo) : null
+      const contract = repo ? readContract(repo, process.platform) : null
       const local = {
         os: OS,
         osLabel: platformLabel(),

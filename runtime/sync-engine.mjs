@@ -1009,7 +1009,7 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
   // 2) 契约：记下本机实测版本 + 平台
   try {
     if (local.dshVersion) {
-      const existing = readContract(repoRoot)
+      const existing = readContract(repoRoot, PLATFORM_LANE)
       const merged = buildContract({
         dshVersion: existing ? existing.appVersion : local.dshVersion,
         electronVersion: local.electronVersion,
@@ -1753,7 +1753,7 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
 function foreignRepoEvidence(repoRoot, local) {
   const reasons = []
   const mine = platformFamily()
-  const contract = repoRoot ? readContract(repoRoot) : null
+  const contract = repoRoot ? readContract(repoRoot, PLATFORM_LANE) : null
   if (contract && contract.platformFamily && String(contract.platformFamily).toLowerCase() !== String(mine).toLowerCase()) {
     reasons.push(`仓库契约记录的平台是 ${contract.platformFamily}，本机是 ${mine}`)
   }
@@ -1795,7 +1795,7 @@ function applyConversationsWithGuard(opts) {
 
 export function status({ repoRoot, dshHome, appRoot, workspaceHome } = {}) {
   const local = probeLocal({ dshHome, appRoot, workspaceHome })
-  const contract = repoRoot ? readContract(repoRoot) : null
+  const contract = repoRoot ? readContract(repoRoot, PLATFORM_LANE) : null
   const machines = repoRoot ? listMachines(repoRoot) : []
   const git = local.git
   const gitState = git && repoRoot ? readGitState(repoRoot, git) : null
@@ -2326,7 +2326,7 @@ export async function runCli(argv) {
         }
       }
       // 宿主版本契约：与 Windows 版语义一致 —— 主版本不同直接拒绝，同主版本不同号只警告。
-      const contractDoc = readContract(repoRoot)
+      const contractDoc = readContract(repoRoot, PLATFORM_LANE)
       const localDoc = createProbeLocal({ dshHome, appRoot, workspaceHome })
       const verdict = checkContract(contractDoc, localDoc)
       if (verdict.level === 'block' && !(a.AllowVersionDrift || a.allowVersionDrift)) {

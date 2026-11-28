@@ -2620,6 +2620,21 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     check('执行体幂等：内容没变不重写', again.length === 0, again.join(','))
   }
 
+  // ── 契约也按平台读：本平台分区优先，根目录那份是老客户端写的 ──
+  {
+    const cStage = mkdtempSync(join(tmpdir(), 'cfg-sync-contract-'))
+    const cRepo = join(cStage, 'repo')
+    mkdirSync(join(cRepo, 'profile', process.platform), { recursive: true })
+    writeFileSync(join(cRepo, 'profile', process.platform, 'host-contract.json'), JSON.stringify({ appVersion: '1.0.0', electronVersion: '40.0.0', platforms: [process.platform], platformFamily: 'posix' }))
+    writeFileSync(join(cRepo, 'profile', 'host-contract.json'), JSON.stringify({ appVersion: '0.2.2-rc.5' }))  // 老客户端那份，缺字段
+    const cm = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'contract.mjs')).href)
+    const laned = cm.readContract(cRepo, process.platform)
+    const rootOnly = cm.readContract(cRepo)
+    check('契约按平台读：本平台分区优先（根目录那份不完整也不会误判成「没有契约」）',
+      laned && laned.appVersion === '1.0.0' && Array.isArray(laned.platforms)
+      && rootOnly === null)
+  }
+
   // ── 共享目录按云端镜像：A 机删掉的技能，B 机拉一次就该消失（删前留底）──
   {
     const mStage = mkdtempSync(join(tmpdir(), 'cfg-sync-mirror-'))

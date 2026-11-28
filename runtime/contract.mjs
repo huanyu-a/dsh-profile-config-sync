@@ -26,10 +26,17 @@ export function contractPath(repoRoot) {
   return join(repoRoot, 'profile', 'host-contract.json')
 }
 
-/** 读契约。不存在或坏掉返回 null（调用方据此跳过校验，而不是拒绝同步）。 */
-export function readContract(repoRoot) {
+/**
+ * 读契约。不存在或坏掉返回 null（调用方据此跳过校验，而不是拒绝同步）。
+ *
+ * 0.6.49 起契约按平台分开存（`profile/<平台>/host-contract.json`），根目录那份是老客户端写的。
+ * 先读本平台分区，没有再回落到根目录 —— 否则 macOS 上读到的是 Windows 那份不完整契约，
+ * 面板会误报「契约缺失 / 平台不明」。
+ */
+export function readContract(repoRoot, platform = '') {
   try {
-    const p = contractPath(repoRoot)
+    const lane = platform ? join(repoRoot, 'profile', String(platform), 'host-contract.json') : ''
+    const p = lane && existsSync(lane) ? lane : contractPath(repoRoot)
     if (!existsSync(p)) return null
     const doc = JSON.parse(readFileSync(p, 'utf8'))
     if (!doc || typeof doc !== 'object') return null
