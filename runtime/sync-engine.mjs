@@ -765,6 +765,10 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
     copy(join(profileDir, 'cordis.patch.yml'), 'profile/cordis.patch.yml')
     copy(join(profileDir, 'package-lock.json'), 'profile/package-lock.json')
     copy(join(profileDir, 'pnpm-lock.yaml'), 'profile/pnpm-lock.yaml')
+    // 0.6.49 补：`cordis.yml` 是「哪些插件开着」的名单、`pnpm-workspace.yaml` 是 hoisted 布局，
+    // 两者丢了换台机器就不是同一套插件。Windows 版一直抓这两个（capture.ps1 的 profile 文件表）。
+    copy(join(profileDir, 'cordis.yml'), 'profile/cordis.yml')
+    copy(join(profileDir, 'pnpm-workspace.yaml'), 'profile/pnpm-workspace.yaml')
   }
 
   // 1.5) 执行体：把 Node 引擎写进仓库根（Windows 版一直这么干，POSIX 之前漏了）
@@ -965,6 +969,8 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
 
   pull('profile/package.json', join(profileDir, 'package.json'))
   pull('profile/cordis.patch.yml', join(profileDir, 'cordis.patch.yml'))
+  pull('profile/cordis.yml', join(profileDir, 'cordis.yml'))
+  pull('profile/pnpm-workspace.yaml', join(profileDir, 'pnpm-workspace.yaml'))
   if (!scopeGroupEnabled(scope, 'prompt')) skippedByScope.push('prompt: 未勾选同步')
   else {
     if (scopeItemEnabled(scope, 'prompt', 'AGENTS.md')) pull('prompt/AGENTS.md', join(local.dshHome, 'AGENTS.md'))

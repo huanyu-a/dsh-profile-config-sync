@@ -2582,6 +2582,15 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       && rules.extraSkipReason('a/x.json', 10, cfg) === '')
   }
 
+  // profile 组要带上「哪些插件开着」：cordis.yml 丢了，换台机器就不是同一套插件
+  {
+    const engText = readFileSync(join(repoRootOfTools, 'runtime', 'sync-engine.mjs'), 'utf8')
+    check('引擎抓取 profile 文件含 cordis.yml / pnpm-workspace.yaml',
+      engText.includes("copy(join(profileDir, 'cordis.yml'), 'profile/cordis.yml')")
+      && engText.includes("copy(join(profileDir, 'pnpm-workspace.yaml'), 'profile/pnpm-workspace.yaml')")
+      && engText.includes("pull('profile/cordis.yml', join(profileDir, 'cordis.yml'))"))
+  }
+
   // 同步范围卡必须按平台说实话：非 Windows 只同步四组，其余八组要在 GET /scope 里
   // 带 supported:false，面板据此禁用勾选 —— 让人勾着却永不生效是最糟的「看起来能用」。
   // 直接用字符串包含比正则稳（这行里有 ? : . ( ) 五类元字符，写正则容易自己咬自己）
