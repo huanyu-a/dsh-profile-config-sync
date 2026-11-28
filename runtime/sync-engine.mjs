@@ -1042,14 +1042,9 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
   if (gated('prompt')) skipScopedGroup(scope, repoRoot, 'prompt', skippedByScope)
   else {
     if (gatedItem('prompt', 'AGENTS.md')) skippedByScope.push('prompt/AGENTS.md: 未勾选')
-    else {
-      copy(join(local.dshHome, 'AGENTS.md'), 'prompt/AGENTS.md')
-      // 0.6.49 早期版本把提示也按平台分过区，这里把那份清掉，避免读的时候又优先读到旧的分区副本
-      const staleLane = join(repoRoot, fromRepoPath(lanePathOf('prompt/AGENTS.md')))
-      if (existsSync(staleLane)) {
-        try { rmSync(staleLane, { force: true }); changed.push(`${lanePathOf('prompt/AGENTS.md')}（已并入共享的 prompt/AGENTS.md）`) } catch { /* 删不掉不影响 */ }
-      }
-    }
+    // 全局提示按平台分开存：里面写的是各系统的运行时路径与 shell 命令，
+    // 共享一份的话 Mac 推一次就把 Windows 的 pwsh 路径换成了 macOS 的（反之亦然）。
+    else copy(join(local.dshHome, 'AGENTS.md'), lanePathOf('prompt/AGENTS.md'))
     if (gatedItem('prompt', 'prompt-inject.md')) skippedByScope.push('prompt/prompt-inject.md: 未勾选')
     else copy(join(local.dshHome, 'prompt-inject.md'), 'prompt/prompt-inject.md')
   }

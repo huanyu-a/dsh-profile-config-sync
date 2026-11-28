@@ -2653,12 +2653,12 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     writeFileSync(join(lHome, 'AGENTS.md'), '# 本机全局提示\n')
     const lEng = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'sync-engine.mjs')).href)
     const lcap = lEng.capture({ repoRoot: lRepo, dshHome: lHome, appRoot: '/Applications/DeepSeek Harness.app' })
-    check('平台分区：profile 写进 <平台>/ 子目录，全局提示走共享（配置要互相覆盖）',
+    check('平台分区：profile 与全局提示都写进 <平台>/ 子目录，根目录老位置不建',
       lcap.ok === true
       && existsSync(join(lRepo, 'profile', lane, 'package.json'))
-      && existsSync(join(lRepo, 'prompt', 'AGENTS.md'))
+      && existsSync(join(lRepo, 'prompt', lane, 'AGENTS.md'))
       && !existsSync(join(lRepo, 'profile', 'package.json'))
-      && !existsSync(join(lRepo, 'prompt', lane, 'AGENTS.md')))
+      && !existsSync(join(lRepo, 'prompt', 'AGENTS.md')))
 
     // 同一份仓库里同时存在老客户端写的根目录那份（Windows 形状）时，本平台必须优先用自己那份
     writeFileSync(join(lRepo, 'profile', 'package.json'), '{"dependencies":{"@local/x":"link:C:\\\\Users\\\\bob\\\\AppData\\\\Local\\\\x"}}')
