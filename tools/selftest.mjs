@@ -2620,6 +2620,28 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     check('执行体幂等：内容没变不重写', again.length === 0, again.join(','))
   }
 
+  // ── 共享目录按云端镜像：A 机删掉的技能，B 机拉一次就该消失（删前留底）──
+  {
+    const mStage = mkdtempSync(join(tmpdir(), 'cfg-sync-mirror-'))
+    const mRepo = join(mStage, 'repo'), mHome = join(mStage, 'home')
+    mkdirSync(join(mRepo, 'skills', 'keep-skill'), { recursive: true })
+    writeFileSync(join(mRepo, 'skills', 'keep-skill', 'SKILL.md'), '# keep\n')
+    mkdirSync(join(mHome, 'skills', 'keep-skill'), { recursive: true })
+    writeFileSync(join(mHome, 'skills', 'keep-skill', 'SKILL.md'), '# keep\n')
+    mkdirSync(join(mHome, 'skills', 'stale-skill'), { recursive: true })
+    writeFileSync(join(mHome, 'skills', 'stale-skill', 'SKILL.md'), '# stale\n')
+    mkdirSync(join(mHome, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(mHome, 'profiles', 'desktop', 'package.json'), '{"name":"dsh-profile-desktop"}')
+    const mEng = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'sync-engine.mjs')).href)
+    const mr = mEng.apply({ repoRoot: mRepo, dshHome: mHome, appRoot: '/Applications/DeepSeek Harness.app' })
+    const bkDirs = existsSync(join(mHome, 'backups')) ? readdirSync(join(mHome, 'backups')) : []
+    const backed = bkDirs.length > 0 && existsSync(join(mHome, 'backups', bkDirs[0], 'skills', 'stale-skill', 'SKILL.md'))
+    check('共享目录镜像：仓库里没有的技能会被删掉，且删前留底',
+      mr.ok === true && !existsSync(join(mHome, 'skills', 'stale-skill'))
+      && existsSync(join(mHome, 'skills', 'keep-skill')) && backed,
+      `backups=${bkDirs.join(',')}`)
+  }
+
   // ── 平台分区（0.6.49）：机器相关的文件按平台分目录，三端共用一份仓库而不互相覆盖 ──
   {
     const lane = process.platform
@@ -2631,12 +2653,12 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     writeFileSync(join(lHome, 'AGENTS.md'), '# 本机全局提示\n')
     const lEng = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'sync-engine.mjs')).href)
     const lcap = lEng.capture({ repoRoot: lRepo, dshHome: lHome, appRoot: '/Applications/DeepSeek Harness.app' })
-    check('平台分区：capture 把 profile / 全局提示写进 <平台>/ 子目录，根目录那份老位置不建',
+    check('平台分区：profile 写进 <平台>/ 子目录，全局提示走共享（配置要互相覆盖）',
       lcap.ok === true
       && existsSync(join(lRepo, 'profile', lane, 'package.json'))
-      && existsSync(join(lRepo, 'prompt', lane, 'AGENTS.md'))
+      && existsSync(join(lRepo, 'prompt', 'AGENTS.md'))
       && !existsSync(join(lRepo, 'profile', 'package.json'))
-      && !existsSync(join(lRepo, 'prompt', 'AGENTS.md')))
+      && !existsSync(join(lRepo, 'prompt', lane, 'AGENTS.md')))
 
     // 同一份仓库里同时存在老客户端写的根目录那份（Windows 形状）时，本平台必须优先用自己那份
     writeFileSync(join(lRepo, 'profile', 'package.json'), '{"dependencies":{"@local/x":"link:C:\\\\Users\\\\bob\\\\AppData\\\\Local\\\\x"}}')

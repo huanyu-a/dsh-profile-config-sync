@@ -15,7 +15,7 @@
 
 import { spawnSync } from 'node:child_process'
 import {
-  closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync,
+  closeSync, copyFileSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync,
   readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, lstatSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
@@ -1042,7 +1042,14 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
   if (gated('prompt')) skipScopedGroup(scope, repoRoot, 'prompt', skippedByScope)
   else {
     if (gatedItem('prompt', 'AGENTS.md')) skippedByScope.push('prompt/AGENTS.md: 未勾选')
-    else copy(join(local.dshHome, 'AGENTS.md'), lanePathOf('prompt/AGENTS.md'))
+    else {
+      copy(join(local.dshHome, 'AGENTS.md'), 'prompt/AGENTS.md')
+      // 0.6.49 早期版本把提示也按平台分过区，这里把那份清掉，避免读的时候又优先读到旧的分区副本
+      const staleLane = join(repoRoot, fromRepoPath(lanePathOf('prompt/AGENTS.md')))
+      if (existsSync(staleLane)) {
+        try { rmSync(staleLane, { force: true }); changed.push(`${lanePathOf('prompt/AGENTS.md')}（已并入共享的 prompt/AGENTS.md）`) } catch { /* 删不掉不影响 */ }
+      }
+    }
     if (gatedItem('prompt', 'prompt-inject.md')) skippedByScope.push('prompt/prompt-inject.md: 未勾选')
     else copy(join(local.dshHome, 'prompt-inject.md'), 'prompt/prompt-inject.md')
   }
@@ -1187,6 +1194,47 @@ let applyBackupDir = ''
  * 覆盖前留底。只备份「将被覆盖且内容不同」的本机文件；内容相同的不重复拷。
  * src 是目录时逐文件比对。备份失败不阻断同步，但要记进 errors（否则是静默丢底）。
  */
+/**
+ * 共享目录的「镜像」语义：仓库里没有的，本机就删（删前留底）。
+ *
+ * 用户要的是「配置互相覆盖」：在 A 机删掉的技能，B 机拉一次就该消失。
+ * 只拷贝不删的话，删掉的东西会在另一台机器上永远留着，时间一长两边就分叉了。
+ * 只用于 skills / presets 这类以云端为准的配置目录，不动插件数据（那里有运行期文件）。
+ */
+function mirrorSharedDir({ srcDir, dstDir, dshHome, dryRun, label, backupDir, written, skipped, errors }) {
+  if (!isDir(srcDir) || !isDir(dstDir)) return 0
+  let srcNames = []
+  try { srcNames = readdirSync(srcDir) } catch { return 0 }
+  const keep = new Set(srcNames)
+  let localNames = []
+  try { localNames = readdirSync(dstDir) } catch { return 0 }
+  let removed = 0
+  for (const name of localNames) {
+    if (keep.has(name)) continue
+    const abs = join(dstDir, name)
+    const rel = relative(dshHome, abs).split(sep).join('/')
+    if (dryRun) { written.push(`${label}/${name}（会删除：仓库里没有）`); continue }
+    try {
+      const target = join(backupDir || join(dshHome, 'backups', 'apply-manual'), rel)
+      mkdirSync(dirname(target), { recursive: true })
+      if (isDir(abs)) cpSync(abs, target, { recursive: true, force: true })
+      else copyFileSync(abs, target)
+    } catch (e) {
+      errors.push(`${label}/${name}: 删除前留底失败，已跳过删除（${(e && e.message) || e}）`)
+      continue
+    }
+    try {
+      rmSync(abs, { recursive: true, force: true })
+      removed += 1
+      written.push(`${label}/${name}（已删除：仓库里没有）`)
+    } catch (e) {
+      errors.push(`${label}/${name}: 删除失败 ${(e && e.message) || e}`)
+    }
+  }
+  if (removed) skipped.push(`${label}: 按云端镜像删掉本机多出来的 ${removed} 项（已留底）`)
+  return removed
+}
+
 /**
  * 覆盖前留底：把**目标文件当前的样子**复制到 `<DshHome>/backups/apply-<时间戳>/`。
  *
@@ -1613,10 +1661,20 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
     if (scopeItemEnabled(scope, 'prompt', 'prompt-inject.md')) pull('prompt/prompt-inject.md', join(local.dshHome, 'prompt-inject.md'))
     else skippedByScope.push('prompt/prompt-inject.md: 未勾选')
   }
-  if (scopeGroupEnabled(scope, 'skills')) pull('skills', join(local.dshHome, 'skills'))
-  else skippedByScope.push('skills: 未勾选同步')
-  if (scopeGroupEnabled(scope, 'presets')) pull('presets', join(local.dshHome, '.agent-presets'))
-  else skippedByScope.push('presets: 未勾选同步')
+  if (scopeGroupEnabled(scope, 'skills')) {
+    pull('skills', join(local.dshHome, 'skills'))
+    mirrorSharedDir({
+      srcDir: join(repoRoot, 'skills'), dstDir: join(local.dshHome, 'skills'), dshHome: local.dshHome,
+      dryRun, label: 'skills', backupDir: applyBackupDir, written, skipped, errors,
+    })
+  } else skippedByScope.push('skills: 未勾选同步')
+  if (scopeGroupEnabled(scope, 'presets')) {
+    pull('presets', join(local.dshHome, '.agent-presets'))
+    mirrorSharedDir({
+      srcDir: join(repoRoot, 'presets'), dstDir: join(local.dshHome, '.agent-presets'), dshHome: local.dshHome,
+      dryRun, label: 'presets', backupDir: applyBackupDir, written, skipped, errors,
+    })
+  } else skippedByScope.push('presets: 未勾选同步')
 
   // 会话记录：目录名按本机工作区 ID 重编码，会话日志走 seq 护栏（见 runtime/conversations.mjs）
   if (scopeGroupEnabled(scope, 'conversations')) {
