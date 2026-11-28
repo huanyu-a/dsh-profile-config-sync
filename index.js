@@ -49,7 +49,7 @@ import { listMachines } from './runtime/machines.mjs'
 import { checkContract, readContract } from './runtime/contract.mjs'
 // 0.4.0：WebDAV 通道（第二种同步方式，与 git 共用同一份仓库格式）
 import {
-  downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive,
+  downloadRepo, isSecureUrl, normalizeWebdav, sanitizeUserAgent, testConnection, uploadRepo, webdavActive,
 } from './runtime/webdav.mjs'
 
 const pluginRequire = createRequire(import.meta.url)
@@ -64,6 +64,8 @@ const ROUTE_CONFLICT = '/config-sync/conflict'
 // 0.3.30：跨机路径确认（每台机器把自己的根目录报给插件一次）与问题反馈（落仓库 feedback\ 再推 GitHub）
 const ROUTE_ROOTS = '/config-sync/roots'
 const ROUTE_FEEDBACK = '/config-sync/feedback'
+/** 反馈请求体上限：4 个附件 × 20 MB 的 base64（约 27 MB/个）+ 余量。 */
+const ROUTE_FEEDBACK_MAX_BODY = 160 * 1024 * 1024
 // 0.3.76：会话投影缓存守卫（GET 只读扫描 / POST scan|sweep|clear|busy）
 const ROUTE_CACHE_GUARD = '/config-sync/cache-guard'
 // 0.3.76：工作区显示状态（GET 读 / POST workspace 三态 | session 独立隐藏）
@@ -364,6 +366,9 @@ function readSettings(dshHome) {
     webdavPass: typeof raw.webdavPass === 'string' ? raw.webdavPass : '',
     // WebDAV 上存放同步包的目录（相对根，默认 dsh-config-sync）
     webdavDir: typeof raw.webdavDir === 'string' ? raw.webdavDir : '',
+    // 0.6.48：自定义 User-Agent。部分第三方 WebDAV 按 UA 放行/拦截，默认 undici UA 会被拒。
+    // 留空 = 不发 User-Agent 头（与 0.6.47 之前的行为一致）。
+    webdavUserAgent: typeof raw.webdavUserAgent === 'string' ? raw.webdavUserAgent : '',
   }
 }
 
@@ -394,6 +399,7 @@ function writeSettings(dshHome, s) {
     webdavUser: s.webdavUser || '',
     webdavPass: s.webdavPass || '',
     webdavDir: s.webdavDir || '',
+    webdavUserAgent: s.webdavUserAgent || '',
   }
   const payload = JSON.stringify(merged, null, 2) + '\n'
   // 这份文件里有 WebDAV 密码与更新令牌：POSIX 上收紧到仅本人可读写（Windows 靠用户目录 ACL，0o600 是空操作）
@@ -1445,6 +1451,8 @@ async function inspect(config) {
         url: w.url,
         user: w.user,
         dir: w.dir,
+        // 0.6.48：UA（留空 = 不发 User-Agent 头）
+        userAgent: w.ua,
         secure: isSecureUrl(w.url),
       }
     })(),
@@ -1509,14 +1517,21 @@ function sendJson(res, code, body) {
   } catch { /* 客户端已断开就忽略 */ }
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
-    let data = ''
+    // 用数组收块、最后再 join：反馈路由的请求体上限放宽到 160 MB，
+    // 逐块 `data += c` 会在这种体量下反复复制整条字符串（O(n²)），内存也翻倍。
+    const chunks = []
+    let total = 0
     req.on('data', (c) => {
-      data += c
-      if (data.length > 64 * 1024) { reject(new Error('body too large')); req.destroy() }
+      const buf = Buffer.isBuffer(c) ? c : Buffer.from(c)
+      total += buf.length
+      // 0.6.48：上限可放宽（反馈带附件时 base64 会超 64 KB），默认值不变，
+      // 其它路由的行为一个字节都不动。
+      if (total > maxBytes) { reject(new Error('body too large')); req.destroy() }
+      else chunks.push(buf)
     })
-    req.on('end', () => resolve(data))
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
     req.on('error', reject)
   })
 }
@@ -5340,6 +5355,9 @@ async function handleWebdav(req, res, config) {
       user: w.user,
       dir: w.dir,
       mode: w.mode,
+      // 0.6.48：UA 回显（面板要能确认「发出去的到底是什么」），留空表示不发 User-Agent
+      userAgent: w.ua,
+      userAgentSanitized: Boolean(String(settings.webdavUserAgent || '').trim()) && !w.ua,
       secure: isSecureUrl(w.url),
       probe,
       platform: OS,
@@ -5356,13 +5374,26 @@ async function handleWebdav(req, res, config) {
 
   // save：只更新给出的字段；密码留空表示「不改」（避免面板回显后把密码清空）
   if (action === 'save') {
-    const next = { ...settings }
-    if (typeof body.url === 'string') next.webdavUrl = body.url.trim()
-    if (typeof body.user === 'string') next.webdavUser = body.user.trim()
-    if (typeof body.dir === 'string') next.webdavDir = body.dir.trim()
-    if (typeof body.mode === 'string' && ['git', 'webdav', 'auto'].includes(body.mode)) next.syncMode = body.mode
-    if (typeof body.pass === 'string' && body.pass.length > 0) next.webdavPass = body.pass
     try {
+      const next = { ...settings }
+      if (typeof body.url === 'string') next.webdavUrl = body.url.trim()
+      if (typeof body.user === 'string') next.webdavUser = body.user.trim()
+      if (typeof body.dir === 'string') next.webdavDir = body.dir.trim()
+      if (typeof body.mode === 'string' && ['git', 'webdav', 'auto'].includes(body.mode)) next.syncMode = body.mode
+      if (typeof body.pass === 'string' && body.pass.length > 0) next.webdavPass = body.pass
+      // 0.6.48：UA。非法值（含 CRLF / 非 ASCII / 超长）不静默存：明确报错，
+      // 否则用户以为填上了，实际发出去的还是默认 UA，症状又变成「连不上」。
+      if (typeof body.userAgent === 'string') {
+        const raw = body.userAgent.trim()
+        const safe = sanitizeUserAgent(raw)
+        if (raw && !safe) {
+          throw new Error(t(
+            'User-Agent 只能是一行可见 ASCII（不含换行、中文、制表符），且不超过 200 字符',
+            'User-Agent must be a single line of visible ASCII (no newlines, CJK or tabs), at most 200 characters',
+          ))
+        }
+        next.webdavUserAgent = safe
+      }
       writeSettings(dshHome, next)
       clearWebdavProbeCache()
       const w = normalizeWebdav(next)
@@ -5892,11 +5923,174 @@ function issueBodyOf(text, config) {
   return `${String(text || '').trim()}\n\n---\n### 环境 / Environment\n${env}\n`
 }
 
-async function createIssue(repo, token, title, text, config) {
+/* ---------- 0.6.48：反馈附件（图片 / 视频） ----------
+ * 起因（issue #9）：面板只能打字，截图与录屏没法带上来 —— 而这两样恰恰是
+ * 「界面显示不对」「同步报错」类反馈里最关键的证据。
+ *
+ * 做法：走 GitHub 自己的 release asset 上传接口，不借道第三方图床。
+ *   1) 找一个用来挂附件的 release（见 feedbackAssetRelease）：没有就建一个
+ *      名为 `feedback-assets` 的草稿 release（draft，标签页看不见，只有
+ *      知道链接的人才打得到 —— 反馈附件本来就不该公开发布）；
+ *   2) POST 到该 release 的 `upload_url`（形如
+ *      https://uploads.github.com/repos/<o>/<r>/releases/<id>/assets{?name,label}），
+ *      body 是原始字节，Content-Type 是真实类型，`?name=` 给出文件名；
+ *   3) 把返回的 `browser_download_url` 按 Markdown 图片 / 普通链接插进正文。
+ *
+ * 为什么要自己找 release：Issue 本身没有附件接口，只有 release 才有。
+ * 而附件存成 release asset 的好处是：链接永久有效、换机器与别人看都能打开，
+ * 且不依赖你本机的文件还在不在。
+ *
+ * 边界：
+ *   - 单文件 20 MB、最多 4 个（GitHub 单 asset 上限 2 GB，这里收紧是为了面板不卡）；
+ *   - 白名单类型：PNG / JPEG / GIF / WebP / MP4 / MOV / WebM / 文本日志；
+ *     其它一律拒（可执行文件、压缩包不进资产）；
+ *   - 没有令牌时退回「浏览器预填页面」，并明确告知附件没上传，
+ *     提示用户手动拖进网页 —— 不静默丢弃。
+ */
+const FEEDBACK_MAX_ATTACH_BYTES = 20 * 1024 * 1024
+const FEEDBACK_MAX_ATTACH_COUNT = 4
+const FEEDBACK_ATTACH_MIME = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  bmp: 'image/bmp',
+  svg: 'image/svg+xml',
+  mp4: 'video/mp4',
+  mov: 'video/quicktime',
+  webm: 'video/webm',
+  log: 'text/plain; charset=utf-8',
+  txt: 'text/plain; charset=utf-8',
+  md: 'text/plain; charset=utf-8',
+  json: 'text/plain; charset=utf-8',
+}
+
+/** 附件的扩展名 → MIME。不在白名单里返回 ''（调用方据此拒收）。 */
+function feedbackAttachMime(name) {
+  const leaf = String(name || '').split(/[\\/]/).pop() || ''
+  const dot = leaf.lastIndexOf('.')
+  if (dot <= 0) return ''
+  return FEEDBACK_ATTACH_MIME[leaf.slice(dot + 1).toLowerCase()] || ''
+}
+
+/** Markdown 引用：图片用 ![]()，其它（视频/日志）用普通链接，点开是下载/播放。 */
+function feedbackAttachMarkdown(item) {
+  const url = String((item && item.url) || '')
+  const name = String((item && item.name) || 'attachment').replace(/([\[\]])/g, '\\$1')
+  if (!url) return ''
+  return /^image\//.test(String((item && item.type) || '')) ? `![${name}](${url})` : `- [${name}](${url})`
+}
+
+/**
+ * 上传一个附件到 GitHub（两步：拿上传地址 → PUT 字节）。
+ * 成功返回 { ok: true, name, url, type }，失败返回 { ok: false, name, error } —— 不抛，
+ * 因为「有一个附件传不上去」不该让整条反馈都发不出去。
+ */
+/**
+ * 找（或建）一个用来挂反馈附件的 release。
+ *
+ * GitHub 只有 release 有 asset 接口，Issue 没有。先按 tag `feedback-assets` 找；
+ * 找不到就建一个**草稿** release（draft=true）：它不会出现在 Releases 页面、
+ * 不会被搜索引擎收录，但知道链接的人打得开 —— 反馈附件本来就不该公开发布。
+ *
+ * 缓存到进程内存里：一次反馈最多 4 个附件，不该为每个文件都去查一遍。
+ */
+const feedbackReleaseCache = new Map()
+
+async function feedbackAssetRelease(repo, token) {
+  const cached = feedbackReleaseCache.get(repo)
+  if (cached) return cached
+  const tag = 'feedback-assets'
+  const found = await ghApi(`/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, { token })
+  if (found.ok && found.json && found.json.id) {
+    const r = { id: found.json.id, uploadUrl: String(found.json.upload_url || '') }
+    feedbackReleaseCache.set(repo, r)
+    return r
+  }
+  // 没有就建：草稿 release，tag 固定，名字写明用途
+  const created = await ghApi(`/repos/${repo}/releases`, {
+    method: 'POST',
+    token,
+    body: {
+      tag_name: tag,
+      name: 'feedback-assets',
+      body: 'Draft release holding the attachments of GitHub Issues in this repository. Created automatically by dsh-profile-config-sync; not published on purpose.',
+      draft: true,
+      prerelease: false,
+    },
+    timeoutMs: 20000,
+  })
+  if (!created.ok || !created.json || !created.json.id) {
+    return { error: `${created.status} ${String((created.json && created.json.message) || '').slice(0, 160) || '建不了存放附件的 release'}` }
+  }
+  const r = { id: created.json.id, uploadUrl: String(created.json.upload_url || '') }
+  feedbackReleaseCache.set(repo, r)
+  return r
+}
+
+/**
+ * 上传一个附件到 GitHub 的 release assets。
+ * 成功返回 { ok: true, name, url, type }，失败返回 { ok: false, name, error } —— 不抛，
+ * 因为「有一个附件传不上去」不该让整条反馈都发不出去。
+ */
+async function uploadFeedbackAsset(repo, token, name, buf, mime) {
+  const safe = String(name || 'attachment').split(/[\\/]/).pop().slice(0, 120) || 'attachment'
+  const rel = await feedbackAssetRelease(repo, token)
+  if (!rel || !rel.id) {
+    return { ok: false, name: safe, error: String((rel && rel.error) || '拿不到存放附件的 release') }
+  }
+  if (!rel.uploadUrl) {
+    return { ok: false, name: safe, error: 'release 没有 upload_url' }
+  }
+  // upload_url 形如 https://uploads.github.com/repos/<o>/<r>/releases/<id>/assets{?name,label}
+  // —— 官方格式是「{?name,label}」这一整段，不能只把 {name} 当占位符替换。
+  // 去掉那段之后地址末尾没有查询串，所以要用「?」而不是「&」。
+  const base = rel.uploadUrl.replace(/\{\?[^}]*\}/g, '')
+  const target = base + (base.includes('?') ? '&' : '?') + 'name=' + encodeURIComponent(safe)
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': PACKAGE_ID,
+    Authorization: `Bearer ${token}`,
+    'Content-Type': mime || 'application/octet-stream',
+    'Content-Length': String(buf.length),
+  }
+  let res
+  try {
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null
+    const timer = ctrl ? setTimeout(() => { try { ctrl.abort() } catch { } }, 120000) : null
+    try {
+      res = await fetch(target, { method: 'POST', headers, body: buf, signal: ctrl ? ctrl.signal : undefined })
+    } finally { if (timer) clearTimeout(timer) }
+  } catch (e) {
+    return { ok: false, name: safe, error: String((e && e.message) || e) }
+  }
+  const raw = await res.text().catch(() => '')
+  let json = null
+  try { json = raw ? JSON.parse(raw) : null } catch { json = null }
+  if (!res.ok || !json || !json.browser_download_url) {
+    return { ok: false, name: safe, error: `${res.status} ${String((json && json.message) || raw).slice(0, 160) || '上传失败'}` }
+  }
+  return { ok: true, name: safe, url: String(json.browser_download_url), type: mime || '' }
+}
+
+/**
+ * 正文 = 用户写的 + 附件引用 + 环境块（环境块永远在最后一段）。
+ * 有附件时附件在前、环境块在后；没附件时就是原来的形状，老行为一个字节都不变。
+ */
+function issueBodyWithAttachments(text, config, attachments) {
+  const base = String(text || '').trim()
+  const refs = (attachments || []).map(feedbackAttachMarkdown).filter(Boolean)
+  const withRefs = refs.length ? `${base}${base ? '\n\n' : ''}### 附件 / Attachments\n${refs.join('\n')}\n` : base
+  return issueBodyOf(withRefs, config)
+}
+
+async function createIssue(repo, token, title, text, config, attachments = []) {
   return ghApi(`/repos/${repo}/issues`, {
     method: 'POST',
     token,
-    body: { title, body: issueBodyOf(text, config), labels: [GH_FEEDBACK_LABEL] },
+    body: { title, body: issueBodyWithAttachments(text, config, attachments), labels: [GH_FEEDBACK_LABEL] },
   })
 }
 
@@ -6255,7 +6449,9 @@ async function handleFeedback(req, res, config) {
   if (!originAllowed(req)) { sendJson(res, 403, { ok: false, error: 'cross-origin request rejected' }); return }
 
   try {
-    const raw = await readBody(req)
+    // 0.6.48：反馈可能带最多 4 个附件的 base64（每个 20 MB 上限，但 base64 后按 32 MB 算）。
+    // 这里给 160 MB 的上限：够 4×20 MB 的极端情况，又不至于让一个请求把内存吃穿。
+    const raw = await readBody(req, ROUTE_FEEDBACK_MAX_BODY)
     const payload = raw.trim() ? JSON.parse(raw) : {}
     const g = await ghToken(config, dshHome)
 
@@ -6344,7 +6540,9 @@ async function handleFeedback(req, res, config) {
       const sent = []
       const failed = []
       for (const item of pending) {
-        const r = await createIssue(g.repo, g.token, String(item.title || ''), String(item.body || ''), config)
+        // 0.6.48：队列里可能带着已经上传好的附件 URL（建 issue 那步失败时留下的），
+        // 补发直接引用，不再重传 —— 附件已经在仓库资产里，重传只会留下垃圾。
+        const r = await createIssue(g.repo, g.token, String(item.title || ''), String(item.body || ''), config, Array.isArray(item.attachments) ? item.attachments : [])
         if (r.ok && r.json) sent.push({ number: r.json.number, url: r.json.html_url })
         else failed.push(item)
       }
@@ -6378,31 +6576,108 @@ async function handleFeedback(req, res, config) {
     const text = String(payload.body || payload.detail || '').trim().slice(0, 6000)
     if (!title) throw new Error(t('先写个标题，方便以后对上号', 'Give it a title so it can be found later'))
 
-    // 没令牌：不硬失败，给一条浏览器预填链接（浏览器登录了 GitHub 就能点提交）
+    // 4a) 附件（issue #9：图片 / 视频）。面板把文件读成 base64 放进 payload.attachments：
+    //     [{ name, type, data }]。这里先校验再上传 —— 上传是不可撤销的（资产留在仓库里），
+    //     所以宁可在本地就拒掉不合规的，也不要传上去再删。
+    const attachments = []
+    const attachErrors = []
+    const rawAttachments = Array.isArray(payload.attachments) ? payload.attachments : []
+    if (rawAttachments.length > FEEDBACK_MAX_ATTACH_COUNT) {
+      throw new Error(t(
+        `附件最多 ${FEEDBACK_MAX_ATTACH_COUNT} 个（收到 ${rawAttachments.length} 个）`,
+        `At most ${FEEDBACK_MAX_ATTACH_COUNT} attachments (got ${rawAttachments.length})`,
+      ))
+    }
+    for (const item of rawAttachments) {
+      const name = String((item && item.name) || '')
+      const mime = feedbackAttachMime(name)
+      if (!mime) {
+        attachErrors.push(`${name || '?'}: ${t('不支持的文件类型（只收图片 / 视频 / 日志）', 'unsupported type (images, videos and logs only)')}`)
+        continue
+      }
+      let buf = null
+      try {
+        const b64 = String((item && item.data) || '')
+        // 先按 base64 长度粗筛：base64 约为原字节的 4/3，
+        // 超上限十几倍的数据根本不该解码（否则先占一份内存再丢掉）。
+        if (b64 && b64.length <= Math.ceil(FEEDBACK_MAX_ATTACH_BYTES * 4 / 3) + 8) buf = Buffer.from(b64, 'base64')
+      } catch { buf = null }
+      if (!buf || buf.length === 0) {
+        attachErrors.push(`${name || '?'}: ${t('读不到文件内容', 'cannot read the file content')}`)
+        continue
+      }
+      if (buf.length > FEEDBACK_MAX_ATTACH_BYTES) {
+        attachErrors.push(`${name}: ${t(`超过 ${Math.round(FEEDBACK_MAX_ATTACH_BYTES / 1048576)} MB`, `larger than ${Math.round(FEEDBACK_MAX_ATTACH_BYTES / 1048576)} MB`)}`)
+        continue
+      }
+      attachments.push({ name, type: mime, buf })
+    }
+
+    // 没令牌：不硬失败，给一条浏览器预填链接（浏览器登录了 GitHub 就能点提交）。
+    // 有附件时必须在消息里说清楚「附件没带上，要手动拖进网页」—— 静默丢弃是这类功能最常见的坑。
     if (!g.token) {
+      const localNames = attachments.map((a) => a.name)
+      const notes = []
+      if (localNames.length) {
+        notes.push(t(
+          `没有令牌：附件（${localNames.join('、')}）没能上传，请在打开的页面里手动把它们拖进正文；标题和正文都已填好。`,
+          `No token: attachments (${localNames.join(', ')}) were not uploaded — drag them into the body on the opened page; title and body are prefilled.`,
+        ))
+      }
+      // 被拒的附件也要说：悄悄丢掉一个 .exe，用户会以为「它上去了」
+      if (attachErrors.length) {
+        notes.push(t(`有附件没带上：${attachErrors.join('、')}`, `Some attachments were left out: ${attachErrors.join(', ')}`))
+      }
       sendJson(res, 200, {
         ok: true,
         needToken: true,
         submitted: false,
         fallbackUrl: newIssueUrl(g.repo, title, text, config),
-        error: t('没有令牌：可以打开预填好的新建 issue 页面，在浏览器里点一下提交', 'No token: open the prefilled new-issue page and press submit in the browser'),
+        pendingAttachments: localNames,
+        attachmentErrors: attachErrors,
+        error: notes.join(' ') || t('没有令牌：可以打开预填好的新建 issue 页面，在浏览器里点一下提交', 'No token: open the prefilled new-issue page and press submit in the browser'),
       })
       return
     }
 
-    const r = await createIssue(g.repo, g.token, title, text, config)
+    // 先传附件：资产一旦上传就留在仓库里，所以放在建 issue 之前——
+    // 建 issue 失败时至少能把这些 URL 存进待发队列，补发时不用再传一遍。
+    const uploaded = []
+    for (const a of attachments) {
+      const r = await uploadFeedbackAsset(g.repo, g.token, a.name, a.buf, a.type)
+      if (r.ok) uploaded.push({ name: r.name, url: r.url, type: r.type })
+      else attachErrors.push(`${a.name}: ${r.error}`)
+    }
+
+    const r = await createIssue(g.repo, g.token, title, text, config, uploaded)
     if (r.ok && r.json) {
-      sendJson(res, 200, { ok: true, number: r.json.number, url: r.json.html_url, item: issueToItem(r.json) })
+      sendJson(res, 200, {
+        ok: true,
+        number: r.json.number,
+        url: r.json.html_url,
+        item: issueToItem(r.json),
+        attachments: uploaded.map((u) => ({ name: u.name, url: u.url })),
+        attachmentErrors: attachErrors,
+      })
       return
     }
     // 建 issue 失败：进本机队列，网络好了点「补发」
     const items = readOutbox(dshHome)
-    items.push({ title, body: text, createdAt: new Date().toISOString(), error: `${r.status} ${String((r.json && r.json.message) || '').slice(0, 160)}` })
+    items.push({
+      title,
+      body: text,
+      createdAt: new Date().toISOString(),
+      error: `${r.status} ${String((r.json && r.json.message) || '').slice(0, 160)}`,
+      // 附件 URL 一起入队：补发时直接引用，不重复上传
+      attachments: uploaded.map((u) => ({ name: u.name, url: u.url, type: u.type })),
+    })
     writeOutbox(dshHome, items)
     sendJson(res, 200, {
       ok: true,
       queued: true,
       remaining: items.length,
+      attachments: uploaded.map((u) => ({ name: u.name, url: u.url })),
+      attachmentErrors: attachErrors,
       error: `${r.status} ${String((r.json && r.json.message) || '').slice(0, 160)}`,
     })
   } catch (error) {

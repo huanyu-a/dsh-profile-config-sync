@@ -132,6 +132,47 @@ Details, raw first-push/first-pull output and the five classic pitfalls: [docs/R
 - Cloud emptiness is probed with `ls-remote` + a shallow bare fetch (15 s timeout); unreachable means “pull only”.
 - Settings live in `~\.dsh\dsh-config-sync.json` (machine-local, never committed); the SSH key path is stored, but may be left empty for `.ssh\config`.
 
+## WebDAV: when a third-party server refuses the connection
+
+WebDAV reuses the same repository layout and only swaps the transport (no git, no remote repository). Fill in the URL, account, password and remote folder in the panel's "Cloud repo & transport" card.
+
+| Item | Notes |
+|---|---|
+| **User-Agent** | Optional client name (e.g. `Mozilla/5.0`, `davfs2/1.6.1`). Some third-party DAV servers (Synology / Jianguoyun / self-hosted) allow or block by UA — on 403, put the client name they expect. **Blank = no User-Agent header is sent at all** |
+| Allowed UA characters | A single line of visible ASCII: no newlines, no CJK, no tabs, at most 200 characters. An invalid value is rejected with an explicit error instead of being silently stored as empty |
+| URL | The server root (e.g. `https://dav.example.com/dav`); the subfolder goes into "Remote dir" |
+| Authentication | Basic (account + password). The password stays in the machine-local `dsh-config-sync.json`; the panel only shows "set / not set" and never echoes it |
+| Transport safety | Plain `http` is refused by default (credentials in clear text); set `DSH_SYNC_ALLOW_INSECURE=1` to allow it |
+
+**When it fails, the reason is now specific** (since 0.6.48 the status code decides the message instead of one vague "cannot connect"):
+
+| Symptom | Meaning |
+|---|---|
+| Auth failed (401) | Wrong username or password, or the service wants an app password / token |
+| Forbidden (403) | The account has no access to that folder; it may also be blocked by User-Agent → set the client name it expects |
+| 404 | No such folder under that URL → check that the URL is the server root and the folder is in "Remote dir" |
+| PROPFIND not allowed (405 / 501) | This may not be a standard WebDAV endpoint, or it needs a path prefix |
+| Unreachable / timeout | Check the URL, network and certificate (self-signed certs must be trusted by the system) |
+
+"Test" also reports **the User-Agent actually sent**, so you can tell a client filter from another cause.
+
+## Feedback (with screenshots and screen recordings)
+
+The last panel section, "Feedback": write a title and details → **submitting creates a GitHub Issue** (label `feedback`); every machine sees the same list, and "Resolve" closes it.
+
+**Attachments (since 0.6.48)**: screenshots and recordings are the most telling evidence in "the UI looks wrong" or "the sync failed" reports, and until now they could only be described in words. Files can now be attached directly:
+
+| Item | Notes |
+|---|---|
+| Accepted types | Images (png / jpg / jpeg / gif / webp / bmp / svg), videos (mp4 / mov / webm), text (log / txt / md / json) |
+| Count and size | Up to 4 files, 20 MB each |
+| Where they live | Uploaded as **release assets of the feedback repo itself** (GitHub's asset interface exists only for releases, not issues) and referenced from the issue body — no third-party image host, readable from any machine, and independent of your local file still existing. The attachments hang on a **draft release** (tag `feedback-assets`), so they never show up on the Releases page |
+| Body reference | Images use Markdown image syntax (shown inline); videos and logs use a plain link (click to download / play) |
+| A token is required | Uploading assets needs a GitHub token. Without one the panel opens the prefilled browser page and **tells you explicitly that the attachments were not uploaded** — ask you to drag them in; they are never dropped silently |
+| No network | Uploaded attachment URLs are kept in the local queue, so "Flush" references them instead of uploading twice |
+
+Rejected attachments (wrong type, too large, unreadable) are reported one by one — the panel never pretends everything went along.
+
 ## Sync scope
 
 All **12 groups are checked by default**; each group and each item can be unchecked, and unchecking stops both capture and restore.

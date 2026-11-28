@@ -2025,5 +2025,269 @@ console.log('== 0.5.1：环境变量读取令牌 + 防令牌/凭据推入仓库 
     && cliSrc.includes("st.tokenSource === 'gh-cli'"),
     'index.js 或 client.js 缺少网络容错或本机登录态识别')
 }
+
+/* ==================== 0.6.48：issue #7/#8/#9 修复回归 ====================
+ * #7/#8：第三方 WebDAV 连不上 —— 既没有 UA 配置项，失败也只有一句
+ *        「连不上或认证失败（PROPFIND 无响应）」，用户无从下手。
+ * #9  ：问题反馈带不了图片/视频。
+ * 这一节盯三件事：UA 真的发出去、失败原因按状态码分开、附件真的上传并引进正文。
+ */
+console.log('')
+console.log('== 0.6.48：WebDAV User-Agent + 可诊断失败 + 反馈附件（issue #7/#8/#9）==')
+{
+  const idxSrc = readFileSync(join(pluginRootSelf, 'index.js'), 'utf8')
+  const cliSrc = readFileSync(join(pluginRootSelf, 'client.js'), 'utf8')
+  const eng2 = await import(pathToFileURL(join(pluginRuntime, 'webdav.mjs')).href)
+
+// --- UA：归一化 / 非法值拒收 / 真的进请求头 ---
+{
+  const w = eng2.normalizeWebdav({
+    webdavUrl: 'https://dav.example.com/dav', webdavUser: 'u', webdavPass: 'p',
+    webdavDir: 'dsh', webdavUserAgent: 'davfs2/1.6.1',
+  })
+  check('normalizeWebdav 带出自定义 UA', w.ua === 'davfs2/1.6.1', String(w.ua))
+  check('normalizeWebdav 的诊断字段不进 JSON（lastError / lastStatus 不外露）',
+    !/lastError|lastStatus/.test(JSON.stringify(w)),
+    JSON.stringify(w))
+
+  const bad = [
+    ['CRLF 注入', 'davfs2\r\nX-Evil: 1'],
+    ['中文', '中文客户端'],
+    ['制表符', 'davfs2\t1'],
+    ['超长', 'a'.repeat(300)],
+  ]
+  for (const [label, value] of bad) {
+    check(`UA 非法值被拒（${label}）→ 退回不发`, eng2.sanitizeUserAgent(value) === '', JSON.stringify(eng2.sanitizeUserAgent(value)))
+  }
+  check('UA 留空 = 不发 User-Agent', eng2.sanitizeUserAgent('') === '' && eng2.sanitizeUserAgent(undefined) === '')
+
+  // 真发一次：本地起个 HTTP 服务，把收到的 user-agent 头回显出来。
+  // 这是唯一能证明「配置项不是摆设」的办法 —— 只读源码断言会被「字段存了但没用」骗过去。
+  const { createServer } = await import('node:http')
+  const seen = []
+  const srv = createServer((req, res) => {
+    seen.push(req.headers['user-agent'] === undefined ? '(none)' : String(req.headers['user-agent']))
+    res.statusCode = 207
+    res.setHeader('content-type', 'application/xml; charset=utf-8')
+    res.end('<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"></d:multistatus>')
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const port = srv.address().port
+  try {
+    const withUa = eng2.normalizeWebdav({ webdavUrl: `http://127.0.0.1:${port}/dav`, webdavDir: 'dsh', webdavUserAgent: 'MyDAV/1.0' })
+    const r1 = await eng2.listRemote(withUa, '')
+    check('自定义 UA 真的发给了服务端', r1 && seen[0] === 'MyDAV/1.0', `收到 ${seen[0]}`)
+    const noUa = eng2.normalizeWebdav({ webdavUrl: `http://127.0.0.1:${port}/dav`, webdavDir: 'dsh' })
+    await eng2.listRemote(noUa, '')
+    check('UA 留空时服务端收不到 User-Agent 头', seen[1] === '(none)', `收到 ${seen[1]}`)
+  } finally {
+    await new Promise((r) => srv.close(r))
+  }
+}
+
+// --- 失败原因按状态码分开，且不再是那句笼统的「连不上或认证失败」 ---
+{
+  const { createServer } = await import('node:http')
+  // 本地测试服是 http：testConnection 会按「明文传密码有风险」拒掉非 https 地址，
+  // 这里显式放行（只在这个测试进程里生效，且连的是 127.0.0.1）。
+  const prevInsecure = process.env.DSH_SYNC_ALLOW_INSECURE
+  process.env.DSH_SYNC_ALLOW_INSECURE = '1'
+  const cases = [[401, '认证失败（401）'], [403, '被拒绝（403）'], [405, '不支持 PROPFIND']]
+  try {
+    for (const [status, expect] of cases) {
+      const srv = createServer((req, res) => { res.statusCode = status; res.end('nope') })
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+      const port = srv.address().port
+      try {
+        const w = eng2.normalizeWebdav({ webdavUrl: `http://127.0.0.1:${port}/dav`, webdavDir: 'dsh' })
+        const probe = await eng2.testConnection(w)
+        check(`PROPFIND ${status} 的失败原因说得清（${expect}）`,
+          probe.ok === false && String(probe.error).includes(expect),
+          String(probe.error))
+        check(`PROPFIND ${status} 不再落到笼统文案`,
+          !/连不上或认证失败（PROPFIND 无响应）/.test(String(probe.error)),
+          String(probe.error))
+        check(`PROPFIND ${status} 报出状态码`, Number(probe.status) === status, String(probe.status))
+      } finally {
+        await new Promise((r) => srv.close(r))
+      }
+    }
+    // 404 是「目录还不存在」的合法首次同步：探测不算失败，只是空的
+    {
+      const srv = createServer((req, res) => { res.statusCode = 404; res.end('nope') })
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+      const port = srv.address().port
+      try {
+        const w = eng2.normalizeWebdav({ webdavUrl: `http://127.0.0.1:${port}/dav`, webdavDir: 'dsh' })
+        const probe = await eng2.testConnection(w)
+        check('404 视为「云端还是空的」而不是失败', probe.ok === true && probe.exists === false, JSON.stringify(probe))
+      } finally {
+        await new Promise((r) => srv.close(r))
+      }
+    }
+  } finally {
+    if (prevInsecure === undefined) delete process.env.DSH_SYNC_ALLOW_INSECURE
+    else process.env.DSH_SYNC_ALLOW_INSECURE = prevInsecure
+  }
+}
+
+// --- 整条 WebDAV 通路实测（0.6.48 换了 HTTP 客户端，必须有回归护栏） ---
+// 为什么单独起一个假服务器：上传/下载涉及 PROPFIND / PUT / GET / MKCOL 四种方法，
+// 路径基准、Content-Length、重定向方法保持这些细节，只有真跑一遍才看得见。
+{
+  const { createServer } = await import('node:http')
+  const { mkdtempSync, writeFileSync, readFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const store = new Map()
+  const seenUa = []
+  const methods = []
+  const esc = (s) => String(s).replace(/&/g, '&amp;')
+  const srv = createServer((req, res) => {
+    const u = new URL(req.url, 'http://x')
+    const key = u.pathname
+    methods.push(req.method)
+    seenUa.push(req.headers['user-agent'] === undefined ? '(none)' : String(req.headers['user-agent']))
+    if (req.method === 'PROPFIND') {
+      const base = key.replace(/\/$/, '')
+      const kids = [...store.keys()].filter((k) => k.startsWith(base + '/') && !k.slice(base.length + 1).includes('/'))
+      const body = '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
+        + `<d:response><d:href>${esc(base)}/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>`
+        + kids.map((k) => `<d:response><d:href>${esc(k)}</d:href><d:propstat><d:prop><d:getcontentlength>${store.get(k).length}</d:getcontentlength><d:etag>x</d:etag></d:prop></d:propstat></d:response>`).join('')
+        + '</d:multistatus>'
+      res.statusCode = 207
+      res.setHeader('content-type', 'application/xml')
+      res.end(body)
+      return
+    }
+    if (req.method === 'PUT') {
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => { store.set(key, Buffer.concat(chunks)); res.statusCode = 201; res.end() })
+      return
+    }
+    if (req.method === 'GET') {
+      if (store.has(key)) { res.statusCode = 200; res.end(store.get(key)) } else { res.statusCode = 404; res.end() }
+      return
+    }
+    if (req.method === 'MKCOL') { res.statusCode = 201; res.end(); return }
+    res.statusCode = 405
+    res.end()
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const port = srv.address().port
+  const prevInsecure2 = process.env.DSH_SYNC_ALLOW_INSECURE
+  process.env.DSH_SYNC_ALLOW_INSECURE = '1'
+  try {
+    const w = eng2.normalizeWebdav({ webdavUrl: `http://127.0.0.1:${port}/dav`, webdavDir: 'dsh', webdavUserAgent: 'RoundTripUA/1' })
+    const probe = await eng2.testConnection(w)
+    check('WebDAV 实测：探测连通并回显实际 UA', probe.ok === true && probe.userAgent === 'RoundTripUA/1', JSON.stringify(probe))
+    check('WebDAV 实测：请求里带的是自定义 UA', seenUa.every((u) => u === 'RoundTripUA/1'), seenUa.join(','))
+
+    const local = mkdtempSync(join(tmpdir(), 'dsh-dav-up-'))
+    writeFileSync(join(local, 'a.txt'), 'hello dav', 'utf8')
+    const up = await eng2.uploadRepo(w, local)
+    check('WebDAV 实测：上传成功', up.ok === true && up.uploaded.includes('a.txt'), JSON.stringify(up.errors))
+    const up2 = await eng2.uploadRepo(w, local)
+    check('WebDAV 实测：内容相同则跳过（不重复传）', up2.ok === true && up2.uploaded.length === 0 && up2.skipped.includes('a.txt'), JSON.stringify({ u: up2.uploaded, s: up2.skipped }))
+
+    const local2 = mkdtempSync(join(tmpdir(), 'dsh-dav-down-'))
+    const dn = await eng2.downloadRepo(w, local2)
+    check('WebDAV 实测：下载成功且内容一致',
+      dn.ok === true && dn.downloaded.includes('a.txt') && readFileSync(join(local2, 'a.txt'), 'utf8') === 'hello dav',
+      JSON.stringify({ d: dn.downloaded, e: dn.errors }))
+    check('WebDAV 实测：确实用了 PROPFIND / PUT / GET 三种方法',
+      methods.includes('PROPFIND') && methods.includes('PUT') && methods.includes('GET'),
+      [...new Set(methods)].join(','))
+  } finally {
+    if (prevInsecure2 === undefined) delete process.env.DSH_SYNC_ALLOW_INSECURE
+    else process.env.DSH_SYNC_ALLOW_INSECURE = prevInsecure2
+    await new Promise((r) => srv.close(r))
+  }
+}
+
+// --- 反馈附件：上传两步（找/建 release → 传字节）与正文引用 ---
+{
+  check('附件用 release assets 接口（GitHub 的 /repos/{o}/{r}/uploads 已下线）',
+    idxSrc.includes('/releases/tags/')
+    && idxSrc.includes('`/repos/${repo}/releases`')
+    && !idxSrc.includes('`/repos/${repo}/uploads`'),
+    'index.js 未走 release assets 接口')
+  check('附件挂在一个草稿 release 上（不出现在 Releases 页面）',
+    idxSrc.includes('draft: true')
+    && idxSrc.includes('feedback-assets'),
+    'index.js 没用草稿 release 存附件')
+  check('upload_url 的 {?name,label} 整段被替换成真实查询串',
+    idxSrc.includes('replace(/\\{\\?[^}]*\\}/g, \'\')')
+    && idxSrc.includes("'name=' + encodeURIComponent(safe)"),
+    'index.js 的 upload_url 处理不对')
+  check('附件上传走 POST 到 upload_url 且带 Content-Length',
+    idxSrc.includes("fetch(target, { method: 'POST'")
+    && idxSrc.includes("'Content-Length': String(buf.length)"),
+    'index.js 附件上传方法/头不对')
+  check('附件正文引用图片用 Markdown 图片语法',
+    idxSrc.includes("return /^image\\//.test(String((item && item.type) || ''))"),
+    'index.js 附件引用格式不对')
+}
+
+// --- 面板与设置：UA 字段贯通 ---
+check('index.js 设置里读写 webdavUserAgent（读 / 写 / 回显）',
+  idxSrc.includes('webdavUserAgent: typeof raw.webdavUserAgent')
+  && idxSrc.includes('webdavUserAgent: s.webdavUserAgent')
+  && idxSrc.includes('userAgent: w.ua')
+  && idxSrc.includes('sanitizeUserAgent'),
+  'index.js 的 UA 设置没贯通')
+check('保存非法 UA 明确报错（不静默存成空）',
+  /User-Agent 只能是一行可见 ASCII/.test(idxSrc),
+  'index.js 缺少 UA 校验文案')
+check('UA 校验的抛错在 try 里（否则整个路由抛出、连 400 都回不来）',
+  // 取 save 分支这一段：校验必须在 writeSettings 之前、且被 try 包住
+  (() => {
+    const seg = idxSrc.slice(idxSrc.indexOf("if (action === 'save') {"))
+    if (seg < 0) return false
+    const block = seg.slice(0, seg.indexOf("\n    return\n"))
+    const tryAt = block.indexOf('try {')
+    const throwAt = block.indexOf('throw new Error(t(')
+    const writeAt = block.indexOf('writeSettings(dshHome, next)')
+    return tryAt >= 0 && throwAt > tryAt && writeAt > throwAt
+  })(),
+  'index.js 的 UA 校验抛错位置不对')
+check('面板有 User-Agent 输入框并随保存提交',
+  cliSrc.includes("M('User-Agent', 'User-Agent')")
+  && cliSrc.includes('userAgent: wdUa'),
+  'client.js 缺少 UA 输入或没提交')
+
+// --- #9 反馈附件 ---
+check('反馈附件走仓库 assets（不借道第三方图床）',
+  idxSrc.includes('uploadFeedbackAsset')
+  && idxSrc.includes('/uploads')
+  && idxSrc.includes('browser_download_url'),
+  'index.js 缺少附件上传实现')
+check('附件类型白名单 + 单文件 20MB + 最多 4 个',
+  idxSrc.includes('FEEDBACK_ATTACH_MIME')
+  && idxSrc.includes('FEEDBACK_MAX_ATTACH_BYTES')
+  && idxSrc.includes('FEEDBACK_MAX_ATTACH_COUNT'),
+  'index.js 缺少附件限制常量')
+check('附件引用进正文（图片用 ![]()，其它用链接）',
+  idxSrc.includes('feedbackAttachMarkdown')
+  && idxSrc.includes('### 附件 / Attachments'),
+  'index.js 缺少附件正文引用')
+check('没令牌时明确告知附件没上传（不静默丢弃）',
+  idxSrc.includes('pendingAttachments')
+  && /附件（.*）没能上传/.test(idxSrc),
+  'index.js 缺少无令牌时的附件提示')
+check('面板可选图片/视频并随提交发送',
+  cliSrc.includes("type: 'file'")
+  && cliSrc.includes('accept:')
+  && cliSrc.includes('attachments = files.map(')
+  && cliSrc.includes('callFeedback({ title, body: text, attachments })')
+  && cliSrc.includes('addFiles'),
+  'client.js 缺少附件选择或提交')
+check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）',
+  idxSrc.includes('ROUTE_FEEDBACK_MAX_BODY')
+  && /readBody\(req, ROUTE_FEEDBACK_MAX_BODY\)/.test(idxSrc)
+  && /function readBody\(req, maxBytes = 64 \* 1024\)/.test(idxSrc),
+  'index.js 的 body 上限没放宽')
+}
 process.exit(failures === 0 ? 0 : 1)
 

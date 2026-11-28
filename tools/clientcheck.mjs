@@ -253,6 +253,37 @@ try {
   check('备份列表不再逐个显示体积（体积由资源管理器看，status 不为此递归统计）',
     !source.includes('个文件 · ${size(s.bytes)}'),
     '仍在列表里渲染体积')
+  // --- 0.6.48：WebDAV User-Agent 与反馈附件 ---
+  check('WebDAV 卡有 User-Agent 输入框并随保存提交',
+    source.includes("M('User-Agent', 'User-Agent')")
+    && source.includes('userAgent: wdUa')
+    && source.includes('currentWdUa'),
+    'client.js 缺少 User-Agent 输入或没提交')
+  check('WebDAV 测试失败时把状态码原因与实际 UA 一起显示',
+    source.includes('res.userAgent')
+    && source.includes('res.status'),
+    'client.js 没回显探测诊断信息')
+  check('反馈卡有附件选择（图片 / 视频 / 日志）',
+    source.includes("type: 'file'")
+    && source.includes('accept:')
+    && source.includes('addFiles'),
+    'client.js 缺少附件选择')
+  check('反馈提交把附件一起发出去',
+    source.includes('attachments = files.map(')
+    && source.includes('callFeedback({ title, body: text, attachments })'),
+    'client.js 提交时没带附件')
+  check('附件有类型与体积上限，并在超限时明确告知',
+    source.includes('ATTACH_OK')
+    && source.includes('MAX_ATTACH_MB')
+    && source.includes('MAX_ATTACH'),
+    'client.js 缺少附件限制')
+  check('没有令牌时明确提示附件没上传（不静默丢弃）',
+    source.includes('pendingAttachments')
+    && source.includes('没能上传'),
+    'client.js 缺少无令牌时的附件提示')
+  check('反馈附件的类型白名单与后端一致',
+    source.includes('.png,.jpg,.jpeg,.gif,.webp,.bmp,.svg,.mp4,.mov,.webm,.log,.txt,.md,.json'),
+    'client.js 的 accept 列表与后端白名单不一致')
 } catch (e) {
   check('体检数据字段齐全', false, String(e && e.message))
 }

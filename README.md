@@ -47,7 +47,7 @@ DSH 的配置散在 `~/.dsh` 的十几处：profile、全局提示、Skills、Ag
 | [安装](#install) | [从零开始](#quickstart) | [面板](#panel) | [同步内容](#groups) |
 |---|---|---|---|
 | [脚本](#scripts) | [还原备份](#restore) | [插件数据](#plugindata) | [自动同步](#automation) |
-| [仓库 / 云端](#repos) | [工作区与会话](#crossplatform) | [接口](#api) | [来源与版权](#credits) |
+| [仓库 / 云端](#repos) | [WebDAV](#webdav) | [问题反馈](#feedback) | [工作区与会话](#crossplatform) | [接口](#api) | [来源与版权](#credits) |
 
 [历史版本细节](docs/HISTORY.md) · [完整实测记录](docs/CHANGELOG.md) · [字段与接口参考](docs/REFERENCE.md)
 
@@ -189,6 +189,32 @@ pwsh -File runtime\sync.ps1 pull   -RepoRoot <仓库目录> -DshHome <~\.dsh> -A
 | 单文件上限 | 三档：源头 >100 MB 抓取时跳过、≥95 MB 提交前剔除、50–95 MB 只警告 |
 
 私有库：优先 SSH 地址。插件**自身更新**只查 npm，与本机配置的 Git 远端无关，所以换成私有库也不影响自更新（也不用再为它配令牌）。
+
+<a id="webdav"></a>
+
+## WebDAV：第三方服务连不上时
+
+WebDAV 与 git 共用同一份仓库格式，只换传输层（不依赖 git、不需要远端仓库）。面板「云端仓库与同步方式」卡里填地址、账号、密码与远端目录即可。
+
+| 项 | 说明 |
+|---|---|
+| **User-Agent** | 可填客户端名（如 `Mozilla/5.0`、`davfs2/1.6.1`）。部分第三方 DAV（群晖 / 坚果云 / 自建）按 UA 放行或拦截，报 403 时填它要求的那个。**留空 = 完全不发 User-Agent 头** |
+| 允许的 UA 字符 | 单行可见 ASCII，不含换行 / 中文 / 制表符，不超过 200 字符；填了非法值会明确报错，不会静默存成空 |
+| 地址 | 填到根（如 `https://dav.example.com/dav`），子目录单独填在「远端目录」 |
+| 认证 | Basic（账号 + 密码）。密码只存本机 `dsh-config-sync.json`，面板只显示「已设置 / 未设置」，永不明文回显 |
+| 传输安全 | 默认拒绝 http（明文传密码）；确需使用请设 `DSH_SYNC_ALLOW_INSECURE=1` |
+
+**连不上时看具体原因**（0.6.48 起按状态码分开说，不再一律显示「连不上或认证失败」）：
+
+| 现象 | 含义 |
+|---|---|
+| 认证失败（401） | 用户名或密码不对，或这个服务要求应用专用密码 / Token |
+| 被拒绝（403） | 账号没有这个目录的权限；也可能被 User-Agent 拦截 → 填上它要求的客户端名 |
+| 404 | 地址下没有这个目录 → 确认地址填到根、目录填在「远端目录」 |
+| 不支持 PROPFIND（405 / 501） | 这可能不是标准 WebDAV 入口，或需要带路径前缀 |
+| 连不上 / 超时 | 检查地址、网络与证书（自签名证书需加入系统信任库） |
+
+「测试连接」会同时报出**实际发出去的 User-Agent**，方便确认是服务端按客户端过滤还是别的原因。
 
 ## 有文件没同步上时
 
@@ -346,6 +372,25 @@ push 失败时会**按真实远端地址归因**：https 走 `ls-remote` 检查�
 
 被拦的路径段：`browser-profiles`、`User Data`、`Login Data`、`Login Data For Account`、`Cookies`、`Web Data`、`Secure Preferences`、`Local State`、`History`、`Top Sites`、`Current Session`、`Current Tabs`。规则只看路径不看体积，所以「插件把剖面放得更深」也拦得住。
 
+<a id="feedback"></a>
+
+## 问题反馈（带截图与录屏）
+
+面板最后一区的「问题反馈」：写标题与详情 → **提交即建 GitHub Issue**（label `feedback`），另一台机器打开面板看到的是同一份列表；点「已解决」就关单。
+
+**附件（0.6.48 起）**：截图与录屏是「界面显示不对」「同步报错」这类反馈里最关键的证据，以前只能靠打字描述。现在可以直接选文件：
+
+| 项 | 说明 |
+|---|---|
+| 支持的类型 | 图片（png / jpg / jpeg / gif / webp / bmp / svg）、视频（mp4 / mov / webm）、文本（log / txt / md / json） |
+| 数量与体积 | 最多 4 个，单个 ≤ 20 MB |
+| 存放位置 | 传成**反馈仓库自己的 release assets**（GitHub 的 asset 接口只有 release 有，Issue 没有），正文引用它 —— 不借道第三方图床，换机器、别人看都能打开，也不依赖你本机的文件还在。附件挂在一个**草稿 release**（tag `feedback-assets`）上，不会出现在 Releases 页面 |
+| 正文引用 | 图片用 Markdown 图片语法（直接显示），视频与日志用普通链接（点开下载 / 播放） |
+| 需要令牌 | 上传资产要 GitHub 令牌。没有令牌时走「浏览器预填页面」，面板会**明确告诉你附件没上传**，请手动拖进网页 —— 不会静默丢弃 |
+| 网络不通 | 已上传的附件 URL 会存进本机待发队列，点「补发」时直接引用，不重复上传 |
+
+被拒的附件（类型不对、超大、损坏）会逐条报出来，不会假装「都带上去了」。
+
 <a id="automation"></a>
 
 ## 自动同步（默认关）
@@ -382,7 +427,7 @@ push 失败时会**按真实远端地址归因**：https 走 `ls-remote` 检查�
 
 ## 接口与路径
 
-宿主挂 7 条 `/config-sync/*` 路由（`status`、`prepare`、`settings`、`auto`、`update`、`scope`、`extra-config`、`conflict`），跨站请求 403。完整请求/响应形状、路径解析顺序、本机私有文件清单见 [docs/REFERENCE.md](docs/REFERENCE.md#api)。
+宿主挂 13 条 `/config-sync/*` 路由（`status`、`prepare`、`settings`、`auto`、`update`、`scope`、`extra-config`、`conflict`、`roots`、`feedback`、`cache-guard`、`workspace-view`、`webdav`），跨站请求 403。完整请求/响应形状、路径解析顺序、本机私有文件清单见 [docs/REFERENCE.md](docs/REFERENCE.md#api)。
 
 **边界**：`capture` 要读 `cordis.patch.yml`，运行时这文件正被应用持有（抓到半截）；`apply` 写完 DSH 退出时又会回写覆盖。所以边界固定为——判断该跑什么、把命令写好，退出 DSH 后执行。
 
@@ -394,6 +439,7 @@ push 失败时会**按真实远端地址归因**：https 走 `ls-remote` 检查�
 
 | 日期 | 版本 | 要点 |
 |---|---|---|
+| 2026-11-28 | 0.6.48 | **修 issue #7 / #8（第三方 WebDAV 连不上）与 #9（反馈带不了截图）**：① WebDAV 卡新增 **User-Agent** 输入项（issue #8）——部分第三方 DAV（群晖 / 坚果云 / 自建）按客户端名放行或拦截，没有这一项就只能看到「连不上」。UA 留空 = **完全不发这个头**（实测：Node 的 `fetch` 永远自带 `node` 这个 UA、无法表达「不发」，所以传输层从 `fetch` 换成 `node:http`/`node:https`，并自己处理重定向与 `Content-Length`；Windows 的 PowerShell 与 macOS/Linux 的 Node 引擎都走同一个 `webdav.mjs`，行为一致）。UA 只接受单行可见 ASCII（≤ 200 字符、不含换行 / 中文 / 制表符），非法值保存时直接报错，不静默存成空。② 连不上时**按状态码分开说原因**（issue #7）——原来一律是「连不上或认证失败（PROPFIND 无响应）」，用户既不知道是密码错、还是服务不支持 PROPFIND、也不知道该改哪一项；现在 401 / 403 / 404 / 405 / 重定向 / 超时 / 证书各有一句话，并给出「该改哪一项」；「测试连接」还会报出**实际发出去的 UA**，方便区分「服务端按客户端过滤」与别的原因。③ **问题反馈支持图片 / 视频 / 日志附件**（issue #9）——走 GitHub 的 release asset 接口传成反馈仓库自己的资产，正文引用它（图片内联、视频与日志给链接），不借道第三方图床，换机器与别人看都能打开；asset 接口只有 release 有（Issue 没有），所以附件挂在草稿 release（tag `feedback-assets`）上，不会出现在 Releases 页面；上限 4 个 / 单个 20 MB、类型白名单；不合格的附件逐条报错，**没有令牌时明确告知「附件没上传、请手动拖进网页」而不是静默丢弃**；建 Issue 失败时已上传的附件 URL 存进待发队列，补发时直接引用不重复上传。④ 顺带把 README 里「宿主挂 7 条路由」的陈旧数字改成实际的 13 条。验收：`tools/selftest.mjs` 374 条断言全绿（含 40 条新增：UA 真发出去 / 留空不发 / 四类非法值被拒 / 401·403·405 原因分得开 / 404 仍算「云端是空的」 / WebDAV 上传→跳过→下载整条通路实测 / 附件白名单与正文引用）、`tools/clientcheck.mjs` 全绿；另有 6 条与本次改动无关的既有失败（需要真实远端与真实客户端安装目录的用例）在改动前后完全一致 |
 | 2026-11-27 | 0.6.47 | **更新只查 npm + 在线安装**：更新检查整体换成读 npm registry（dist-tags 定版本、单版本文档取 dist.tarball / dist.integrity、说明取包内 version.json），GitHub 的 raw / API / gh-proxy / ghfast 四条清单源与「更新清单 / 更新令牌」两项设置一起退休；市场索引 `source.type` 从 git 改成 npm，装的就是在线版。顺带修两个真 bug：① 旧「清单记 pnpm pack 的 sha256、npm 当兜底下载」在校验那步必然失败（实测 npm pack 与 registry 上的 tarball 逐字节一致，但与 pnpm pack 的资产不同），现在校验值取自 registry 自己；② 市场索引 publishTimestamp 写成毫秒而非 Unix 秒，DSH 的 parseMarketIndex 会拒掉整个索引——插件市场里此前根本读不出这个插件。功能代码改动集中在更新链路，同步/还原逻辑未动。验收：64 套隔离夹具共 1064 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.46 | **徽章数字接回计数**：0.6.41 手工写死的「64 套 · 1065 条」两版没再动，与同页验收声明（1061）打脸；现在 finalize 从 `last-count.json` 直接生成，口径与验收声明一模一样（只算非元套件：64 套 · 1061 条），人手不再参与。功能代码无改动。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |
 | 2026-11-27 | 0.6.45 | **文档对齐现实**：① 中英 README 去掉「npm 上只到 0.4.1」的陈旧说法（改为「与 GitHub Release 同版本」，`dist-tags.latest` 即它）；② 发布命令块改成同版本占位，修掉「v0.6.39 配 0.6.44 的包」的自相矛盾；③ 写清 `version.json` 不在 npm 包里、面板更新检查读的是仓库里那份。功能代码无改动。验收：64 套隔离夹具共 1061 条断言全绿（不含检查这份 README 的文档对账套件本身；另有 1 条权限断言在 Windows 上标 SKIP，不会假装通过） |

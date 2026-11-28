@@ -23,6 +23,8 @@
 
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 import { homedir } from 'node:os'
 import { dirname, join, resolve, sep as SEP } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -40,15 +42,41 @@ export const DEFAULT_WEBDAV_DIR = 'dsh-config-sync'
 export function normalizeWebdav(settings) {
   const s = settings || {}
   const rawUrl = String(s.webdavUrl || '').trim()
-  return {
+  const w = {
     enabled: Boolean(rawUrl),
     url: rawUrl.replace(/\/+$/, ''),
     user: String(s.webdavUser || '').trim(),
     pass: String(s.webdavPass || ''),
     dir: String(s.webdavDir || '').trim().replace(/^\/+|\/+$/g, '') || DEFAULT_WEBDAV_DIR,
+    // 0.6.48：自定义 User-Agent。部分第三方 WebDAV（群晖 / 坚果云 / 自建 DAV）会按 UA
+    // 放行或拦截客户端，默认 UA 会被当成未知客户端拒掉。留空 = 不发 User-Agent 头。
+    ua: sanitizeUserAgent(s.webdavUserAgent),
     // auto：配了 WebDAV 就用它；否则走 git
     mode: s.syncMode === 'webdav' || s.syncMode === 'auto' ? s.syncMode : 'git',
   }
+  // 0.6.48：诊断字段（面板回显实际发出去的 UA / 失败状态码）。用不可枚举属性，
+  // 免得调用方 JSON.stringify(w) 或打日志时多出三个噪音字段。
+  Object.defineProperties(w, {
+    lastError: { value: '', writable: true, enumerable: false, configurable: true },
+    lastStatus: { value: 0, writable: true, enumerable: false, configurable: true },
+  })
+  return w
+}
+
+/**
+ * User-Agent 只允许单行可见 ASCII，且不能出现 CRLF。
+ *
+ * 这个值会进 HTTP 头：`\r\n` 能凭空造出一条头（响应拆分 / 绕过服务端 ACL），
+ * 非 ASCII 会让 undici 直接抛 TypeError（症状是「连不上」而不是「UA 非法」）。
+ * 不合法就退回「不发 UA」，绝不让一个填错的输入把整条同步打断。
+ */
+export function sanitizeUserAgent(raw) {
+  const s = String(raw == null ? '' : raw).trim()
+  if (!s) return ''
+  if (s.length > 200) return ''
+  // 可见 ASCII（0x20–0x7E）之外一律拒：tab 也不放行，头值里不需要它
+  if (!/^[\x20-\x7E]+$/.test(s)) return ''
+  return s
 }
 
 /** 当前是否应该走 WebDAV（auto 模式下看有没有配地址）。 */
@@ -99,28 +127,152 @@ function authHeader(w) {
   return { authorization: `Basic ${token}` }
 }
 
-/** 一次 fetch，带超时与统一错误。 */
-async function request(url, w, init = {}, timeoutMs = 30000) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    const res = await fetch(url, {
-      ...init,
-      headers: { ...(authHeader(w) || {}), ...((init && init.headers) || {}) },
-      signal: controller.signal,
-    })
-    return res
-  } finally {
-    clearTimeout(timer)
+/**
+ * 一个够用的 Response 替身。
+ *
+ * 为什么不直接用 fetch：undici 的 fetch **总会**带一个 User-Agent 头（默认 `node`），
+ * 且没有「不带 UA」的表达方式 —— 而「留空就不发 User-Agent」正是本插件对用户的承诺
+ * （有些服务看到陌生 UA 就拦）。node:http 则完全由我们决定发哪个头：没设就是没有。
+ * 这里只实现用到的那几个成员（ok / status / text / arrayBuffer）。
+ */
+class DavResponse {
+  constructor(status, headers, body) {
+    this.status = status
+    this.headers = headers || {}
+    this._body = body || Buffer.alloc(0)
   }
+
+  get ok() { return this.status >= 200 && this.status < 300 }
+
+  async text() { return this._body.toString('utf8') }
+
+  async arrayBuffer() {
+    return this._body.buffer.slice(this._body.byteOffset, this._body.byteOffset + this._body.byteLength)
+  }
+}
+
+/** 真正发一次请求（不跟重定向）。 */
+function rawRequestOnce(urlStr, { method, headers, body }, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let u
+    try { u = new URL(urlStr) } catch (e) { reject(new Error(`地址不合法：${urlStr}`)); return }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      reject(new Error(`只支持 http / https 地址：${urlStr}`))
+      return
+    }
+    const mod = u.protocol === 'https:' ? httpsRequest : httpRequest
+    let settled = false
+    const req = mod(u, { method: method || 'GET', headers: headers || {} }, (res) => {
+      const chunks = []
+      res.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
+      res.on('end', () => {
+        if (settled) return
+        settled = true
+        resolve(new DavResponse(res.statusCode || 0, res.headers, Buffer.concat(chunks)))
+      })
+      res.on('error', (e) => { if (!settled) { settled = true; reject(e) } })
+    })
+    req.on('error', (e) => { if (!settled) { settled = true; reject(e) } })
+    if (timeoutMs > 0) {
+      // 覆盖「响应头到手后 body 卡住」：node 的 socket 空闲计时同样管得到 body
+      req.setTimeout(timeoutMs, () => {
+        const err = new Error(`请求超时（${Math.round(timeoutMs / 1000)}s 内没有响应）`)
+        try { req.destroy(err) } catch { }
+      })
+    }
+    if (body !== undefined && body !== null) req.end(body)
+    else req.end()
+  })
+}
+
+/** 发请求，跟随重定向（最多 5 跳）。WebDAV 常见的 301/302 就是干这个的。 */
+async function rawRequest(urlStr, init, timeoutMs, redirects = 0) {
+  const res = await rawRequestOnce(urlStr, init, timeoutMs)
+  const status = res.status
+  const isRedirect = status === 301 || status === 302 || status === 303 || status === 307 || status === 308
+  const location = res.headers && res.headers.location
+  if (isRedirect && location && redirects < 5) {
+    let next = ''
+    try { next = new URL(String(location), urlStr).toString() } catch { next = '' }
+    if (next) {
+      // 与浏览器一致：303 一律改成 GET；301/302 只在原方法是 POST 时改成 GET。
+      // PROPFIND / PUT 这类方法必须原样保留 —— 改成 GET 就把「列目录 / 传文件」变成取网页了。
+      const m = String(init.method || 'GET').toUpperCase()
+      const toGet = status === 303 || ((status === 301 || status === 302) && m === 'POST')
+      const init2 = toGet ? { ...init, method: 'GET', body: undefined } : init
+      return rawRequest(next, init2, timeoutMs, redirects + 1)
+    }
+  }
+  return res
+}
+
+/**
+ * 一次请求，带超时与统一错误。
+ *
+ * 0.6.48：User-Agent 可配置（留空则**不发**这个头）。
+ * 第三方 DAV 常按 UA 放行，默认的 undici UA 会被当成未知客户端直接 401/403 ——
+ * 用户看到的就是「连不上」。这里改用 node:http，因为只有它能做到「没设就是没有」。
+ */
+async function request(url, w, init = {}, timeoutMs = 30000) {
+  const headers = { ...(authHeader(w) || {}), ...((init && init.headers) || {}) }
+  const ua = sanitizeUserAgent(w && w.ua)
+  if (ua) headers['user-agent'] = ua
+  else delete headers['user-agent']
+  // 显式给 Content-Length：部分服务端不接受 chunked 的 PROPFIND
+  let body = init && init.body
+  if (body !== undefined && body !== null) {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8')
+    headers['content-length'] = String(buf.length)
+    body = buf
+  }
+  return rawRequest(url, { method: (init && init.method) || 'GET', headers, body }, timeoutMs)
+}
+
+/**
+ * 把「连不上 / 认证失败」拆成能照着修的具体原因。
+ *
+ * 以前无论 401、403、404、405 还是证书错误，面板都只显示
+ * 「连不上或认证失败（PROPFIND 无响应）」—— 用户既不知道是密码错、
+ * 还是这个服务压根不支持 PROPFIND，也不知道该去改哪一项。这里按状态码给话。
+ *
+ * 文案同时给中英文（面板与 CLI 都可能显示它，CLI 没有 accept-language）。
+ */
+function explainStatus(status, w) {
+  const url = String((w && w.url) || '')
+  if (status === 401) {
+    return '认证失败（401）：用户名或密码不对，或这个服务要求别的认证方式（应用专用密码 / Token）'
+      + ' / Auth failed (401): wrong username or password, or this service requires an app password / token'
+  }
+  if (status === 403) {
+    return '被拒绝（403）：账号没有这个目录的权限；部分服务还会按 User-Agent 拦截，可在「User-Agent」里填它要求的客户端名'
+      + ' / Forbidden (403): the account lacks access to this folder; some services also filter by User-Agent — set the client name they expect in "User-Agent"'
+  }
+  if (status === 404) {
+    return `地址下没有这个目录（404）：${url} —— WebDAV 地址填到根（如 https://dav.example.com/dav），目录名单独填在「远端目录」`
+      + ` / Not found (404): ${url} — put the server root in "WebDAV URL" (e.g. https://dav.example.com/dav) and the folder in "Remote dir"`
+  }
+  if (status === 405 || status === 501) {
+    return `这个服务不支持 PROPFIND（${status}）：它可能不是标准 WebDAV 入口，或需要带路径前缀`
+      + ` / PROPFIND not allowed (${status}): this may not be a standard WebDAV endpoint, or it needs a path prefix`
+  }
+  if (status === 301 || status === 302 || status === 307 || status === 308) {
+    return `地址被重定向（${status}）：请直接填重定向后的最终地址`
+      + ` / Redirected (${status}): use the final URL instead`
+  }
+  if (status === 0) {
+    return '连不上服务器：检查地址、网络与证书（自签名证书需加入系统信任库）'
+      + ' / Cannot reach the server: check the URL, network and certificate (self-signed certs must be trusted by the system)'
+  }
+  return `PROPFIND 失败（HTTP ${status}） / PROPFIND failed (HTTP ${status})`
 }
 
 /**
  * 读完响应体，带**独立**超时。
  *
- * fetch 的超时（request() 里的 AbortController）只管到「响应头到手」，之后 body 卡住不会再有超时：
- * 实测遇到服务端先回 200 再停住不发的 PROPFIND，整条同步流水线就永久挂着（进程不退、面板一直转）。
- * 所以读 body 单独计时。
+ * 为什么还要单独计时：0.6.48 起传输层用 `node:http`，它的 `req.setTimeout` 是**空闲**计时
+ * （socket 上多久没数据），服务端若持续慢速吐 body 就永远不触发；而面板必须有一个
+ * 硬上限，否则整条同步流水线会永久挂着（进程不退、面板一直转）。
+ * 这个计时是「从发起到读完一共多久」，与服务端怎么吐数据无关。
  */
 function withBodyTimeout(promise, timeoutMs = 30000, label = '读取响应体') {
   let timer = null
@@ -177,7 +329,8 @@ export async function ensureRemoteDir(w, relDir = '') {
 
 /**
  * 列远端目录（PROPFIND Depth:1），返回相对路径 → { size, etag, mtime }。
- * 失败返回 null（调用方据此报「读不到云端」而不是「云端是空的」）。
+ * 失败返回 null，并把 `lastError` 写在 w 上（调用方据此报「读不到云端」而不是「云端是空的」，
+ * 且能说出到底是 401、404 还是服务不支持 PROPFIND —— 0.6.48 起）。
  */
 export async function listRemote(w, relDir = '') {
   const url = remoteUrlFor(w, relDir)
@@ -193,7 +346,13 @@ export async function listRemote(w, relDir = '') {
     }, 45000)
     if (!res.ok && res.status !== 207) {
       // 404 = 目录还不存在，这是正常的「首次同步」，返回空表
-      if (res.status === 404) return { entries: new Map(), exists: false }
+      if (res.status === 404) {
+        w.lastError = ''
+        w.lastStatus = 404
+        return { entries: new Map(), exists: false }
+      }
+      w.lastError = explainStatus(res.status, w)
+      w.lastStatus = res.status
       return null
     }
     const xml = await withBodyTimeout(res.text(), 60000, `PROPFIND 响应`)
@@ -202,8 +361,16 @@ export async function listRemote(w, relDir = '') {
     // 服务端回的 href 里带着那段前缀，只拿 dir 去比 parent 永远对不上 → 列目录恒为空，
     // 后果是 pull 报「云端还是空的」、push 每轮全量重传。
     const base = requestPathBase(url, w, relDir)
+    w.lastError = ''
+    w.lastStatus = res.status
     return { entries: parsePropfind(xml, w, base), exists: true }
-  } catch {
+  } catch (e) {
+    // 超时 / 连接被拒 / 证书不受信：原因各不一样，别一律说成「认证失败」
+    const msg = String((e && e.message) || e || '')
+    w.lastStatus = 0
+    w.lastError = /abort|timeout|超时/i.test(msg)
+      ? `PROPFIND 超时（45s 内没有响应）：${url} / PROPFIND timed out (no response in 45s)`
+      : `连不上服务器：${msg || url} / Cannot reach the server`
     return null
   }
 }
@@ -453,7 +620,7 @@ export async function uploadRepo(w, localRepo, { dryRun = false, onProgress = nu
   // 现在改为：递归列远端全部文件 + 逐个比 sha256，内容真相同才跳过。
   const remote = await listRemote(w, '')
   if (!remote) {
-    return { ok: false, uploaded, skipped, errors: [...errors, '读不到云端目录（PROPFIND 失败）'] }
+    return { ok: false, uploaded, skipped, errors: [...errors, `读不到云端目录（PROPFIND 失败）：${w.lastError || '未知原因'} / Cannot list the cloud folder`] }
   }
 
   const remoteMeta = remote.exists ? await listRemoteMeta(w, '') : new Map()
@@ -539,7 +706,7 @@ export async function downloadRepo(w, localRepo, { dryRun = false } = {}) {
 
   const remote = await listRemote(w, '')
   if (!remote) {
-    return { ok: false, downloaded, skipped, conflicts, errors: ['读不到云端目录（PROPFIND 失败）'] }
+    return { ok: false, downloaded, skipped, conflicts, errors: [`读不到云端目录（PROPFIND 失败）：${w.lastError || '未知原因'} / Cannot list the cloud folder`] }
   }
   if (!remote.exists) {
     return { ok: true, downloaded, skipped, conflicts, errors: [], empty: true }
@@ -682,12 +849,23 @@ function isSafeRemoteRel(rel) {
 
 /** 连通性测试（面板「测试连接」与探云端是否为空共用）。 */
 export async function testConnection(w) {
-  if (!w.enabled) return { ok: false, error: '未配置 WebDAV 地址' }
+  if (!w.enabled) return { ok: false, error: '未配置 WebDAV 地址 / WebDAV URL is not set' }
   if (!isSecureUrl(w.url)) {
-    return { ok: false, error: '地址不是 https（明文传输密码有风险）；确需使用请设 DSH_SYNC_ALLOW_INSECURE=1' }
+    return { ok: false, error: '地址不是 https（明文传输密码有风险）；确需使用请设 DSH_SYNC_ALLOW_INSECURE=1'
+      + ' / Not https (credentials would travel in clear text); set DSH_SYNC_ALLOW_INSECURE=1 to allow it' }
   }
   const res = await listRemote(w, '')
-  if (!res) return { ok: false, error: '连不上或认证失败（PROPFIND 无响应）' }
+  // 0.6.48：失败要说清是哪一类（401/403/404/405/超时/证书），并把用到的 UA 一起报出来 ——
+  // 排查「服务按客户端过滤」时，第一件事就是确认我们发出去的到底是什么。
+  if (!res) {
+    return {
+      ok: false,
+      error: String(w.lastError || '连不上或认证失败（PROPFIND 无响应） / Cannot reach the server or auth failed (PROPFIND gave no answer)'),
+      url: w.url,
+      userAgent: w.ua || '',
+      status: Number(w.lastStatus || 0),
+    }
+  }
   const dirs = res.exists ? await listRemoteDirs(w, '') : []
   return {
     ok: true,
@@ -696,6 +874,7 @@ export async function testConnection(w) {
     rootFiles: res.entries.size,
     rootDirs: dirs.length,
     url: w.url,
+    userAgent: w.ua || '',
   }
 }
 

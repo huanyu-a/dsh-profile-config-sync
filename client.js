@@ -722,6 +722,8 @@ window.__ModuleLoader__.load({
       const currentWdUrl = st.url || ''
       const currentWdUser = st.user || ''
       const currentWdDir = st.dir || ''
+      // 0.6.48：自定义 User-Agent（留空 = 不发 User-Agent 头）
+      const currentWdUa = st.userAgent || ''
       const currentGitUrl = remote.url || ''
       const currentGitKey = remote.sshKey || ''
 
@@ -731,6 +733,7 @@ window.__ModuleLoader__.load({
       const [wdUser, setWdUser] = react.useState(currentWdUser)
       const [wdPass, setWdPass] = react.useState('')
       const [wdDir, setWdDir] = react.useState(currentWdDir)
+      const [wdUa, setWdUa] = react.useState(currentWdUa)
       const [gitUrl, setGitUrl] = react.useState(currentGitUrl)
       const [gitKey, setGitKey] = react.useState(currentGitKey)
       const [busy, setBusy] = react.useState(false)
@@ -751,10 +754,11 @@ window.__ModuleLoader__.load({
         setWdUrl(currentWdUrl)
         setWdUser(currentWdUser)
         setWdDir(currentWdDir)
+        setWdUa(currentWdUa)
         setWdPass('')
         setGitUrl(currentGitUrl)
         setGitKey(currentGitKey)
-      }, [editing, currentMode, currentWdUrl, currentWdUser, currentWdDir, currentGitUrl, currentGitKey])
+      }, [editing, currentMode, currentWdUrl, currentWdUser, currentWdDir, currentWdUa, currentGitUrl, currentGitKey])
 
       const activeMode = editing ? mode : currentMode
       const wdConfigured = Boolean(st.configured || st.url)
@@ -774,6 +778,7 @@ window.__ModuleLoader__.load({
         setWdUrl(currentWdUrl)
         setWdUser(currentWdUser)
         setWdDir(currentWdDir)
+        setWdUa(currentWdUa)
         setWdPass('')
         setGitUrl(currentGitUrl)
         setGitKey(currentGitKey)
@@ -784,6 +789,7 @@ window.__ModuleLoader__.load({
         setWdUrl(currentWdUrl)
         setWdUser(currentWdUser)
         setWdDir(currentWdDir)
+        setWdUa(currentWdUa)
         setWdPass('')
         setGitUrl(currentGitUrl)
         setGitKey(currentGitKey)
@@ -802,7 +808,7 @@ window.__ModuleLoader__.load({
           if (mode === 'auto' && !wdUrl.trim() && !gitUrl.trim()) {
             throw new Error(M('自动模式下请至少填写 WebDAV 地址或 Git 远端地址', 'In Auto mode, provide at least a WebDAV URL or a Git remote URL'))
           }
-          await callWebdav({ action: 'save', url: wdUrl, user: wdUser, dir: wdDir, mode, pass: wdPass })
+          await callWebdav({ action: 'save', url: wdUrl, user: wdUser, dir: wdDir, mode, pass: wdPass, userAgent: wdUa })
           let gitSet = false
           const gitDirty = gitUrl.trim() !== currentGitUrl.trim() || gitKey.trim() !== currentGitKey.trim()
           if (gitDirty && (gitUrl.trim() || currentGitUrl.trim() || gitKey.trim() || currentGitKey.trim())) {
@@ -824,7 +830,29 @@ window.__ModuleLoader__.load({
         try {
           const r = await callWebdav({ action })
           const res = r.result || r
-          if (res.ok === false) throw new Error(res.error || M('操作失败', 'Operation failed'))
+          if (res.ok === false) {
+            // 0.6.48：失败时把「该改哪一项」直接摊开（服务端已按状态码给出可执行的文案），
+            // 并且顺带报出实际发出去的 UA —— 排查 UA 拦截时这是第一个要确认的事实。
+            const parts = [String(res.error || M('操作失败', 'Operation failed'))]
+            // 上传/下载的失败原因在 errors 数组里（每条一个文件），
+            // 只报一句「操作失败」等于把服务端刚给出的诊断又丢了。
+            if (Array.isArray(res.errors) && res.errors.length) {
+              parts.push(res.errors.slice(0, 5).join('；'))
+            }
+            if (action === 'test' && res.userAgent !== undefined) {
+              parts.push(M(`本次 User-Agent：${res.userAgent || '（未发送）'}`, `User-Agent sent: ${res.userAgent || '(none)'}`))
+            }
+            throw new Error(parts.join(' · '))
+          }
+          if (action === 'test') {
+            const n = res.files ?? (res.rootFiles || 0) + (res.rootDirs || 0)
+            setMsg(M(
+              `连通正常：云端根目录 ${n} 项${res.exists === false ? '（目录还不存在，首次推送会自动创建）' : ''}${res.userAgent ? ` · UA ${res.userAgent}` : ' · 未发送 User-Agent'}`,
+              `Connected: ${n} item(s) at the cloud root${res.exists === false ? ' (folder does not exist yet; the first push creates it)' : ''}${res.userAgent ? ` · UA ${res.userAgent}` : ' · no User-Agent sent'}`,
+            ))
+            if (typeof props.onSaved === 'function') props.onSaved()
+            return
+          }
           setMsg(M(
             `完成：上传 ${res.uploaded || 0} · 下载 ${res.downloaded || 0} · 跳过 ${res.skipped || 0} · 冲突 ${res.conflicts || 0}`,
             `Done: uploaded ${res.uploaded || 0} · downloaded ${res.downloaded || 0} · skipped ${res.skipped || 0} · conflicts ${res.conflicts || 0}`,
@@ -898,6 +926,12 @@ window.__ModuleLoader__.load({
                 v: st.hasPassword ? M('已设置（不回显）', 'set (not shown)') : M('未设置', 'not set'),
               }),
             field(M('远端目录', 'Remote dir'), isEditing ? wdDir : currentWdDir, setWdDir, 'dsh-config-sync'),
+            // 0.6.48：UA。第三方 DAV 常按客户端名放行/拦截，默认 undici UA 会被 401/403。
+            field(M('User-Agent', 'User-Agent'), isEditing ? wdUa : currentWdUa, setWdUa, M('留空 = 不发（默认）', 'blank = do not send')),
+            isEditing
+              ? h('div', { style: { ...S.footnote, marginTop: '-2px' } }, M(
+                '部分第三方 WebDAV（群晖 / 坚果云 / 自建 DAV）会按客户端 User-Agent 放行或拦截；连不上且报 403 时，填它要求的客户端名（如 Mozilla/5.0 或 davfs2）。留空则不发 User-Agent。',
+                'Some third-party WebDAV servers (Synology / Jianguoyun / self-hosted DAV) allow or block by client User-Agent; if you get 403, put the client name they expect (e.g. Mozilla/5.0 or davfs2). Leave blank to send no User-Agent.')) : null,
             h(Kv, {
               k: M('传输安全', 'Transport'),
               v: (st.secure === false)
@@ -3787,9 +3821,61 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = react.useState(false)
       const [msg, setMsg] = react.useState('')
       const [err, setErr] = react.useState('')
+      // 0.6.48（issue #9）：附件（图片 / 视频 / 日志）。选文件后读成 base64 跟着提交走，
+      // 服务端传到仓库的 release assets，正文引用 —— 不借道第三方图床。
+      const [files, setFiles] = react.useState([])
       // 筛选：状态走本地过滤（一次拉全量、计数才准），关键词也本地过，输入即筛，不打接口
       const [filter, setFilter] = react.useState('open')
       const [kw, setKw] = react.useState('')
+
+      const MAX_ATTACH = 4
+      const MAX_ATTACH_MB = 20
+      const ATTACH_OK = /\.(png|jpe?g|gif|webp|bmp|svg|mp4|mov|webm|log|txt|md|json)$/i
+
+      /** 读一个 File 成 base64（去掉 data: 前缀）。FileReader 在面板进程里可用。 */
+      const readAsBase64 = (file) => new Promise((resolve, reject) => {
+        try {
+          const fr = new FileReader()
+          fr.onload = () => {
+            const s = String(fr.result || '')
+            const comma = s.indexOf(',')
+            resolve(comma >= 0 ? s.slice(comma + 1) : '')
+          }
+          fr.onerror = () => reject(new Error(String((fr.error && fr.error.message) || 'read failed')))
+          fr.readAsDataURL(file)
+        } catch (e) { reject(e) }
+      })
+
+      const addFiles = async (list) => {
+        const picked = Array.from(list || [])
+        if (!picked.length) return
+        setErr(''); setMsg('')
+        const next = [...files]
+        const problems = []
+        for (const f of picked) {
+          if (next.length >= MAX_ATTACH) { problems.push(M(`附件最多 ${MAX_ATTACH} 个`, `At most ${MAX_ATTACH} attachments`)); break }
+          if (!ATTACH_OK.test(f.name || '')) {
+            problems.push(M(`${f.name}：不支持的类型（只收图片 / 视频 / 日志）`, `${f.name}: unsupported type (images, videos, logs only)`))
+            continue
+          }
+          if ((f.size || 0) > MAX_ATTACH_MB * 1024 * 1024) {
+            problems.push(M(`${f.name}：超过 ${MAX_ATTACH_MB} MB`, `${f.name}: larger than ${MAX_ATTACH_MB} MB`))
+            continue
+          }
+          try {
+            const data = await readAsBase64(f)
+            if (!data) { problems.push(M(`${f.name}：读不出内容`, `${f.name}: cannot read content`)); continue }
+            next.push({ name: f.name || 'attachment', size: f.size || 0, type: f.type || '', data })
+          } catch (e) {
+            problems.push(M(`${f.name}：${String((e && e.message) || e)}`, `${f.name}: ${String((e && e.message) || e)}`))
+          }
+        }
+        setFiles(next)
+        if (problems.length) setErr(problems.join('；'))
+        else if (next.length > files.length) setMsg(M(`已加 ${next.length - files.length} 个附件（点「提交到 GitHub」一起发）`, `Added ${next.length - files.length} attachment(s) — they go with the report`))
+      }
+
+      const removeFile = (idx) => { setFiles(files.filter((_, i) => i !== idx)); setErr(''); setMsg('') }
 
       const load = async (forceRefresh = false) => {
         setBusy(true)
@@ -3807,18 +3893,37 @@ window.__ModuleLoader__.load({
       const submit = async () => {
         setBusy(true); setErr(''); setMsg('')
         try {
-          const r = await callFeedback({ title, body: text })
+          // 只把 { name, type, data } 发出去：size 是本机展示用的，服务端不需要
+          const attachments = files.map((f) => ({ name: f.name, type: f.type, data: f.data }))
+          const r = await callFeedback({ title, body: text, attachments })
+          const attachNote = (r && Array.isArray(r.attachmentErrors) && r.attachmentErrors.length)
+            ? M(`；有附件没传上去：${r.attachmentErrors.join('、')}`, `; some attachments failed: ${r.attachmentErrors.join(', ')}`)
+            : ''
           if (r && r.needToken && r.fallbackUrl) {
             // 没有令牌：把这单交给浏览器——预填好标题/正文/环境块，登录状态下点一下就建好了
             try { window.open(r.fallbackUrl, '_blank', 'noopener') } catch { }
-            setMsg(M('没有令牌，已打开浏览器里的新建 issue 页面（标题和正文都填好了），点一下提交即可。', 'No token: opened the prefilled new-issue page in the browser - press submit there.'))
+            const pending = (r.pendingAttachments || []).length
+              ? M(
+                `；附件（${(r.pendingAttachments || []).join('、')}）没能上传，请在页面里手动拖进正文`,
+                `; attachments (${(r.pendingAttachments || []).join(', ')}) were not uploaded — drag them into the body`,
+              )
+              : ''
+            setMsg(M('没有令牌，已打开浏览器里的新建 issue 页面（标题和正文都填好了），点一下提交即可。', 'No token: opened the prefilled new-issue page in the browser - press submit there.') + pending + attachNote)
+            setFiles([])
           } else if (r && r.number) {
-            setMsg(M(`已建 Issue #${r.number}，列表里能看到，网页上也点得开。`, `Issue #${r.number} created; it shows in the list and opens in the browser.`))
+            const n = (r.attachments || []).length
+            setMsg(M(
+              `已建 Issue #${r.number}，列表里能看到，网页上也点得开。${n ? `（带了 ${n} 个附件）` : ''}`,
+              `Issue #${r.number} created; it shows in the list and opens in the browser.${n ? ` (${n} attachment(s))` : ''}`,
+            ) + attachNote)
             setTitle('')
             setText('')
+            setFiles([])
           } else {
+            const kept = (r && (r.attachments || []).length) ? M('（附件已上传，补发时会自动引用）', '(attachments uploaded; Flush will reference them)') : ''
             setMsg(M(`没连上 GitHub（${(r && r.error) || '网络不通'}），已存进本机待发队列（${r ? r.remaining : 0} 条），联网后点「补发」。`,
-              `Could not reach GitHub (${(r && r.error) || 'network'}). Saved to the local queue (${r ? r.remaining : 0} item(s)); press Flush when online.`))
+              `Could not reach GitHub (${(r && r.error) || 'network'}). Saved to the local queue (${r ? r.remaining : 0} item(s)); press Flush when online.`) + kept + attachNote)
+            if (!(r && (r.attachments || []).length)) setFiles([])
           }
           await load()
         } catch (e) {
@@ -4027,6 +4132,37 @@ window.__ModuleLoader__.load({
             placeholder: M('现象、期望、怎么复现（版本、机器、时间会自动附在末尾）', 'What happened, what you expected, how to reproduce (version, machine and time are appended automatically)'),
             onChange: (e) => setText(e.target.value),
           }),
+        ),
+        // 0.6.48（issue #9）：附件。截图 / 录屏是「界面不对」「同步报错」这类反馈里最关键的证据，
+        // 以前只能靠打字描述。选完文件后读成 base64 跟提交一起发，服务端传到仓库资产、正文引用。
+        h('div', { style: S.kvRow },
+          h('div', { style: S.kvKey }, M('附件', 'Attachments')),
+          h('div', { style: { ...S.kvVal, display: 'flex', flexDirection: 'column', gap: '6px' } },
+            h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+              h('input', {
+                key: 'file', type: 'file', multiple: true, disabled: busy,
+                accept: '.png,.jpg,.jpeg,.gif,.webp,.bmp,.svg,.mp4,.mov,.webm,.log,.txt,.md,.json',
+                style: { fontSize: '12px' },
+                onChange: (e) => { addFiles(e.target.files); try { e.target.value = '' } catch { } },
+              }),
+              h('span', { style: S.footnote }, M(
+                `图片 / 视频 / 日志，最多 ${MAX_ATTACH} 个、每个 ${MAX_ATTACH_MB} MB`,
+                `Images / videos / logs, up to ${MAX_ATTACH} files, ${MAX_ATTACH_MB} MB each`,
+              )),
+            ),
+            files.length
+              ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '2px' } },
+                files.map((f, i) => h('div', { key: `${f.name}-${i}`, style: { display: 'flex', gap: '8px', alignItems: 'center', fontSize: '12px' } },
+                  h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, f.name),
+                  h('span', { style: S.footnote }, `${Math.max(1, Math.round((f.size || 0) / 1024))} KB`),
+                  h('button', { type: 'button', style: S.btn, disabled: busy, onClick: () => removeFile(i) }, M('移除', 'Remove')),
+                )))
+              : null,
+            h('div', { style: S.footnote }, M(
+              '附件会作为 GitHub 资产上传到本反馈仓库，Issue 正文引用它：换机器、别人看都能打开，不依赖你本机的文件还在。没有令牌时附件传不上去，会提示手动拖进网页。',
+              'Attachments are uploaded as assets of the feedback repo and referenced from the issue body: readable from any machine, no dependency on your local file. Without a token they cannot be uploaded, and you are told to drag them into the page.',
+            )),
+          ),
         ),
         h('div', { style: S.actions },
           h('button', { type: 'button', style: S.btnPrimary, disabled: busy || !title.trim(), onClick: submit },

@@ -131,6 +131,8 @@ conversations/session-index.json  conversations/session_projcache/s1.json
 | `GET/POST /config-sync/scope` | 十二组同步范围读写 |
 | `GET/POST /config-sync/extra-config` | 规则读写（`{config:{pluginData:{enabled,maxFileBytes,exclude,skipDirs},extra:{enabled,paths[]}}}`，id 去重、路径必须绝对、上限按 100 MB 压；GET 另带 `defaults` 供「恢复默认」） |
 | `GET/POST /config-sync/conflict` | GET 读清单（每项带 `localSaved`/`cloudSaved`）；POST `{items:[{path,choice}]}` 存选择、`{action:'restore',path,side}` 单项还原、`{action:'reset'}` 放弃清单。还原按清单记录的 `repo` 路径写，改过 `repoPath` 也不会写错仓库 |
+| `GET/POST /config-sync/webdav` | GET 回显当前配置（`url`/`user`/`dir`/`userAgent`/`mode`/`hasPassword`/`secure`）与连通性探测结果（`probe`，含 `error`、`status`、`userAgent`）；POST `{action:'save'\|'test'\|'upload'\|'download', url?, user?, pass?, dir?, mode?, userAgent?}`。`userAgent` 非法（换行 / 非 ASCII / 超 200 字符）直接 400，不静默存成空 |
+| `GET/POST/PATCH /config-sync/feedback` | GET 读 Issue 列表与连接状态；POST 提交（`{title, body, attachments?}`，附件为 `{name, type, data(base64)}`）、存令牌（`?action=token`）、补发队列（`?action=flush`）；PATCH 改状态（`?number=`）。附件先传成仓库 release assets，再把 URL 引进正文 |
 
 跨站请求 403。客户端只 `fetch` 这几条，不 import 任何 `@deepseek-ai/dsh-client-*`，样式只用 `--dsw-alias-*` token。
 
@@ -148,6 +150,29 @@ conversations/session-index.json  conversations/session_projcache/s1.json
 6. **令牌不用手填**：默认从 `git credential fill` 取一次，存 `<dshHome>\config-sync-gh.json`（本机私有）；取不到才粘一次，粘完立刻用 `/repos/{repo}` 验一遍。
 7. **断网不丢**：建 Issue 失败进 `config-sync-feedback-outbox.json`，联网后点「补发」逐条建，成功自动出队。
 8. 列表头「未解决 / 已解决 / 全部」+ 搜索框（编号、标题、作者、正文、环境块都参与），筛选全在本地做，不占匿名限额。
+
+## `dsh-config-sync.json` 里的 WebDAV 字段
+
+本机私有设置文件 `~\.dsh\dsh-config-sync.json`（不进仓库，POSIX 上 0600）：
+
+| 字段 | 说明 |
+|---|---|
+| `syncMode` | `git`（默认）/ `webdav` / `auto`（配了 WebDAV 就用它） |
+| `webdavUrl` | WebDAV 根地址（如 `https://dav.example.com/dav`） |
+| `webdavUser` / `webdavPass` | Basic 认证账号与密码（密码永不明文回显到面板） |
+| `webdavDir` | 远端子目录（相对根，默认 `dsh-config-sync`） |
+| `webdavUserAgent` | **0.6.48 新增**：自定义 User-Agent。留空 = 完全不发这个头。只接受单行可见 ASCII（≤ 200 字符，不含换行 / 中文 / 制表符），非法值在保存时直接 400 |
+
+Windows 的 PowerShell 与 macOS/Linux 的 Node 引擎都读这一份文件、都把整份传给 `runtime/webdav.mjs`，所以 UA 在两条路径上行为一致。
+
+## 反馈附件的机制（0.6.48）
+1. 面板选文件（图片 / 视频 / 日志，最多 4 个、单个 ≤ 20 MB），读成 base64 随提交一起发（该路由的请求体上限单独放宽到 160 MB，其余路由仍是 64 KB）。
+2. 服务端先校验（类型白名单 / 体积 / 可读性），不合格的**逐条报错**，不静默丢弃。
+3. GitHub 只有 **release** 有 asset 接口（Issue 没有），所以先按 tag `feedback-assets` 找 release；没有就建一个**草稿** release（`draft: true`，不出现在 Releases 页面、不会被搜索引擎收录，但知道链接的人打得开 —— 反馈附件本来就不该公开发布）。该 release 的 id 与 `upload_url` 在进程内缓存，一次反馈不会反复查。
+4. 往 `upload_url` POST 原始字节：`{?name,label}` 整段被替换成 `?name=<文件名>`，`Content-Type` 给真实类型，`Content-Length` 给实际字节数。
+5. 拿到的 `browser_download_url` 引进正文：图片用 `![name](url)`，其它用 `- [name](url)`；环境块仍在最后一段。
+6. **没有令牌时附件传不上去**：面板明确告知「附件没能上传，请手动拖进网页」，并在响应里带 `pendingAttachments`。
+7. 建 Issue 失败但附件已传上去时，附件 URL 存进待发队列；「补发」直接引用，不重复上传（重复上传会在仓库里留下垃圾资产）。
 
 ## 卸载残留清理
 
