@@ -985,7 +985,8 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
           if (before !== out) {
             mkdirSync(dirname(dst), { recursive: true })
             writeFileSync(dst, out, 'utf8')
-            changed.push(`settings/${entry.id}`)
+            // 标签写真实落点：分区的写 settings/<平台>/x.json，别再报成根目录那份（否则看日志会以为覆盖了老客户端）
+            changed.push(LANED_SETTINGS.has(entry.id) ? `settings/${PLATFORM_LANE}/${entry.id}` : `settings/${entry.id}`)
             wrote += 1
           }
           files += 1
