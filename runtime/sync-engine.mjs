@@ -35,6 +35,7 @@ import {
   PRIVATE_KEY_BODY_RE, SSH_KEY_NAME_RE,
 } from './webdav.mjs'
 import { applyConversations, captureConversations, conversationPendingRoots, resolveGuardScript } from './conversations.mjs'
+import { extraSkipReason, listPluginDataSlots, readExtraConfig } from './extra-rules.mjs'
 
 /** 占位符：仓库里存这些，落地时展开成本机路径。 */
 export const TOKENS = {
@@ -378,11 +379,16 @@ export function copyWithTokens(src, dst, roots) {
   const binary = isBinaryName(name) || !isTextName(name)
   mkdirSync(dirname(dst), { recursive: true })
   if (binary) {
+    // 内容一致就别重写：否则每次 capture 都刷一遍 mtime，还谎报「本轮改了 N 个文件」
+    try { if (existsSync(dst) && fileHash(src) === fileHash(dst)) return { files: 0, bytes: 0 } } catch { /* 比不了就照写 */ }
     copyFileSync(src, dst)
     return { files: 1, bytes: st.size }
   }
   const text = readFileSync(src, 'utf8')
   const out = toTokenText(text, roots).replace(/\r\n/g, '\n')
+  // 文本按「归一化后的内容」比对（占位符化 + LF），相同就不写。0.6.49 之前无条件写：
+  // 于是 profile/package.json 这类文件每次 capture 都报「有改动」，面板与提交都被噪声污染。
+  try { if (existsSync(dst) && readFileSync(dst, 'utf8') === out) return { files: 0, bytes: 0 } } catch { /* 比不了就照写 */ }
   writeFileSync(dst, out, 'utf8')
   return { files: 1, bytes: Buffer.byteLength(out, 'utf8') }
 }
@@ -580,6 +586,148 @@ export function probeLocal({ dshHome, appRoot, workspaceHome } = {}) {
  *
  * 返回 { ok, changed:[], files, bytes, errors:[] }。
  */
+/**
+ * 一个「槽」（插件数据槽 / 额外路径目录）的镜像：按规则过滤 → 拷进仓库 → 删掉本机已经不存在的。
+ *
+ * 规则用的是 runtime/extra-rules.mjs（与面板、与 PowerShell 同一份）：
+ * 单文件上限、排除通配、凭据（名字 + 内容）、符号链接不跟。
+ */
+function mirrorSlotInto({ srcRoot, dstRoot, cfg, roots, label }) {
+  const out = { files: 0, bytes: 0, changed: [], errors: [], notes: [] }
+  const wanted = new Map()
+  for (const f of walk(srcRoot)) {
+    let st
+    try { st = statSync(f.full) } catch { continue }
+    const why = extraSkipReason(f.rel, st.size, cfg)
+    if (why === 'too-big') { out.notes.push(`${label}/${f.rel}: 超过单文件上限，未进仓库`); continue }
+    if (why) continue
+    if (isSecretFile(f.full, f.rel)) { out.notes.push(`${label}/${f.rel}: 像是凭据文件，已跳过`); continue }
+    wanted.set(f.rel, { full: f.full, size: st.size })
+  }
+  for (const [rel, info] of wanted) {
+    const dst = join(dstRoot, ...rel.split('/'))
+    try {
+      mkdirSync(dirname(dst), { recursive: true })
+      // copyWithTokens 自己会按「归一化后的内容」比对，相同就不写并返回 files:0
+      const w = copyWithTokens(info.full, dst, roots)
+      if (w.files > 0) {
+        out.files += w.files
+        out.bytes += w.bytes
+        out.changed.push(`${label}/${rel}`)
+      }
+    } catch (e) {
+      out.errors.push(`${label}/${rel}: ${(e && e.message) || e}`)
+    }
+  }
+  // 镜像删除：本机已经没有的，仓库里也删（否则换机会把删掉的文件铺回来）
+  for (const f of walk(dstRoot)) {
+    if (wanted.has(f.rel)) continue
+    try {
+      rmSync(f.full, { force: true })
+      out.changed.push(`${label}/${f.rel}（删除）`)
+    } catch (e) {
+      out.errors.push(`删除 ${label}/${f.rel} 失败：${(e && e.message) || e}`)
+    }
+  }
+  return out
+}
+
+/** 名字或内容像凭据（PEM / PuTTY 私钥、SSH 私钥文件名）→ 不进仓库。 */
+function isSecretFile(full, rel) {
+  const name = String(rel || '').split('/').pop() || ''
+  if (SSH_KEY_NAME_RE.test(name)) return true
+  if (isBinaryName(name)) return false
+  try {
+    const fd = openSync(full, 'r')
+    const buf = Buffer.alloc(4096)
+    const n = readSync(fd, buf, 0, 4096, 0)
+    closeSync(fd)
+    return PRIVATE_KEY_BODY_RE.test(buf.subarray(0, n).toString('utf8'))
+  } catch { return false }
+}
+
+/** 插件数据组（<DshHome> 一级目录，跳过规则里的系统目录与隐藏目录）。 */
+function capturePluginData({ repoRoot, dshHome, cfg, scope, roots }) {
+  const dstRoot = join(repoRoot, 'plugin-data')
+  const result = { files: 0, bytes: 0, changed: [], errors: [], notes: [] }
+  if (!cfg || cfg.pluginData.enabled === false) {
+    result.notes.push('插件数据：已在 config-sync-extra.json 里关闭（pluginData.enabled=false），跳过')
+    return result
+  }
+  mkdirSync(dstRoot, { recursive: true })
+  const slots = []
+  for (const slot of listPluginDataSlots(dshHome, cfg)) {
+    if (!scopeItemEnabled(scope, 'plugin-data', slot.id)) { result.notes.push(`插件数据 ${slot.id}: 未勾选`); continue }
+    const r = mirrorSlotInto({ srcRoot: slot.src, dstRoot: join(dstRoot, slot.id), cfg, roots, label: `plugin-data/${slot.id}` })
+    result.files += r.files
+    result.bytes += r.bytes
+    result.changed.push(...r.changed)
+    result.errors.push(...r.errors)
+    result.notes.push(...r.notes)
+    slots.push({ id: slot.id, src: toTokenText(slot.src, roots) })
+  }
+  // manifest 不写时间戳：写了每次抓取都会产生假改动
+  const text = JSON.stringify({ version: 1, slots }, null, 2)
+  const mp = join(dstRoot, 'manifest.json')
+  let before = ''
+  try { before = readFileSync(mp, 'utf8') } catch { /* 没有就写 */ }
+  if (before !== text) {
+    writeFileSync(mp, text, 'utf8')
+    result.changed.push('plugin-data/manifest.json')
+  }
+  return result
+}
+
+/** 额外路径组（用户在面板里自己填的文件 / 目录）。 */
+function captureExtraPaths({ repoRoot, dshHome, cfg, scope, roots }) {
+  const dstRoot = join(repoRoot, 'extra')
+  const result = { files: 0, bytes: 0, changed: [], errors: [], notes: [] }
+  if (!cfg || cfg.extra.enabled === false) {
+    result.notes.push('额外路径：已在 config-sync-extra.json 里关闭（extra.enabled=false），跳过')
+    return result
+  }
+  const paths = (cfg.extra && cfg.extra.paths) || []
+  if (!paths.length) { result.notes.push('额外路径：没有登记任何路径'); return result }
+  mkdirSync(dstRoot, { recursive: true })
+  for (const p of paths) {
+    if (!scopeItemEnabled(scope, 'extra', p.id)) { result.notes.push(`额外路径 ${p.id}: 未勾选`); continue }
+    if (!existsSync(p.src)) { result.notes.push(`额外路径本机不存在，跳过：${p.src}`); continue }
+    const isDir = isDir2(p.src)
+    const label = `extra/${p.id}`
+    if (!toTokenText(p.src, roots).includes('{{')) {
+      result.notes.push(`额外路径不在已知根下（换机可能对不上）：${p.src}`)
+    }
+    if (isDir) {
+      const r = mirrorSlotInto({ srcRoot: p.src, dstRoot: join(dstRoot, p.id), cfg, roots, label })
+      result.files += r.files
+      result.bytes += r.bytes
+      result.changed.push(...r.changed)
+      result.errors.push(...r.errors)
+      result.notes.push(...r.notes)
+    } else {
+      if (isSecretFile(p.src, basename(p.src))) { result.notes.push(`额外路径 ${p.id}: 像凭据文件，已跳过`); continue }
+      const ext = p.src.includes('.') ? p.src.slice(p.src.lastIndexOf('.')) : ''
+      const dst = join(dstRoot, `${p.id}${ext}`)
+      try {
+        const st = statSync(p.src)
+        const same = existsSync(dst) && fileHash(p.src) === fileHash(dst)
+        if (!same) {
+          mkdirSync(dirname(dst), { recursive: true })
+          copyWithTokens(p.src, dst, roots)
+          result.files += 1
+          result.bytes += st.size
+          result.changed.push(`${label}${ext}`)
+        }
+      } catch (e) {
+        result.errors.push(`${label}: ${(e && e.message) || e}`)
+      }
+    }
+  }
+  return result
+}
+
+function isDir2(p) { try { return statSync(p).isDirectory() } catch { return false } }
+
 export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName = 'desktop' } = {}) {
   const local = probeLocal({ dshHome, appRoot, workspaceHome })
   // 用「用户确认过的根」（config-sync-roots.json）：自选目录必须变成 {{ROOT:x}}，
@@ -682,6 +830,31 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
     } catch (e) {
       errors.push(`conversations: ${(e && e.message) || e}`)
     }
+  }
+
+  // 3.6) 插件数据 / 额外路径（规则与面板、PowerShell 共用 runtime/extra-rules.mjs）
+  try {
+    const extraCfg = readExtraConfig(local.dshHome)
+    if (gated('plugin-data')) skipScopedGroup(scope, repoRoot, 'plugin-data', skippedByScope)
+    else {
+      const r = capturePluginData({ repoRoot, dshHome: local.dshHome, cfg: extraCfg, scope, roots })
+      files += r.files
+      bytes += r.bytes
+      changed.push(...r.changed)
+      errors.push(...r.errors)
+      for (const n of r.notes) skippedByScope.push(`plugin-data: ${n}`)
+    }
+    if (gated('extra')) skipScopedGroup(scope, repoRoot, 'extra', skippedByScope)
+    else {
+      const r = captureExtraPaths({ repoRoot, dshHome: local.dshHome, cfg: extraCfg, scope, roots })
+      files += r.files
+      bytes += r.bytes
+      changed.push(...r.changed)
+      errors.push(...r.errors)
+      for (const n of r.notes) skippedByScope.push(`extra: ${n}`)
+    }
+  } catch (e) {
+    errors.push(`plugin-data/extra: ${(e && e.message) || e}`)
   }
 
   // 4) 本机身份（不是配置，是元数据）：让别的机器知道「这份配置来自哪」
@@ -819,6 +992,49 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
       errors.push(`conversations: ${(e && e.message) || e}`)
     }
   } else skippedByScope.push('conversations: 未勾选同步')
+
+  // 插件数据 / 额外路径：按仓库里的 manifest + 本机规则铺回（占位符展开后落到本机路径）
+  const extraCfg = readExtraConfig(local.dshHome)
+  if (scopeGroupEnabled(scope, 'plugin-data') && extraCfg.pluginData.enabled !== false) {
+    const pdRoot = join(repoRoot, 'plugin-data')
+    if (existsSync(pdRoot)) {
+      let slots = null
+      try { slots = JSON.parse(readFileSync(join(pdRoot, 'manifest.json'), 'utf8')).slots } catch { /* 没清单就按目录名猜 */ }
+      if (!Array.isArray(slots)) {
+        let names = []
+        try { names = readdirSync(pdRoot, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name) } catch { names = [] }
+        slots = names.map((id) => ({ id }))
+      }
+      for (const slot of slots) {
+        if (!slot || !slot.id) continue
+        if (!scopeItemEnabled(scope, 'plugin-data', slot.id)) { skippedByScope.push(`plugin-data/${slot.id}: 未勾选`); continue }
+        const target = slot.src ? expandTokenText(slot.src, roots) : join(local.dshHome, slot.id)
+        if (slot.src && missingTokens(target).length) { skipped.push(`plugin-data/${slot.id}: 待确认路径 ${missingTokens(target).join(', ')}`); continue }
+        if (target === local.dshHome || target.length <= local.dshHome.length) { skipped.push(`plugin-data/${slot.id}: 目标路径可疑，跳过`); continue }
+        pull(`plugin-data/${slot.id}`, target)
+      }
+    }
+  } else if (scopeGroupEnabled(scope, 'plugin-data')) skippedByScope.push('plugin-data: 已在 extra 规则里关闭')
+  else skippedByScope.push('plugin-data: 未勾选同步')
+
+  if (scopeGroupEnabled(scope, 'extra') && extraCfg.extra.enabled !== false) {
+    const exRoot = join(repoRoot, 'extra')
+    if (existsSync(exRoot)) {
+      for (const p of (extraCfg.extra.paths || [])) {
+        if (!scopeItemEnabled(scope, 'extra', p.id)) { skippedByScope.push(`extra/${p.id}: 未勾选`); continue }
+        const dirEntry = join(exRoot, p.id)
+        if (isDir(dirEntry)) { pull(`extra/${p.id}`, p.src); continue }
+        let fileEntry = ''
+        try {
+          const hit = readdirSync(exRoot).find((n) => n.startsWith(`${p.id}.`))
+          if (hit) fileEntry = hit
+        } catch { /* 没有就跳过 */ }
+        if (fileEntry) pull(`extra/${fileEntry}`, p.src)
+        else skipped.push(`extra/${p.id}: 仓库里没有`)
+      }
+    }
+  } else if (scopeGroupEnabled(scope, 'extra')) skippedByScope.push('extra: 已在 extra 规则里关闭')
+  else skippedByScope.push('extra: 未勾选同步')
 
   return { ok: errors.length === 0, written, skipped, errors, conflicts, files, bytes, local, backupDir: applyBackupDir, skippedByScope }
 }

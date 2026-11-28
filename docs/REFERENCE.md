@@ -12,7 +12,7 @@
 | `index.js` | 宿主半身：`/config-sync/status`、`prepare`、`settings`、`auto`、`update`、`scope`、`extra-config`、`conflict` 路由 |
 | `client.js` | 浏览器半身：侧栏行、面板、设置摘要行 |
 | `cordis.patch.yml` | bundle 补丁层（`id: config-sync`） |
-| `runtime/` | 执行体：7 个 PowerShell 脚本（`capture` / `apply` / `sync` / `restore` / `post-exit` / `common` / 自更新）+ Node 引擎 `sync-engine.mjs`（macOS/Linux）+ `webdav.mjs`（WebDAV 传输） |
+| `runtime/` | 执行体：7 个 PowerShell 脚本（`capture` / `apply` / `sync` / `restore` / `post-exit` / `common` / 自更新）+ Node 引擎 `sync-engine.mjs`（macOS/Linux）+ `conversations.mjs`（会话记录组）+ `webdav.mjs`（WebDAV 传输）+ `extra-rules.mjs`（插件数据 / 额外路径的规则，面板与引擎共用一份）+ `tools/`（会话 seq 护栏、cwd 修正等，随包发布） |
 | `tools/` | `selftest.mjs`、`clientcheck.mjs`、`pack-plugin.ps1`（**只在源码仓库**，不进安装包） |
 | `version.json` / `releases/` | 自更新清单与安装包（同样只在仓库） |
 

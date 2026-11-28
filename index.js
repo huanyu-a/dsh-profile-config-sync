@@ -23,6 +23,11 @@ import { createRequire } from 'node:module'
 import { gunzipSync } from 'node:zlib'
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs'
 import { writeFileAtomicSync } from './runtime/atomic-write.mjs'
+import {
+  EXTRA_CONFIG_NAME, EXTRA_DEFAULT_EXCLUDE, EXTRA_DEFAULT_SKIP_DIRS, EXTRA_HARD_MAX_BYTES,
+  EXTRA_MANDATORY_EXCLUDES, EXTRA_MANDATORY_SKIP_DIRS, extraConfigPath, extraSkipReason,
+  readExtraConfig, topUpExtraMandatory, wildcardToRegex,
+} from './runtime/extra-rules.mjs'
 import { homedir, hostname, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -4070,7 +4075,7 @@ function countEntries(dir) {
  * profile（4 个文件）/ prompt / skills / presets —— 别的组在那台机器上根本不会被同步。
  * null 表示「全部组」，非 Windows 时是白名单。
  */
-const ENGINE_SYNCED_GROUPS = IS_WIN ? null : new Set(['profile', 'prompt', 'skills', 'presets', 'conversations'])
+const ENGINE_SYNCED_GROUPS = IS_WIN ? null : new Set(['profile', 'prompt', 'skills', 'presets', 'conversations', 'plugin-data', 'extra'])
 
 /** profile 目录：优先 desktop，其次 profiles 下唯一的那一个 */
 function resolveProfileDir(dshHome) {
@@ -4124,25 +4129,6 @@ function listLocalPlugins(dshHome) {
  * 与 runtime\dsh-sync-common.ps1 的默认值必须一致，否则面板说"会同步"、capture 却跳过。
  */
 const ROUTE_EXTRA_CONFIG = '/config-sync/extra-config'
-const EXTRA_CONFIG_NAME = 'config-sync-extra.json'
-/** GitHub 单文件硬上限 100MB，超过必被拒收，所以配置里调多大都按这个封顶。 */
-const EXTRA_HARD_MAX_BYTES = 104857600
-const EXTRA_DEFAULT_SKIP_DIRS = [
-  'profiles', 'skills', '.agent-presets', 'storages', 'sessions', 'attachments', 'logs', 'backups',
-  'update-staging', 'electron', 'dsh-runtimes', 'dsh-market', '.dsh-plugin-market', 'dsh-session-manager',
-  'browser-profiles', 'im', 'node_modules',
-]
-const EXTRA_DEFAULT_EXCLUDE = [
-  '*.db', '*.db-*', '*.db3', '*.sqlite', '*.sqlite3', '*.sqlite-*', '*.db-shm', '*.db-wal',
-  '*.node', '*.exe', '*.dll', '*.asar', '*.pak', '*.bin', '*.iso', '*.img',
-  '*.zip', '*.7z', '*.rar', '*.tar', '*.gz', '*.tgz', '*.mp4', '*.mkv', '*.avi',
-  '*.log', '*.log.*', '*.tmp', '*.bak', '*.bak-*', '*.old', '*.orig', '*.swp',
-  '*.env', '.env*', 'config-sync-gh.json', 'config-sync-feedback-outbox.json', 'dsh-config-sync.json', 'dsh-ssh-master.key',
-  'api-key', '*.pem', '*.key', '*.p12', '*.pfx', '*.crt',
-  '*cache*', '*token*', '*secret*', '*credential*', '*password*', '*vault*',
-  'browser-profiles', 'User Data', 'Login Data', 'Cookies', 'Web Data', 'Local State',
-  'node_modules', '.git', '.cache', '__pycache__', '.venv',
-]
 
 /**
  * 安全必需项：用户自己的 config-sync-extra.json 不允许把它们去掉。
@@ -4154,8 +4140,6 @@ const EXTRA_DEFAULT_EXCLUDE = [
  * 于是待推送会把 browser-profiles 里几千个文件的 mtime 变动算成「待推送」，而 capture 根本不会抓它们
  * —— 面板永远消不掉，退出自动推送也每次白跑。
  */
-const EXTRA_MANDATORY_SKIP_DIRS = ['browser-profiles']
-const EXTRA_MANDATORY_EXCLUDES = ['browser-profiles', 'User Data', 'Login Data', 'Cookies', 'Web Data', 'Local State']
 
 /**
  * 浏览器剖面 / 凭据库的路径段黑名单：与 PS 的 $SyncBlockedProfileSegments、webdav.mjs 的
@@ -4172,14 +4156,6 @@ const BLOCKED_PROFILE_SEGMENTS = new Set([
  * 读配置要用、保存前也要用：POST 拿用户提交的名单覆盖掉之后，
  * 如果只在读的时候补，用户一保存就又把它删掉了（实测就是这样丢的）。
  */
-function topUpExtraMandatory(cfg) {
-  if (!cfg || !cfg.pluginData) return { skipDirs: [], exclude: [] }
-  const addedSkip = EXTRA_MANDATORY_SKIP_DIRS.filter((x) => !(cfg.pluginData.skipDirs || []).includes(x))
-  const addedExcl = EXTRA_MANDATORY_EXCLUDES.filter((x) => !(cfg.pluginData.exclude || []).includes(x))
-  if (addedSkip.length) cfg.pluginData.skipDirs = [...(cfg.pluginData.skipDirs || []), ...addedSkip]
-  if (addedExcl.length) cfg.pluginData.exclude = [...(cfg.pluginData.exclude || []), ...addedExcl]
-  return { skipDirs: addedSkip, exclude: addedExcl }
-}
 
 function isBlockedProfilePath(rel) {
   const s = String(rel || '')
@@ -4216,50 +4192,6 @@ function settingsSourcePath(dshHome, profileDir, entry) {
   return entry.profileRel ? join(profileDir, ...entry.profileRel) : join(dshHome, ...entry.rel)
 }
 
-function extraConfigPath(dshHome) { return join(dshHome, EXTRA_CONFIG_NAME) }
-
-function readExtraConfig(dshHome) {
-  const cfg = {
-    version: 1,
-    pluginData: {
-      enabled: true,
-      maxFileBytes: EXTRA_HARD_MAX_BYTES,
-      exclude: [...EXTRA_DEFAULT_EXCLUDE],
-      skipDirs: [...EXTRA_DEFAULT_SKIP_DIRS],
-    },
-    extra: { enabled: true, paths: [] },
-  }
-  const p = extraConfigPath(dshHome)
-  if (!isFile(p)) return cfg
-  try {
-    const j = JSON.parse(readFileSync(p, 'utf8'))
-    const pd = j?.pluginData
-    if (pd) {
-      if (pd.enabled === false) cfg.pluginData.enabled = false
-      const n = Number(pd.maxFileBytes)
-      if (Number.isFinite(n) && n > 0) cfg.pluginData.maxFileBytes = Math.min(Math.floor(n), EXTRA_HARD_MAX_BYTES)
-      // 排除名单整份替换：用户在面板里删掉一条就真的不再排除
-      if (Array.isArray(pd.exclude)) cfg.pluginData.exclude = pd.exclude.filter((x) => typeof x === 'string' && x)
-      if (Array.isArray(pd.skipDirs)) cfg.pluginData.skipDirs = pd.skipDirs.filter((x) => typeof x === 'string' && x)
-    }
-    const ex = j?.extra
-    if (ex) {
-      if (ex.enabled === false) cfg.extra.enabled = false
-      if (Array.isArray(ex.paths)) {
-        cfg.extra.paths = ex.paths
-          .filter((x) => x && typeof x.id === 'string' && typeof x.src === 'string' && x.id && x.src)
-          .map((x) => ({ id: x.id, src: x.src, label: typeof x.label === 'string' && x.label ? x.label : x.id }))
-      }
-    }
-  } catch { /* 坏了就按默认规则走，不让面板整页读不出来 */ }
-  // 安全必需项补齐（与 PowerShell 的 Get-SyncExtraConfig 同一步）：用户文件可以改别的，
-  // 但这些名字必须留着。补齐了要能让面板说出来（missingMandatory），不静默改用户的口径。
-  const added = topUpExtraMandatory(cfg)
-  if (added.skipDirs.length || added.exclude.length) {
-    cfg.pluginData.missingMandatory = { skipDirs: added.skipDirs, exclude: added.exclude }
-  }
-  return cfg
-}
 
 function saveExtraConfig(dshHome, cfg) {
   const p = extraConfigPath(dshHome)
@@ -4280,25 +4212,6 @@ function saveExtraConfig(dshHome, cfg) {
   return p
 }
 
-function wildcardToRegex(pat) {
-  const esc = String(pat).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')
-  return new RegExp(`^${esc}$`, 'i')
-}
-
-/** 返回跳过原因（'' = 允许同步），与 runtime 的 Test-SyncExtraSkip 判定一致。 */
-function extraSkipReason(relName, size, cfg) {
-  const max = Math.min(cfg.pluginData.maxFileBytes || EXTRA_HARD_MAX_BYTES, EXTRA_HARD_MAX_BYTES)
-  if (size > max) return 'too-big'
-  if (!relName) return ''
-  const parts = String(relName).split(/[\\/]+/).filter((x) => x)
-  const name = parts.length ? parts[parts.length - 1] : relName
-  for (const pat of cfg.pluginData.exclude || []) {
-    const re = wildcardToRegex(pat)
-    if (re.test(name)) return 'excluded'
-    for (const seg of parts) if (re.test(seg)) return 'excluded'
-  }
-  return ''
-}
 
 function dirHasRules(cfg) { return (cfg.pluginData.exclude || []).map(wildcardToRegex) }
 

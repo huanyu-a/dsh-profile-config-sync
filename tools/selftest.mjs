@@ -781,6 +781,8 @@ if (prevScope === null) { try { unlinkSync(scopeFile) } catch { } } else writeFi
   // version.json 的年代。用户明确要求「插件更新只检查 npm，不检查 GitHub」，所以整条线退休：
   // 更新检查读 npm 的 dist-tags + 单版本文档，校验值取 registry 自己的 dist.integrity / dist.shasum。
   const indexSrc = readFileSync(join(pluginRoot, 'index.js'), 'utf8')
+  // 0.6.49：插件数据 / 额外路径的规则已挪进 runtime/extra-rules.mjs（engine 也要用同一份）
+  const extraRulesSrc = readFileSync(join(pluginRoot, 'runtime', 'extra-rules.mjs'), 'utf8')
   // 负向断言只看**代码**：这些名字经常在注释里被提到（"原来叫 UPDATE_MANIFEST_MIRRORS，已删"），
   // 直接 includes() 会把「解释为什么删掉」判成「还在用」。
   const stripComments = (src) => String(src)
@@ -909,7 +911,8 @@ if (prevScope === null) { try { unlinkSync(scopeFile) } catch { } } else writeFi
     && indexSrc.includes('async function handleExtraConfig')
     && clientSrc.includes("fetch('/config-sync/extra-config'") && clientSrc.includes('function ExtraCard'), 'index/client')
   check('凭据文件默认不进仓库：*vault* 在名单里，且抓取前按内容嗅探再拦一道',
-    commonSrc.includes("'*vault*'") && indexSrc.includes("'*vault*'")
+    commonSrc.includes("'*vault*'") && extraRulesSrc.includes("'*vault*'")
+    && indexSrc.includes("from './runtime/extra-rules.mjs'")
     && commonSrc.includes('function Test-SyncExtraSecret') && commonSrc.includes('$SyncExtraSecretMarkers')
     && captureSrc.includes('Get-SyncExtraSecretSkips'), 'common/index/capture')
   check('符号链接/junction 不跟进（插件目录常把外部数据链进来）',
@@ -2552,6 +2555,31 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       readFileSync(join(homeB, 'sessions', conv.sessionDirName(wsB), 's1', 'session.v4.jsonl'), 'utf8')
         === readFileSync(join(homeA, 'sessions', conv.sessionDirName(wsA), 's1', 'session.v4.jsonl'), 'utf8')
       && existsSync(join(homeB, 'attachments', 's1', 'shot.png')))
+  }
+
+  // ── 插件数据 / 额外路径（0.6.49 起 Node 引擎也做；规则在 runtime/extra-rules.mjs，面板与引擎共用）──
+  {
+    const rules = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'extra-rules.mjs')).href)
+    const rulesHome = mkdtempSync(join(tmpdir(), 'cfg-sync-rules-'))
+    const cfg = rules.readExtraConfig(rulesHome)
+    check('规则模块：缺配置时用默认名单（含 *vault* / browser-profiles）',
+      cfg.pluginData.exclude.includes('*vault*') && cfg.pluginData.skipDirs.includes('browser-profiles')
+      && !cfg.pluginData.missingMandatory)
+    // 用户把安全必需项删掉：读的时候必须补回来，并且说出来补了什么（不静默改用户口径）
+    writeFileSync(join(rulesHome, 'config-sync-extra.json'), JSON.stringify({
+      version: 1, pluginData: { enabled: true, maxFileBytes: 104857600, exclude: ['*.tmp'], skipDirs: ['logs'] },
+    }))
+    const cfg2 = rules.readExtraConfig(rulesHome)
+    check('规则模块：用户删掉的安全必需项会被补回并记下',
+      cfg2.pluginData.skipDirs.includes('browser-profiles')
+      && cfg2.pluginData.exclude.includes('Login Data')
+      && cfg2.pluginData.missingMandatory.skipDirs.includes('browser-profiles')
+      && cfg2.pluginData.exclude.includes('*.tmp')
+      && cfg2.pluginData.exclude.includes('*vault*') === false)
+    check('规则模块：单文件超限 / 通配排除 / 正常放行',
+      rules.extraSkipReason('a/x.json', 200 * 1024 * 1024, cfg) === 'too-big'
+      && rules.extraSkipReason('a/x.db', 10, cfg) === 'excluded'
+      && rules.extraSkipReason('a/x.json', 10, cfg) === '')
   }
 
   // 同步范围卡必须按平台说实话：非 Windows 只同步四组，其余八组要在 GET /scope 里
