@@ -123,10 +123,10 @@ conversations/session-index.json  conversations/session_projcache/s1.json
 
 | 接口 | 说明 |
 |---|---|
-| `GET /config-sync/status` | 体检 JSON（`repo.*`（`source/configured/phase/empty/remoteHeads/remoteFiles/pushAllowed/pullAllowed`）、`remote.*`、`backup.*`、`local.{lastSyncAt,pending}`、`auto.lastResult`、`conflicts`、`localPaths`） |
+| `GET /config-sync/status` | 体检 JSON（`repo.*`（`source/configured/phase/empty/remoteHeads/remoteFiles/pushAllowed/pullAllowed`）、`remote.*`、`backup.*`、`local.{lastSyncAt,pending}`、`auto.lastResult`、`auto.pullPrompt`、`auto.livePush`、`conflicts`、`localPaths`） |
 | `POST /config-sync/prepare` | `{action:'push'\|'pull'\|'restore'\|'restore-backup'\|'all', message?, backupDir?}`；空目录上按云端文件数分流 |
 | `POST /config-sync/settings` | 校验 → 写设置 →（地址变了才动 git），失败回滚并 400 |
-| `POST /config-sync/auto` | `{action:'check'\|'pull-now'\|'push-now'\|'restore-preview'\|'restore-now'\|'cancel'}`，都不带 `/F` 关闭客户端（走正常退出，配置能存下来） |
+| `POST /config-sync/auto` | `{action:'check'\|'pull-now'\|'push-now'\|'push-live'\|'restore-preview'\|'restore-now'\|'cancel'}`，都不带 `/F` 关闭客户端（走正常退出，配置能存下来）。`push-live` 是**不关闭 DSH** 的后台推送，进度走 `status.auto.livePush`（`phase` / `message` / `recent[]` / `log`）；可选 `{confirmed:true}` 跳过宿主侧的确认框（只有面板会带，宿主对非面板调用仍走原生确认） |
 | `GET/POST /config-sync/update` | `{action:'check'\|'install-live'\|'restart'\|'apply'}` |
 | `GET/POST /config-sync/scope` | 十二组同步范围读写 |
 | `GET/POST /config-sync/extra-config` | 规则读写（`{config:{pluginData:{enabled,maxFileBytes,exclude,skipDirs},extra:{enabled,paths[]}}}`，id 去重、路径必须绝对、上限按 100 MB 压；GET 另带 `defaults` 供「恢复默认」） |
@@ -186,6 +186,17 @@ Windows 的 PowerShell 与 macOS/Linux 的 Node 引擎都读这一份文件、�
 - **上次自动同步的结果**：`~\.dsh\auto-sync-result.json` 若在 15 分钟内，客户端启动即弹一条 5 秒浮层（成功/失败 + 原因 + 日志路径），同一份结果只弹一次。
 
 ## 自动同步的进程细节
+
+**macOS / Linux（0.6.49 起）**：执行体是 `runtime/post-exit.mjs`（Node，替代 `post-exit.ps1`），安装是 `runtime/install-plugin.mjs`。
+- 「客户端是否还在运行」按**可执行文件路径**匹配（`platform.mjs` 的 `listClientProcesses` / `clientProcessPattern`），
+  不按进程名 —— 执行体自己的命令行里就带着 `DeepSeek Harness.app/...` 路径，按名字会把等待进程和自己一起算进去。
+- 重启客户端：macOS 用 `open -a <AppRoot>`，Linux 起解包目录里的可执行文件（`clientExecutable`）。
+- 关闭客户端：先 `app.quit()`；不行再 `osascript -e 'tell application "DeepSeek Harness" to quit'`；6 秒后仍在才 `pkill -f <exe 路径>`。
+- **启动时的自动拉取不再弹原生框**（osascript 的 `display dialog` 常被窗口挡住 → 用户看不见就等于永不发生）：
+  只写 `status.auto.pullPrompt` 与 `~/.dsh/logs/auto-sync-pull-prompt.log`，由面板的「立即拉取」接手。
+- 仓库路径会先 `realpath` 再和 `git rev-parse --show-toplevel` 比：`/var`、`/tmp` 指向 `/private/...`，只比字面量会把正常路径判成「不是仓库根」。
+
+**Windows**：
 
 - 动手由插件拉起 `runtime\post-exit.ps1 -Phase wait`（**隐藏**）盯退出；真退了才用 `-WindowStyle Normal` 起 `-Phase run` 的**可见**窗口，标题「DSH 配置备份与同步 · 拉取/推送」。**排队期间不弹窗**。
 - 仓库还没就位（含空目录）时首检直接跳过，且不记成「检查失败」。
