@@ -292,14 +292,20 @@ window.__ModuleLoader__.load({
       // 三件不能混成一件事的：从没同步过 / 扫描没跑完 / 真的没有
       if (local.known === false) return { kind: 'idle', text: M('还没有同步记录：先推送或拉取一次', 'No sync record yet — push or pull once') }
       if (local.truncated) return { kind: 'warn', text: M('待推送扫描没跑完（文件太多或超时），数字可能偏小', 'Pending scan did not finish (too many files or timeout) — the count may be low') }
-      // 非 Windows：执行体只抓 profile / 提示 / Skills / 预设，别让「没有待推送」被读成「全都同步了」
+      // 非 Windows：别让「没有待推送」被读成「全都同步了」。0.6.49 起引擎覆盖全部 12 组，
+      // 这时就直说「都同步」；没覆盖全的平台才列清单并提 Windows。
       if (Array.isArray(local.engineGroups) && local.pending === 0) {
         return {
           kind: 'idle',
-          text: M(
-            `已同步（这台机器走跨平台引擎，只处理 ${local.engineGroups.join(' / ')}；会话记录、插件数据、额外路径等组要 Windows 版才会同步）`,
-            `Up to date (this machine uses the cross-platform engine, which only handles ${local.engineGroups.join(' / ')}; conversations, plugin data and extra paths sync on Windows)`,
-          ),
+          text: local.engineAllGroups
+            ? M(
+              `已同步（这台机器走跨平台引擎，${local.engineGroups.length} 组内容都与仓库一致）`,
+              `Up to date (this machine uses the cross-platform engine; all ${local.engineGroups.length} groups match the repo)`,
+            )
+            : M(
+              `已同步（这台机器走跨平台引擎，只处理 ${local.engineGroups.join(' / ')}；其余组要 Windows 版才会同步）`,
+              `Up to date (this machine uses the cross-platform engine, which only handles ${local.engineGroups.join(' / ')}; the rest sync on Windows)`,
+            ),
         }
       }
       if (local.pending > 0) {

@@ -2722,6 +2722,10 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
   check('scope GET 按引擎能力给出 supported（非 Windows 只认四组）',
     hostSrc.includes('supported: ENGINE_SYNCED_GROUPS ? ENGINE_SYNCED_GROUPS.has(g.id) : true')
     && hostSrc.includes('engineGroups: ENGINE_SYNCED_GROUPS ? [...ENGINE_SYNCED_GROUPS] : null'))
+  check('非 Windows 引擎已覆盖全部 12 组，面板据此不再提「要 Windows 版」',
+    hostSrc.includes('const ENGINE_COVERS_ALL = ')
+    && hostSrc.includes('engineAllGroups: ENGINE_COVERS_ALL')
+    && readFileSync(join(repoRootOfTools, 'client.js'), 'utf8').includes('local.engineAllGroups'))
   check('面板：不支持的组禁用勾选并写明原因',
     readFileSync(join(repoRootOfTools, 'client.js'), 'utf8').includes('!supported')
     && readFileSync(join(repoRootOfTools, 'client.js'), 'utf8').includes('此平台暂不支持'))

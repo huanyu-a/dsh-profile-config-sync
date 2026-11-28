@@ -1314,10 +1314,15 @@ async function inspect(config) {
       advice.push(t('待推送扫描没跑完（文件太多或超时），这次的数字可能偏小：可再刷新一次', 'The pending scan did not finish (too many files or a timeout); the count may be low — refresh again.'))
     } else if (local && Array.isArray(local.engineGroups)) {
       // 非 Windows：这句话只覆盖引擎真会同步的四组，不能写成「仓库与本机一致」
-      advice.push(t(
-        `这台机器走跨平台引擎，只同步 ${local.engineGroups.join(' / ')}，这几组与仓库一致（会话记录、插件数据、额外路径要 Windows 版才会同步）`,
-        `This machine uses the cross-platform engine, which syncs only ${local.engineGroups.join(' / ')}; those groups match the repo (conversations, plugin data and extra paths sync on Windows).`,
-      ))
+      advice.push(local.engineAllGroups
+        ? t(
+          `这台机器走跨平台引擎，${local.engineGroups.length} 组内容（${local.engineGroups.join(' / ')}）都与仓库一致`,
+          `This machine uses the cross-platform engine; all ${local.engineGroups.length} groups (${local.engineGroups.join(' / ')}) match the repo.`,
+        )
+        : t(
+          `这台机器走跨平台引擎，只同步 ${local.engineGroups.join(' / ')}，这几组与仓库一致（其余组要 Windows 版才会同步）`,
+          `This machine uses the cross-platform engine, which syncs only ${local.engineGroups.join(' / ')}; those groups match the repo (the rest sync on Windows).`,
+        ))
     } else {
       advice.push(t('仓库与本机一致，没有待办', 'The repo matches this machine — nothing to do.'))
     }
@@ -2890,6 +2895,7 @@ function localPending(dshHome, lastSyncAt, profileName, ctx = {}) {
     truncated: scanned >= 20000 || Date.now() >= deadline,
     // 非 Windows 时只统计引擎真会同步的四组，把这件事说出来（面板会显示，不让用户以为别的组也在同步）
     engineGroups: ENGINE_SYNCED_GROUPS ? [...ENGINE_SYNCED_GROUPS] : null,
+    engineAllGroups: ENGINE_COVERS_ALL,
   }
 }
 
@@ -4077,6 +4083,8 @@ function countEntries(dir) {
  * null 表示「全部组」，非 Windows 时是白名单。
  */
 const ENGINE_SYNCED_GROUPS = IS_WIN ? null : new Set(['profile', 'prompt', 'skills', 'presets', 'storages-record', 'settings', 'mnemon', 'local-plugins', 'plugin-data', 'extra', 'workspace', 'conversations'])
+/** 引擎是否已覆盖全部内容分组（'other' 是兜底桶，不算）。0.6.49 起非 Windows 是全 12 组。 */
+const ENGINE_COVERS_ALL = !ENGINE_SYNCED_GROUPS || Object.keys(PENDING_GROUP_LABEL).filter((id) => id !== 'other').every((id) => ENGINE_SYNCED_GROUPS.has(id))
 
 /** profile 目录：优先 desktop，其次 profiles 下唯一的那一个 */
 function resolveProfileDir(dshHome) {
