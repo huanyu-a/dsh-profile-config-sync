@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/huanyu-a/dsh-profile-config-sync/compare/v0.7.0...v0.7.1) (2026-11-28)
+
+
+### Bug Fixes
+
+* **update:** Windows 上插件自更新必失败 —— TransformBlock 传 FileStream 在 PowerShell 7 无重载 ([3f01b23](https://github.com/huanyu-a/dsh-profile-config-sync/commit/3f01b23732990d4f350139a1adecd5af0644df17))
+
 ## [0.7.0](https://github.com/huanyu-a/dsh-profile-config-sync/compare/v0.6.47...v0.7.0) (2026-11-28)
 
 
