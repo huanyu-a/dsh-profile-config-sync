@@ -1140,6 +1140,13 @@ let applyBackupDir = ''
  * 覆盖前留底。只备份「将被覆盖且内容不同」的本机文件；内容相同的不重复拷。
  * src 是目录时逐文件比对。备份失败不阻断同步，但要记进 errors（否则是静默丢底）。
  */
+/**
+ * 覆盖前留底：把**目标文件当前的样子**复制到 `<DshHome>/backups/apply-<时间戳>/`。
+ *
+ * src 是仓库里的那份（用来比对），dst 是本机要被覆盖的那份（用来复制）。
+ * 早先几处调用写成了 backupBeforeWrite(dst, dst)，自己跟自己比永远「内容相同」→ 备份根本没做，
+ * 真机上覆盖 profile/package.json 时一点痕迹都没留下。别再写成两个相同参数。
+ */
 function backupBeforeWrite(src, dst, dshHome, errorsRef) {
   try {
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '')
@@ -1278,7 +1285,7 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
       if (dryRun) written.push('profile/package.json（移植后）')
       else {
         try {
-          backupBeforeWrite(livePkgPath, livePkgPath, local.dshHome, errors)
+          backupBeforeWrite(join(repoRoot, 'profile', 'package.json'), livePkgPath, local.dshHome, errors)
           writeFileSync(livePkgPath, text, 'utf8')
           written.push('profile/package.json（移植后）')
           conflicts.push('profiles/desktop/package.json（已按本机路径改写依赖）')
@@ -1421,7 +1428,7 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
             let before = ''
             try { before = readFileSync(regPath, 'utf8') } catch { before = '' }
             if (before !== merged) {
-              backupBeforeWrite(regPath, regPath, local.dshHome, errors)
+              backupBeforeWrite(join(repoRoot, 'workspace', 'workspace-registry.json'), regPath, local.dshHome, errors)
               mkdirSync(dirname(regPath), { recursive: true })
               writeFileSync(regPath, merged, 'utf8')
               conflicts.push(`storages/workspace.json（补入 ${added.length} 个工作区）`)
@@ -1496,7 +1503,7 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
             continue
           }
           if (before !== merged && !dryRun) {
-            backupBeforeWrite(dstPath, dstPath, local.dshHome, errors)
+            backupBeforeWrite(src, dstPath, local.dshHome, errors)
             mkdirSync(dirname(dstPath), { recursive: true })
             writeFileSync(dstPath, merged, 'utf8')
             written.push(`settings/${entry.id}（移植后合并）`)
@@ -1540,7 +1547,7 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
             // 本机有自己写的那份就只暂存，避免把 macOS 专属的环境事实覆盖掉。
             const ours = /本文件由 dsh-profile-config-sync 从另一套系统移植/.test(liveText)
             if (!liveText.trim() || ours) {
-              backupBeforeWrite(live, live, local.dshHome, errors)
+              backupBeforeWrite(agentsRepo, live, local.dshHome, errors)
               writeFileSync(live, ported.text, 'utf8')
               written.push('AGENTS.md（移植后）')
             } else {

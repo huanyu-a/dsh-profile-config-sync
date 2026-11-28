@@ -2721,6 +2721,15 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       readFileSync(join(winHome, 'AGENTS.md'), 'utf8').includes('本机全局提示')
       && existsSync(join(winHome, 'prompt-from-cloud', 'AGENTS.md'))
       && r1.skippedByScope.some((x) => x.startsWith('prompt/AGENTS.md:') && x.includes('移植版只暂存')))
+    check('覆盖前留底：apply 改动前的本机 package.json 被存进 backups/apply-*/',
+      (() => {
+        const bk = join(winHome, 'backups')
+        if (!existsSync(bk)) return false
+        const dirs = readdirSync(bk).filter((d) => d.startsWith('apply-'))
+        if (!dirs.length) return false
+        const saved = join(bk, dirs[0], 'profiles', 'desktop', 'package.json')
+        return existsSync(saved) && readFileSync(saved, 'utf8').includes('keep-me')
+      })())
     check('跨平台护栏：云端整份工作区登记表不会把盘符路径带进来（翻不出来的不登记）',
       !existsSync(join(winHome, 'storages', 'workspace.json'))
       && r1.skippedByScope.some((x) => x.includes('dsh-workspaces.json')))
