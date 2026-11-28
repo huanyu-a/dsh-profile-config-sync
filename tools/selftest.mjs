@@ -14,7 +14,7 @@
  * 平台相关断言按 process.platform 分支：Windows 生成 .cmd，POSIX 生成 .sh。
  */
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -2478,6 +2478,37 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     Array.isArray(pf.listClientProcesses(appRoot, process.pid)) || pf.listClientProcesses(appRoot, process.pid) === null)
   check('pgrep 用的模式里带可执行文件路径（不是光秃秃的进程名）',
     /Contents.*MacOS|DeepSeek Harness/.test(pf.clientProcessPattern(appRoot)), pf.clientProcessPattern(appRoot))
+
+  // 符号链接形式的仓库路径（macOS 实测）：/var 与 /tmp 都指向 /private/...，git 报真实路径，
+  // 只比字面量会把用户填的路径判成「不是仓库根」，面板「立即推送」直接失败。
+  if (!IS_WIN) {
+    const linkStage = mkdtempSync(join(tmpdir(), 'cfg-sync-link-'))
+    const realRepo = join(linkStage, 'real-repo')
+    const linkRepo = join(linkStage, 'link-repo')
+    mkdirSync(join(realRepo, 'profile'), { recursive: true })
+    writeFileSync(join(realRepo, 'profile', 'package.json'), '{"name":"dsh-profile-desktop"}', 'utf8')
+    const g = (...a) => spawnSync('git', a, { encoding: 'utf8', timeout: 20000 })
+    g('init', '-q', '-b', 'main', realRepo)
+    g('-C', realRepo, 'add', '-A')
+    g('-C', realRepo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'seed')
+    symlinkSync(realRepo, linkRepo, 'dir')
+    const linkHome = join(linkStage, 'home')
+    mkdirSync(join(linkHome, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(linkHome, 'profiles', 'desktop', 'package.json'), '{"name":"dsh-profile-desktop"}', 'utf8')
+    // capture 会把引擎模块写进仓库根，所以这里只需要一个能跑的目录
+    const r = spawnSync(process.execPath, [join(runtimeDir, 'sync-engine.mjs'), 'push', '-RepoRoot', linkRepo, '-DshHome', linkHome], { encoding: 'utf8', timeout: 120000 })
+    const out = String(r.stdout || '') + String(r.stderr || '')
+    check('符号链接路径的仓库不被误判成「不是仓库根」',
+      !/不是仓库根/.test(out), out.split('\n').filter((l) => l.trim()).slice(-3).join(' | '))
+    // 没有 origin 是这套夹具的预期（不该为此伪造远端）：认的是「没被路径判据挡住」，
+    // 也就是走到了 git 那一步才失败，而不是一进门就报「不是仓库根」。
+    check('符号链接路径下 push 能走到 git 那一步（只差 origin）',
+      (r.status === 0 || /origin|远程仓库|not configured|没有/.test(out)) && !/不是仓库根/.test(out),
+      `exit=${r.status} stdout=${String(r.stdout || '').length}B stderr=${String(r.stderr || '').length}B`)
+    rmSync(linkStage, { recursive: true, force: true })
+  } else {
+    console.log('  [SKIP] 符号链接夹具 — Windows 上用 junction，语义不同，另测')
+  }
 
   // 后台自动拉取（启动时那条）在 macOS 上不能弹原生框：那条路径没有请求也没有面板，
   // osascript 的 display dialog 常被窗口挡住 → 用户看不见、自动拉取永不发生（实测踩过）。

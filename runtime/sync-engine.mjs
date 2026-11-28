@@ -16,7 +16,7 @@
 import { spawnSync } from 'node:child_process'
 import {
   closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync,
-  readSync, renameSync, rmSync, statSync, writeFileSync, lstatSync,
+  readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, lstatSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { homedir, hostname } from 'node:os'
@@ -1001,12 +1001,18 @@ function warnUnknownArgs(args, known, usage) {
  */
 function ensureOwnRepo(repoRoot) {
   const norm = (s) => String(s || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  // 0.6.49（macOS 实测）：/var 与 /tmp 都是指向 /private/var、/private/tmp 的符号链接，
+  // `git rev-parse --show-toplevel` 报的是**真实路径**，而用户填/系统给的是符号链接写法 ——
+  // 只比字面量会把 /tmp/dsh-config 判成「这个目录不是仓库根」，面板的「立即推送」直接失败。
+  // 两边都 realpath 一次再比，任何一边解析失败就退回字面量。
+  const real = (s) => { try { return realpathSync(String(s || '')) } catch { return String(s || '') } }
+  const sameDir = (a, b) => norm(a) === norm(b) || norm(real(a)) === norm(real(b))
   const top = gitRun(repoRoot, ['rev-parse', '--show-toplevel'], 60000)
   if (top.code !== 0) {
     return { ok: false, error: `这个目录还不是 git 仓库：${repoRoot}（先在面板「云端仓库」里初始化，或换成已有仓库）` }
   }
   const got = String(top.out || '').trim().split(/\r?\n/).filter(Boolean).pop() || ''
-  if (!got || norm(got) !== norm(repoRoot)) {
+  if (!got || !sameDir(got, repoRoot)) {
     return {
       ok: false,
       error: `这个目录不是仓库根：git 认到的是 ${got || '(空)'}；请把同步仓库放在独立目录，不要塞在别的仓库里面`,
