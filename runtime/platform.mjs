@@ -10,7 +10,8 @@
 //   2. 任何探测失败都返回空/默认值，**绝不抛**：调用方拿到的永远是可用值。
 //   3. 平台差异只允许出现在本文件。业务代码里出现 process.platform 就是漏了这层。
 
-import { existsSync, statSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { closeSync, existsSync, openSync, readFileSync as require$readFileSync, readSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, join, sep } from 'node:path'
 
@@ -85,12 +86,18 @@ export function pathExists(path) {
  * 两个判据都必须接受「asar 是目录」这一形态 —— 打包版 Electron 里
  * statSync('app.asar').isDirectory() 才是 true，只写 isFile() 会让
  * 真实客户端永远认不出自己的根。
+ *
+ * 0.6.49：判据本身只认「Windows 形状」（<root>/resources/...），但 macOS 的
+ * .app bundle 是 <root>/Contents/Resources/... —— 所以这里先把 .app 归一成
+ * Windows 形状再判（normalizeAppRoot）。少了这一步，macOS 上**所有**候选都判 false，
+ * resolveAppRoot 返回空串，面板直接报「定位不到客户端根目录」、三份脚本生成不了。
  */
 export function isAppRoot(path) {
   if (!path) return false
-  const asar = join(path, 'resources', 'app.asar')
-  if (pathExists(asar)) return true
-  return isFile(join(path, 'resources', 'app', 'package.json'))
+  const layout = appRootLayout(path)
+  if (!layout.resources) return false
+  if (pathExists(join(layout.resources, 'app.asar'))) return true
+  return isFile(join(layout.resources, 'app', 'package.json'))
 }
 
 /**
@@ -137,6 +144,10 @@ export function appRootCandidates() {
  * macOS 上 Electron 应用的 resources 目录在 `Xxx.app/Contents/Resources`，
  * 而插件被部署在 `<AppRoot>` 的上一级。这里把 .app 内的 Resources 归一成
  * 与 Windows 一致的形状，让上层逻辑（readAppMeta / hostDshNodeModules）不用改。
+ *
+ * 0.6.49：只在真的认出 Contents/Resources 时才归一 —— 原来无条件返回内层路径，
+ * 于是一个**不是** .app bundle 的目录（例如用户把 appRoot 填成 .../Contents/Resources）
+ * 会被反复套娃。现在认不出就原样返回。
  */
 export function normalizeAppRoot(path) {
   if (!path || !isDir(path)) return path
@@ -152,10 +163,12 @@ export function normalizeAppRoot(path) {
  *
  * Windows：就是 AppRoot 本身。
  * macOS：.app bundle → Contents/MacOS（可执行）与 Contents/Resources（资源）。
+ *        非 .app 的 macOS 安装（解包目录）退回 <root>/resources。
+ * 0.6.49：原来 macOS 分支只认 .app，解包版会被算成 macos=<root>/resources（错）。
  */
 export function appRootLayout(appRoot) {
   if (!appRoot) return { root: appRoot, resources: '', macos: '' }
-  if (IS_MAC && appRoot.endsWith('.app')) {
+  if (IS_MAC && appRoot.endsWith('.app') && isDir(join(appRoot, 'Contents', 'Resources'))) {
     return {
       root: appRoot,
       resources: join(appRoot, 'Contents', 'Resources'),
@@ -163,6 +176,139 @@ export function appRootLayout(appRoot) {
     }
   }
   return { root: appRoot, resources: join(appRoot, 'resources'), macos: appRoot }
+}
+
+/**
+ * 客户端 resources 目录下 app.asar 的路径（不存在也返回路径）。
+ * 0.6.49：macOS 上 asar 在 <root>/Contents/Resources/app.asar，原来各处直接
+ * join(appRoot,'resources','app.asar') 在 macOS 上必定读不到 → 版本、bundle 清单全空。
+ */
+export function asarPath(appRoot) {
+  const res = appRootLayout(appRoot).resources
+  return res ? join(res, 'app.asar') : ''
+}
+
+/**
+ * 读 asar 里的一个 JSON 文件。两种读法都试：
+ *   1) Electron 主进程把 asar 当目录挂载 → 直接按路径读（普通 node 读不到，返回 null 即可）；
+ *   2) 不依赖挂载 → 自己解析 asar 头（Header 里的 files 树 + offset）。
+ * 读不到返回 null（调用方据此降级，不报错）。
+ */
+export function readAsarJson(appRoot, relPath = 'dsh/package.json') {
+  const asar = asarPath(appRoot)
+  if (!asar) return null
+  const viaMount = (() => {
+    try { return JSON.parse(require$readFileSync(join(asar, relPath), 'utf8')) } catch { return null }
+  })()
+  if (viaMount) return viaMount
+  if (!isFile(asar)) return null
+  try {
+    const fd = openSync(asar, 'r')
+    try {
+      const head = Buffer.alloc(16)
+      readSync(fd, head, 0, 16, 0)
+      const headerSize = head.readUInt32LE(4)
+      const jsonLen = head.readUInt32LE(12)
+      if (jsonLen < 2 || jsonLen > 64 * 1024 * 1024) return null
+      const json = Buffer.alloc(jsonLen)
+      readSync(fd, json, 0, jsonLen, 16)
+      const header = JSON.parse(json.toString('utf8'))
+      let node = header
+      for (const seg of String(relPath).split('/').filter(Boolean)) node = node && node.files ? node.files[seg] : null
+      const entry = node
+      if (!entry || entry.size == null || entry.offset == null) return null
+      const body = Buffer.alloc(Number(entry.size))
+      readSync(fd, body, 0, Number(entry.size), 8 + headerSize + Number(entry.offset))
+      return JSON.parse(body.toString('utf8'))
+    } finally { closeSync(fd) }
+  } catch { return null }
+}
+
+/**
+ * 客户端 app 版本（面板「本机 / 契约」那一格）。
+ * 解包版读 resources/app/package.json；打包版读 asar 里的 dsh/package.json。
+ * 0.6.49：路径统一走 asarPath → macOS 上也读得到（原来 macOS 恒为空）。
+ */
+export function readAppVersion(appRoot) {
+  if (!appRoot) return ''
+  const res = appRootLayout(appRoot).resources
+  if (!res) return ''
+  const plain = (() => {
+    try { return JSON.parse(require$readFileSync(join(res, 'app', 'package.json'), 'utf8')) } catch { return null }
+  })()
+  if (plain && plain.version) return String(plain.version)
+  const pkg = readAsarJson(appRoot, 'dsh/package.json')
+  if (pkg && pkg.version) return String(pkg.version)
+  return ''
+}
+
+/**
+ * Electron 版本（面板元信息行 "app 0.2.2-rc.5 / Electron 44.7.0"）。
+ *
+ * 三个来源，按可信度：
+ *   1) Windows：<root>/version（Electron 自己写的版本文件）；
+ *   2) 宿主进程内：process.versions.electron（插件就跑在 Electron 主进程里，最准）；
+ *   3) macOS：.app 里 Electron Framework 的 Info.plist（XML，取 CFBundleVersion）。
+ * 读不到返回空串 —— 调用方显示 '?'，不假装知道。
+ */
+let electronVersionCache = null
+export function readElectronVersion(appRoot) {
+  if (electronVersionCache !== null) return electronVersionCache
+  electronVersionCache = ''
+  if (appRoot) {
+    try {
+      const v = require$readFileSync(join(appRoot, 'version'), 'utf8').trim()
+      if (v) { electronVersionCache = v; return electronVersionCache }
+    } catch { /* 没有这个文件是常态（macOS / Linux） */ }
+  }
+  const inProcess = (() => { try { return String(process.versions.electron || '') } catch { return '' } })()
+  if (inProcess) { electronVersionCache = inProcess; return electronVersionCache }
+  if (IS_MAC && appRoot && appRoot.endsWith('.app')) {
+    const plist = join(appRoot, 'Contents', 'Frameworks', 'Electron Framework.framework',
+      'Versions', 'A', 'Resources', 'Info.plist')
+    try {
+      const xml = require$readFileSync(plist, 'utf8')
+      const m = /<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/.exec(xml)
+      if (m) electronVersionCache = m[1].trim()
+    } catch { /* 读不到就空 */ }
+  }
+  return electronVersionCache
+}
+
+/**
+ * 本机默认的同步仓库目录（面板输入框的占位符、自动探测的候选都用它）。
+ * 0.6.49 之前只有 Windows 语义（D:\dsh-config），macOS 用户看到占位符是盘符路径。
+ */
+export function defaultRepoPath() {
+  return IS_WIN ? 'D:\\dsh-config' : join(homedir(), 'dsh-config')
+}
+
+/**
+ * 仓库路径的合法性（按平台分档）。
+ *
+ * 为什么必须分档：macOS / Linux 上把 `D:\dsh-config` 当相对路径处理，
+ * mkdirSync 会在当前工作目录里真的建出一个名为 `D:\dsh-config` 的目录
+ * （0.6.47 实测：在项目根留下一个这样的空目录）。反过来 Windows 上
+ * 也不该接受 `/Users/x/dsh-config`。返回 { ok, reason }，调用方整批报错。
+ */
+export function repoPathProblem(p) {
+  const s = String(p == null ? '' : p).trim()
+  if (!s) return { ok: false, reason: 'empty' }
+  if (IS_WIN) {
+    const ok = /^[A-Za-z]:[\\/]/.test(s) || s.startsWith('\\\\')
+    return ok ? { ok: true, reason: '' } : { ok: false, reason: 'windows-absolute' }
+  }
+  if (/^[A-Za-z]:[\\/]/.test(s) || s.startsWith('\\\\')) return { ok: false, reason: 'windows-shape' }
+  if (!s.startsWith('/')) return { ok: false, reason: 'posix-absolute' }
+  return { ok: true, reason: '' }
+}
+
+/**
+ * 自动化开关 / 退出后执行的执行体在哪个平台上有实现。
+ * Windows 走 PowerShell 脚本；macOS / Linux 走 Node 脚本（post-exit.mjs）。
+ */
+export function postExitScriptName() {
+  return IS_WIN ? 'post-exit.ps1' : 'post-exit.mjs'
 }
 
 /**
@@ -197,6 +343,53 @@ export function clientProcessNames() {
   if (IS_WIN) return ['DeepSeek Harness', 'deepseek harness']
   if (IS_MAC) return ['DeepSeek Harness', 'DeepSeekHarness']
   return ['dsh', 'deepseek-harness', 'DeepSeek Harness']
+}
+
+/**
+ * 这行 `ps` 输出是不是「客户端本体」进程。
+ *
+ * 为什么不能按进程名模糊匹配（0.6.49 实测踩到）：powershell/pgrep 用
+ * `-f "DeepSeek Harness"` 去匹配整条命令行时，**我们自己的等待进程**命令行里就带着
+ * `/Applications/DeepSeek Harness.app/Contents/Resources/runtime/.../node post-exit.mjs` ——
+ * 于是它永远认为自己要等的客户端还在跑，等到超时也不会动手；`pkill -f` 更糟，会把自己杀掉。
+ *
+ * 判据因此收紧到「客户端可执行文件本身的路径」：.app 里是 Contents/MacOS/<name>，
+ * 而 Node 运行时在 Contents/Resources 下，两者不会互相误伤。
+ */
+export function looksLikeClientProcess(cmdline, appRoot, selfPid = 0) {
+  const cmd = String(cmdline || '')
+  if (!cmd) return false
+  const exe = clientExecutable(appRoot)
+  if (exe && cmd.includes(exe)) return true
+  if (exe) return false
+  // 拿不到可执行文件（appRoot 没定位到）时退回保守判据：带客户端名，但排除我们自己的
+  // Node 执行体（post-exit / install-plugin / 宿主 runtime 里的 node）
+  if (!/DeepSeek Harness/.test(cmd)) return false
+  if (/post-exit\.mjs|install-plugin\.mjs|\/Resources\/runtime\//.test(cmd)) return false
+  void selfPid
+  return true
+}
+
+/** 用 `ps` 列出当前匹配到的客户端进程 pid（不含自己）。找不到 ps 时返回 null。 */
+export function listClientProcesses(appRoot, selfPid = 0) {
+  const r = spawnSync('ps', ['-Ao', 'pid=,command='], { encoding: 'utf8', timeout: 8000 })
+  if (r.error || typeof r.stdout !== 'string') return null
+  const out = []
+  for (const line of r.stdout.split(/\r?\n/)) {
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line)
+    if (!m) continue
+    const pid = Number(m[1])
+    if (!pid || pid === selfPid) continue
+    if (looksLikeClientProcess(m[2], appRoot, selfPid)) out.push(pid)
+  }
+  return out
+}
+
+/** 命令行匹配用的客户端模式（给 .sh 脚本里的 pgrep 用，避开我们自己的 Node 进程）。 */
+export function clientProcessPattern(appRoot) {
+  const exe = clientExecutable(appRoot)
+  if (exe) return exe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return 'DeepSeek Harness\\.app/Contents/MacOS'
 }
 
 /** 宿主自带 bundle 的落点（解包版 / 打包版）。 */

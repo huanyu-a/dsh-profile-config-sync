@@ -2,23 +2,74 @@
  * 无 UI 环境下的宿主半身自检：
  *   node tools/selftest.mjs [repoPath]
  *
- * 用一个假 ctx 拉起 index.js 的 apply()，验证两件事：
- *   1. 两个路由都注册上了；
+ * 用一个假 ctx 拉起 index.js 的 apply()，验证：
+ *   1. 13 条路由都注册上了；
  *   2. GET /config-sync/status 返回合法 JSON（结构字段齐全）；
- *   3. POST /config-sync/prepare 能在仓库根生成 .cmd，且带进程检查与正确参数。
- * 不碰 DSH、不写 profile。
+ *   3. POST /config-sync/prepare 能在仓库根生成脚本，且带进程检查与正确参数。
+ *
+ * 0.6.49：**不再写用户的真实 ~/.dsh**。原来这个自检直接跑在真 DSH_HOME 上，
+ * 靠"先备份再还原"兜底 —— 一旦中途崩了，用户的 dsh-config-sync.json / scope /
+ * 冲突清单就留在测试值上（本机就踩过：scope 与设置被写成夹具内容）。
+ * 现在默认在临时目录里造一份隔离的 DSH_HOME + 仓库夹具；想连真机跑要显式传 --in-place。
+ * 平台相关断言按 process.platform 分支：Windows 生成 .cmd，POSIX 生成 .sh。
  */
+import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { apply } from '../index.js'
 
-const repoArg = process.argv[2] || 'D:\\dsh-config'
+const IS_WIN = process.platform === 'win32'
+const argv = process.argv.slice(2)
+const inPlace = argv.includes('--in-place')
+// 脚本后缀与文件名随平台（0.6.49：POSIX 生成 .sh，原来断言写死 .cmd，macOS 上必然失败）
+const SCRIPT_EXT = IS_WIN ? '.cmd' : '.sh'
+const FILE_NAME = {
+  push: `同步-推送${SCRIPT_EXT}`,
+  pull: `同步-拉取${SCRIPT_EXT}`,
+  restore: `同步-还原${SCRIPT_EXT}`,
+}
+
+// ---- 隔离环境：临时 DSH_HOME + 仓库夹具 ----
+// 不设 DSH_HOME 时（--in-place）才用真机目录；默认一律隔离。
+const sandbox = inPlace ? null : mkdtempSync(join(tmpdir(), 'cfg-sync-selftest-'))
+const dshHomeArg = sandbox ? join(sandbox, 'home') : (process.env.DSH_HOME || join(process.env.HOME || '', '.dsh'))
+if (sandbox) {
+  mkdirSync(dshHomeArg, { recursive: true })
+  process.env.DSH_HOME = dshHomeArg
+  // 造一份 profile 快照当夹具：status 的「备份快照地址」断言才有可验证的对象。
+  // 不造的话它在任何干净机器上都红 —— 而那并不是代码错，只是这台机器还没备份过。
+  const snap = join(dshHomeArg, 'backups', 'config-20260101-000000', 'profile')
+  mkdirSync(snap, { recursive: true })
+  writeFileSync(join(snap, 'package.json'),
+    JSON.stringify({ name: 'dsh-profile-desktop', version: '0.0.0', dsh: { profile: { bundles: [] } } }, null, 2), 'utf8')
+  writeFileSync(join(snap, 'cordis.patch.yml'), '# fixture\n', 'utf8')
+}
+
+const repoArg = argv.find((x) => !x.startsWith('--'))
+  || (sandbox ? join(sandbox, 'repo') : (IS_WIN ? 'D:\\dsh-config' : join(process.env.HOME || '', 'dsh-config')))
+if (sandbox) mkdirSync(repoArg, { recursive: true })
 const routes = new Map()
 
+// 自检会真的调用「保存云端仓库设置」，而保存另一个地址时会 git remote set-url —— 那是在改
+// 用户/夹具仓库的远端。先记下原值，最后原样还原（0.6.49：之前跑一次自检就把夹具仓库的
+// origin 改成了 example.invalid，后续 push 全部失败）。
+const originalOrigin = (() => {
+  const r = spawnSync('git', ['-C', repoArg, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 15000 })
+  return r.status === 0 ? String(r.stdout || '').trim() : ''
+})()
+const restoreOrigin = () => {
+  if (!originalOrigin) return
+  const cur = spawnSync('git', ['-C', repoArg, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 15000 })
+  const now = cur.status === 0 ? String(cur.stdout || '').trim() : ''
+  if (now !== originalOrigin) {
+    spawnSync('git', ['-C', repoArg, 'remote', 'set-url', 'origin', originalOrigin], { encoding: 'utf8', timeout: 15000 })
+    console.log(`  [i] 已把仓库 origin 还原成 ${originalOrigin}`)
+  }
+}
+
 // prepare 写的是仓库根固定文件名。若那里已经有给用户用的真文件，先记下内容，断言完原样还原。
-const FILE_NAME = { push: '同步-推送.cmd', pull: '同步-拉取.cmd', restore: '同步-还原.cmd' }
 const backup = new Map()
 for (const action of ['pull', 'push', 'restore']) {
   const file = join(repoArg, FILE_NAME[action])
@@ -132,46 +183,62 @@ for (const action of ['pull', 'push', 'restore']) {
     body: JSON.stringify({ action }),
   })
   const payload = JSON.parse(prepared.body || '{}')
-  check(`prepare(${action}) 返回 200 且 ok`, prepared.statusCode === 200 && payload.ok === true, prepared.body.slice(0, 160))
-  check(`prepare(${action}) 写出了 cmd`, existsSync(payload.path || ''), payload.path || '(无路径)')
-  check(`prepare(${action}) 的文件名是中文`, /[\\/][^\\/]*[\u4e00-\u9fa5][^\\/]*\.cmd$/.test(payload.path || ''), payload.path || '(无路径)')
+  check(`prepare(${action}) 返回 /sh OK 且 ok`.replace('/sh', SCRIPT_EXT), prepared.statusCode === 200 && payload.ok === true, prepared.body.slice(0, 160))
+  check(`prepare(${action}) 写出了脚本`, existsSync(payload.path || ''), payload.path || '(无路径)')
+  check(`prepare(${action}) 的文件名是中文`, new RegExp(`[\\\\/][^\\\\/]*[\u4e00-\u9fa5][^\\\\/]*\\${SCRIPT_EXT}$`).test(payload.path || ''), payload.path || '(无路径)')
   if (existsSync(payload.path || '')) {
     // prepare 会就地覆盖仓库根的 同步-推送/拉取/还原.cmd —— 那是给人用的真文件，
     // 自检只借用这条路径做断言，结束后必须还原成原样（没有过就删掉）。
     const text = readFileSync(payload.path, 'utf8')
-    check(`cmd 里带进程检查`, /DeepSeek Harness\.exe/.test(text))
+    check(`${SCRIPT_EXT} 里带进程检查`, IS_WIN ? /DeepSeek Harness\.exe/.test(text) : /pgrep|DeepSeek Harness/.test(text))
     // GIT_SSH_COMMAND 的第一个词必须是可执行程序/完整命令，绝不能以 -i 这种参数开头。
     // 踩过的坑：探测不到 ssh.exe 时拼出 `-i "key" -o …`，git 交给 sh 直接 invalid option。
     if (action !== 'restore' && /GIT_SSH_COMMAND=/.test(text)) {
-      const line = text.split('\r\n').find((l) => l.includes('GIT_SSH_COMMAND=')) || ''
+      const line = text.split(/\r?\n/).find((l) => l.includes('GIT_SSH_COMMAND=')) || ''
       const value = line.slice(line.indexOf('GIT_SSH_COMMAND=') + 'GIT_SSH_COMMAND='.length).trim()
       check(`GIT_SSH_COMMAND 以程序/命令开头（不是裸参数）`,
         !/^-/.test(value.replace(/^\s+/, '')),
         value.slice(0, 120))
     }
     if (action === 'restore') {
-      check('还原 cmd 先 DryRun 再确认再真跑', /-DryRun/.test(text) && /set \/p GO=/.test(text) && text.includes('restore.ps1'))
-      check('还原 cmd 里写着快照地址', Boolean(latestSnapshot) && text.includes(latestSnapshot), latestSnapshot || '(status 没给快照)')
-      check('还原 cmd 把 -BackupDir 明写出来', text.includes(`-BackupDir "${latestSnapshot}"`), latestSnapshot || '(无)')
+      if (IS_WIN) {
+        check('还原 cmd 先 DryRun 再确认再真跑', /-DryRun/.test(text) && /set \/p GO=/.test(text) && text.includes('restore.ps1'))
+        check('还原 cmd 里写着快照地址', Boolean(latestSnapshot) && text.includes(latestSnapshot), latestSnapshot || '(status 没给快照)')
+        check('还原 cmd 把 -BackupDir 明写出来', text.includes(`-BackupDir "${latestSnapshot}"`), latestSnapshot || '(无)')
+      } else {
+        check('还原 sh 先 dry-run 再确认再真跑', /--[Dd]ry[Rr]un|dryRun|DryRun/.test(text) && /read -r/.test(text) && /sync-engine\.mjs/.test(text), text.slice(0, 200))
+        check('还原 sh 里写着快照地址', Boolean(latestSnapshot) && text.includes(latestSnapshot), latestSnapshot || '(status 没给快照)')
+        check('还原 sh 把 -BackupDir 明写出来', text.includes(`-BackupDir '${latestSnapshot}'`) || text.includes(`-BackupDir "${latestSnapshot}"`), latestSnapshot || '(无)')
+      }
       check('prepare(restore) 响应里带快照字段', Boolean(payload.backup && payload.backup.dir), JSON.stringify(payload.backup || null))
     } else {
-      check(`cmd 里调的是 sync.ps1 ${action}`, new RegExp(`sync\\.ps1".*${action}`).test(text))
+      check(`脚本里调的是引擎 ${action}`, IS_WIN
+        ? new RegExp(`sync\\.ps1".*${action}`).test(text)
+        : new RegExp(`sync-engine\\.mjs"?.*${action}`).test(text), text.slice(0, 200))
       if (action === 'pull') {
         // pull 会覆盖本机配置，脚本必须在真跑之前要一次 y 确认
-        check('pull cmd 里有确认守卫（set /p GO=）', /set \/p GO=/.test(text))
-        check('pull cmd 说明"会覆盖本机配置"', text.includes('覆盖本机配置'))
-        check('prepare(pull) 返回 warnings（本机领先时提示别点错）',
-          Array.isArray(payload.warnings) && payload.warnings.length > 0,
+        check('pull 脚本里有确认守卫', IS_WIN ? /set \/p GO=/.test(text) : /read -r/.test(text))
+        check('pull 脚本说明"会覆盖本机配置"', text.includes('覆盖本机配置'))
+        // warnings 至少要有「拉取会覆盖本机配置」那条；「本机领先 N 个提交」只在真的领先时才该有
+        check('prepare(pull) 返回 warnings（提示拉取会覆盖本机配置）',
+          Array.isArray(payload.warnings) && payload.warnings.some((w) => /覆盖/.test(String(w))),
           JSON.stringify(payload.warnings || null))
-      } else {
-        check(`prepare(${action}) 不需要确认守卫`, !/set \/p GO=/.test(text))
+        if (Number(body.repo?.ahead) > 0) {
+          check('本机领先时 warnings 里点名「领先 N 个提交」',
+            (payload.warnings || []).some((w) => /领先/.test(String(w))),
+            JSON.stringify(payload.warnings || null))
+        } else {
+          console.log('  [SKIP] 本机领先的 warning — 当前仓库没有未推送提交（ahead=0）')
+        }
+            } else {
+        check(`prepare(${action}) 不需要确认守卫`, IS_WIN ? !/set \/p GO=/.test(text) : !/read -r/.test(text))
       }
       check(`prepare(${action}) 给了中文标签`, typeof payload.label === 'string' && /[\u4e00-\u9fa5]/.test(payload.label), payload.label || '(无)')
-      check(`${action} cmd 用中文写动作名`,
+      check(`${action} 脚本用中文写动作名`,
         text.includes(action === 'push' ? '推送' : '拉取'),
         action)
     }
-    check('cmd 用的是 CRLF', text.includes('\r\n'))
+    check(IS_WIN ? 'cmd 用的是 CRLF' : 'sh 用的是 LF', IS_WIN ? text.includes('\r\n') : !text.includes('\r\n'))
     restoreCmd(payload.path)
   }
 }
@@ -198,6 +265,12 @@ for (const b of (allPayload.built || [])) restoreCmd(b.path)
 } else {
   // 本机还没有仓库内容：prepare 的正确预期不是「必定写出脚本」，而是「按云端空不空分流」——
   // 云端也空 → 只生成推送（那次就是初始化推送）；云端有内容 → 拒绝推送、只放行拉取。
+  //
+  // 0.6.49：还有第三种真实状态 —— **云端根本探不到**（新机器没配地址、断网、凭据没配）。
+  // 那时 prepare 会明确报「连不上云端仓库」，不是代码错。旧断言把它当成「云端有内容」，
+  // 于是任何一台刚装好、还没配远端的机器跑自检都必然红一片。这里单独分出来。
+  // 没配远端 / 探不到：remote.configured=false，或 remoteHeads 为 null
+  const cloudUnknown = body.remote?.configured !== true || body.repo?.remoteHeads == null
   const cloudEmpty = body.repo?.remoteEmpty === true
   const pPush = await call('/config-sync/prepare', {
     method: 'POST',
@@ -207,10 +280,14 @@ for (const b of (allPayload.built || [])) restoreCmd(b.path)
   const pushPayload = JSON.parse(pPush.body || '{}')
   if (cloudEmpty) {
     check('两边都空：prepare(push) 放行（走初始化推送）', pPush.statusCode === 200 && pushPayload.ok === true, pPush.body.slice(0, 160))
-    check('两边都空：生成的推送 cmd 带初始化提示',
-      existsSync(pushPayload.path || '') && readFileSync(pushPayload.path, 'utf8').includes('sync.ps1'),
+    check('两边都空：生成的推送脚本带初始化提示',
+      existsSync(pushPayload.path || '') && readFileSync(pushPayload.path, 'utf8').match(IS_WIN ? /sync\.ps1/ : /sync-engine\.mjs/),
       pushPayload.path || '(无路径)')
     if (existsSync(pushPayload.path || '')) restoreCmd(pushPayload.path)
+  } else if (cloudUnknown) {
+    check('云端探不到时：prepare(push) 明确报「连不上云端」而不是放行',
+      pPush.statusCode === 400 && /连不上云端/.test(pushPayload.error || ''),
+      pPush.body.slice(0, 160))
   } else {
     check('云端有内容：prepare(push) 被拒，并指向「先拉取」',
       pPush.statusCode === 400 && /云端仓库已经有内容/.test(pushPayload.error || ''),
@@ -222,15 +299,20 @@ for (const b of (allPayload.built || [])) restoreCmd(b.path)
     body: JSON.stringify({ action: 'pull' }),
   })
   const pullPayload = JSON.parse(pPull.body || '{}')
-  if (cloudEmpty) {
+  if (cloudUnknown) {
+    check('云端探不到时：prepare(pull) 明确报「连不上云端」而不是生成脚本',
+      pPull.statusCode === 400 && /连不上云端/.test(pullPayload.error || ''),
+      pPull.body.slice(0, 160))
+  } else if (cloudEmpty) {
     check('两边都空：prepare(pull) 被拒（没有东西可拉）',
       pPull.statusCode === 400 && /连不上云端|云端仓库已经有内容|空/.test(pullPayload.error || ''),
       pPull.body.slice(0, 160))
   } else {
     check('云端有内容：prepare(pull) 放行', pPull.statusCode === 200 && pullPayload.ok === true, pPull.body.slice(0, 160))
     if (existsSync(pullPayload.path || '')) {
-      check('pull cmd 里有确认守卫（set /p GO=）', /set \/p GO=/.test(readFileSync(pullPayload.path, 'utf8')))
-      check('cmd 用的是 CRLF', readFileSync(pullPayload.path, 'utf8').includes('\r\n'))
+      const pullText = readFileSync(pullPayload.path, 'utf8')
+      check('pull 脚本里有确认守卫', IS_WIN ? /set \/p GO=/.test(pullText) : /read -r/.test(pullText))
+      check(IS_WIN ? 'cmd 用的是 CRLF' : 'sh 用的是 LF', IS_WIN ? pullText.includes('\r\n') : !pullText.includes('\r\n'))
       restoreCmd(pullPayload.path)
     }
   }
@@ -241,13 +323,21 @@ for (const b of (allPayload.built || [])) restoreCmd(b.path)
   })
   const allP = JSON.parse(pAll.body || '{}')
   const acts = (allP.built || []).map((b) => b.action)
-  check('prepare(all) 按状态组合脚本（两边空→推送+还原；否则→拉取+还原）',
-    pAll.statusCode === 200
-    && (cloudEmpty ? acts.includes('push') && !acts.includes('pull') : acts.includes('pull') && !acts.includes('push')),
-    JSON.stringify(acts))
-  check('prepare(all) 带上 initPush 标记（面板据此显示「初始化推送」）',
-    Boolean(allP.bootstrap) && allP.bootstrap.initPush === cloudEmpty,
-    JSON.stringify(allP.bootstrap && { initPush: allP.bootstrap.initPush }))
+  if (cloudUnknown) {
+    check('云端探不到时：prepare(all) 明确拒绝并说清原因',
+      pAll.statusCode === 400 && /连不上云端|还没有配置云端仓库地址/.test(allP.error || ''),
+      pAll.body.slice(0, 160))
+  } else {
+    check('prepare(all) 按状态组合脚本（两边空→推送+还原；否则→拉取+还原）',
+      pAll.statusCode === 200
+      && (cloudEmpty ? acts.includes('push') && !acts.includes('pull') : acts.includes('pull') && !acts.includes('push')),
+      JSON.stringify(acts))
+  }
+  if (!cloudUnknown) {
+    check('prepare(all) 带上 initPush 标记（面板据此显示「初始化推送」）',
+      Boolean(allP.bootstrap) && allP.bootstrap.initPush === cloudEmpty,
+      JSON.stringify(allP.bootstrap && { initPush: allP.bootstrap.initPush }))
+  }
   for (const b of (allP.built || [])) restoreCmd(b.path)
 }
 
@@ -284,16 +374,27 @@ const putSettings = (payload) => call('/config-sync/settings', {
 const badUrl = await putSettings({ remoteUrl: 'ftp://x/y', sshKey: body.remote.sshKey })
 check('非法远端地址被拒（400）', badUrl.statusCode === 400, String(badUrl.statusCode))
 
-// 不存在的私钥
-const badKey = await putSettings({ remoteUrl: body.remote.url, sshKey: 'C:\\nope\\no.key' })
+// 不存在的私钥（路径用本平台的写法，否则测的是「路径形状」而不是「文件不存在」）
+const badKey = await putSettings({ remoteUrl: body.remote.url, sshKey: IS_WIN ? 'C:\\nope\\no.key' : '/nope/no.key' })
 check('不存在的私钥被拒（400）', badKey.statusCode === 400, String(badKey.statusCode))
 
 // 合法保存：沿用当前地址（若当前走 WebDAV 没设 remoteUrl，则借用合法占位 URL），不会触发 git remote set-url
-const testRemoteUrl = body.remote.url || 'https://example.invalid/dsh-config.git'
+//
+// 注意：验证器只认 git@host:path / ssh:// / https:// 三种写法。仓库若挂的是本地裸库
+// （file:// 或 /path/to/bare.git，自检夹具就是这么造的），沿用它会 400 —— 那是校验在工作，
+// 不是保存坏了。这种情况改用占位 URL 继续验证「保存 + 落盘」这条链路。
+const SUPPORTED_URL = /^(git@[^:]+:.+|ssh:\/\/.+|https:\/\/.+)$/
+const currentUrlUsable = SUPPORTED_URL.test(String(body.remote.url || ''))
+const testRemoteUrl = currentUrlUsable ? body.remote.url : 'https://example.invalid/dsh-config.git'
 const okSave = await putSettings({ remoteUrl: testRemoteUrl, sshKey: body.remote.sshKey })
 const okPayload = JSON.parse(okSave.body || '{}')
 check('合法设置保存成功', okSave.statusCode === 200 && okPayload.ok === true, okSave.body.slice(0, 160))
-check('保存后不回写非当前地址（gitRemoteSet=false，自检不动仓库）', okPayload.gitRemoteSet === false, String(okPayload.gitRemoteSet))
+// 只有「存的就是当前地址」时才该 gitRemoteSet=false；存了另一个地址本来就要 set-url
+if (currentUrlUsable) {
+  check('保存后不回写非当前地址（gitRemoteSet=false，自检不动仓库）', okPayload.gitRemoteSet === false, String(okPayload.gitRemoteSet))
+} else {
+  check('存另一个地址时会改写 git remote（并把结果如实报出）', typeof okPayload.gitRemoteSet === 'boolean', String(okPayload.gitRemoteSet))
+}
 check('保存后设置文件落盘', existsSync(settingsFile), settingsFile)
 check('设置文件含 remoteUrl 字段', existsSync(settingsFile) && readFileSync(settingsFile, 'utf8').includes('remoteUrl'))
 
@@ -358,9 +459,25 @@ else writeFileSync(settingsFile, prevSettings, 'utf8')
 check('status 带回仓库路径来源', Boolean(body.repo && ['settings', 'config', 'env', 'auto', 'none'].includes(body.repo.source)), body.repo && body.repo.source)
 check('status 说得出仓库是否已配置', Boolean(body.repo) && typeof body.repo.configured === 'boolean', String(body.repo && body.repo.configured))
 
-const badRepo = await putSettings({ repoPath: 'C:\\nope\\not-a-repo' })
+// 0.6.49：路径用例必须按平台取。原来写死 'C:\\nope\\not-a-repo'，在 macOS 上
+// 现在会被 repoPathProblem 明确判成「Windows 盘符形状」而拒（这是修好的行为，不是回归），
+// 旧断言却要求 200 —— 一条断言同时测了两件相反的事。
+const badRepoPath = IS_WIN ? 'C:\\nope\\not-a-repo' : '/nope/not-a-repo'
+const badRepo = await putSettings({ repoPath: badRepoPath })
 // 新机器上仓库还没克隆时，这个路径本来就不存在 —— 允许保存（等着首次拉取去克隆），不再当错误拦。
-check('不存在的仓库路径可以保存（待克隆目标）', badRepo.statusCode === 200, String(badRepo.statusCode))
+check('不存在的仓库路径可以保存（待克隆目标）', badRepo.statusCode === 200, `${badRepoPath} → ${badRepo.statusCode} ${badRepo.body.slice(0, 120)}`)
+
+// 平台形状不对的路径必须当场拒（本项目真实踩过：POSIX 上存了 D:\\dsh-config，
+// mkdir 在工作目录里建出一个同名目录，同步目标从此错位）
+{
+  const wrongShape = IS_WIN ? '/Users/x/dsh-config' : 'D:\\dsh-config'
+  const r = await putSettings({ repoPath: wrongShape })
+  check(`跨平台形状的路径被拒（${IS_WIN ? '/posix' : 'D:\\ 盘符'}）`,
+    r.statusCode === 400 && /绝对路径|盘符/.test(JSON.parse(r.body || '{}').error || ''),
+    `${wrongShape} → ${r.statusCode} ${r.body.slice(0, 140)}`)
+  const r2 = await putSettings({ repoPath: IS_WIN ? 'relative\\dsh-config' : 'relative/dsh-config' })
+  check('相对路径被拒', r2.statusCode === 400, `${r2.statusCode} ${r2.body.slice(0, 140)}`)
+}
 
 // 「像仓库的子目录」（有内容但不是仓库）必须被拒；仓库为空时那个子目录可能压根不存在，
 // 不存在的路径按设计允许保存（等首次拉取去建），这时只做 SKIP，不当失败。
@@ -664,10 +781,22 @@ if (prevScope === null) { try { unlinkSync(scopeFile) } catch { } } else writeFi
   // version.json 的年代。用户明确要求「插件更新只检查 npm，不检查 GitHub」，所以整条线退休：
   // 更新检查读 npm 的 dist-tags + 单版本文档，校验值取 registry 自己的 dist.integrity / dist.shasum。
   const indexSrc = readFileSync(join(pluginRoot, 'index.js'), 'utf8')
+  // 负向断言只看**代码**：这些名字经常在注释里被提到（"原来叫 UPDATE_MANIFEST_MIRRORS，已删"），
+  // 直接 includes() 会把「解释为什么删掉」判成「还在用」。
+  const stripComments = (src) => String(src)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join('\n')
+  const indexCode = stripComments(indexSrc)
+  // 0.6.49：地址不再是一个写死的常量（NPM_DIST_TAGS_URL），而是 npmUrls(registry) 现算 ——
+  // 断言跟着改成「有 npmUrls + distTags + registry 可换」，否则它会永远判红，
+  // 让人以为「只查 npm」这条策略失效了。
   check('更新检查只查 npm（dist-tags + 单版本文档），不再读 GitHub 清单',
-    indexSrc.includes('NPM_DIST_TAGS_URL') && indexSrc.includes('async function fetchNpmLatest') &&
-    !indexSrc.includes('async function fetchManifestAuto') && !indexSrc.includes('UPDATE_MANIFEST_MIRRORS') &&
-    !indexSrc.includes('gh-proxy.com') && !indexSrc.includes('raw.githubusercontent.com/' + 'huanyu-a'),
+    indexCode.includes('function npmUrls(') && indexCode.includes('distTags:') &&
+    indexCode.includes('async function fetchNpmLatest') &&
+    !indexCode.includes('async function fetchManifestAuto') && !indexCode.includes('UPDATE_MANIFEST_MIRRORS') &&
+    !indexCode.includes('gh-proxy.com') && !indexCode.includes('raw.githubusercontent.com/' + 'huanyu-a'),
     'index.js')
   check('更新校验用 registry 的 integrity / shasum（与被校验物同源）',
     indexSrc.includes('function verifyDownloadedPackage') && indexSrc.includes('dist.integrity') &&
@@ -966,7 +1095,7 @@ if (repoReady) {
 } else {
   // 仓库还没内容、云端已有内容时，带说明的 push 同样该被拒；说明字段的清洗逻辑用静态断言兜住
   check('本机无内容时：带说明的 push 仍被拒（不被说明字段绕过门禁）',
-    noted.statusCode === 400 && /云端仓库已经有内容/.test(notedPayload.error || ''),
+    noted.statusCode === 400 && /云端仓库已经有内容|连不上云端/.test(notedPayload.error || ''),
     noted.body.slice(0, 160))
   check('提交说明清洗在源码里（去双引号）',
     /\$\{.*message.*\}/.test(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'index.js'), 'utf8'))
@@ -2289,5 +2418,134 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
   && /function readBody\(req, maxBytes = 64 \* 1024\)/.test(idxSrc),
   'index.js 的 body 上限没放宽')
 }
+// --- #10 平台层（0.6.49 macOS 支持）---
+// 这一组是这次 macOS 适配的回归护栏。每条都对应一个真实踩过的坑：
+//   - isAppRoot 只认 <root>/resources，于是 macOS 上 AppRoot 恒为空 → 面板「定位不到客户端根目录」；
+//   - 版本/Electron 版本写死 <root>/resources 与 <root>/version，macOS 上恒为空；
+//   - 仓库路径候选只有 Windows 盘符，macOS 上自动探测永远失败；
+//   - 执行体只找 post-exit.ps1 / install-plugin.ps1，macOS 上退出后同步与自更新整条链路死掉。
+{
+  const repoRootOfTools = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const pf = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'platform.mjs')).href)
+  const appRoot = pf.appRootCandidates().find((c) => pf.isAppRoot(c)) || ''
+  check('平台识别（IS_WIN / IS_MAC 与 process.platform 一致）',
+    pf.IS_WIN === IS_WIN && pf.IS_MAC === (process.platform === 'darwin'),
+    `IS_WIN=${pf.IS_WIN} IS_MAC=${pf.IS_MAC} platform=${process.platform}`)
+  if (appRoot) {
+    check('能定位客户端根（isAppRoot 认得出）', pf.isAppRoot(appRoot), appRoot)
+    const layout = pf.appRootLayout(appRoot)
+    check('resources 目录随平台归一（macOS 在 Contents/Resources）',
+      Boolean(layout.resources) && existsSync(layout.resources), layout.resources)
+    check('能读到客户端 app 版本', Boolean(pf.readAppVersion(appRoot)), pf.readAppVersion(appRoot) || '(空)')
+    check('能读到 Electron 版本', Boolean(pf.readElectronVersion(appRoot)), pf.readElectronVersion(appRoot) || '(空)')
+    check('app.asar 路径落在归一后的 resources 下',
+      Boolean(pf.asarPath(appRoot)) && pf.asarPath(appRoot).startsWith(layout.resources), pf.asarPath(appRoot))
+  } else {
+    console.log('  [SKIP] 客户端根相关断言 — 这台机器上找不到已安装的客户端（appRootCandidates 全不匹配）')
+  }
+  const defRepo = pf.defaultRepoPath()
+  check('默认仓库路径是当前平台的绝对路径',
+    defRepo.startsWith(IS_WIN ? '' : '/') && (IS_WIN ? /^[A-Za-z]:\\/.test(defRepo) : !/^[A-Za-z]:/.test(defRepo)),
+    defRepo)
+  // 形状校验：本平台该拒的必须拒、该放的必须放
+  const wrong = IS_WIN ? '/Users/x/dsh-config' : 'D:\\dsh-config'
+  check('跨平台形状的路径被 repoPathProblem 拒掉',
+    pf.repoPathProblem(wrong).ok === false, JSON.stringify(pf.repoPathProblem(wrong)))
+  check('本平台的合法绝对路径被 repoPathProblem 放行',
+    pf.repoPathProblem(defRepo).ok === true, JSON.stringify(pf.repoPathProblem(defRepo)))
+  check('相对路径被 repoPathProblem 拒掉',
+    pf.repoPathProblem(IS_WIN ? 'dsh-config' : 'dsh-config').ok === false)
+  // 执行体：两个平台各有一套，缺一个就等于该平台的自动同步/自更新全程失效
+  const runtimeDir = join(repoRootOfTools, 'runtime')
+  check('退出后执行体名随平台', pf.postExitScriptName() === (IS_WIN ? 'post-exit.ps1' : 'post-exit.mjs'), pf.postExitScriptName())
+  check('当前平台的退出后执行体在包里', existsSync(join(runtimeDir, pf.postExitScriptName())), pf.postExitScriptName())
+  if (!IS_WIN) {
+    check('POSIX 自带插件安装器（install-plugin.mjs）', existsSync(join(runtimeDir, 'install-plugin.mjs')))
+    // post-exit.mjs 的参数校验：-Mode 不合法必须当场退出 2，不去等客户端
+    const probe = spawnSync(process.execPath, [join(runtimeDir, 'post-exit.mjs'), '-Mode', 'bogus'], { encoding: 'utf8', timeout: 8000 })
+    check('post-exit.mjs 拒绝非法 -Mode（退出码 2）', probe.status === 2, `status=${probe.status} ${String(probe.stderr || '').slice(0, 120)}`)
+  }
+  // 进程判据：踩过的坑 —— 按进程名模糊匹配会命中我们自己的 Node 执行体
+  // （命令行里带着 /Applications/DeepSeek Harness.app/Contents/Resources/.../node post-exit.mjs），
+  // 于是「客户端已退出」永远判成「还在运行」，退出后同步一直等到超时；pkill 更会自杀。
+  const fakeNodeLine = join(appRoot || '/Applications/DeepSeek Harness.app', 'Contents', 'Resources', 'runtime',
+    'primary-runtime', 'dependencies', 'node', 'bin', 'node') + ' post-exit.mjs -Mode push'
+  check('进程判据：客户端本体命令行算「在运行」',
+    pf.looksLikeClientProcess(pf.clientExecutable(appRoot) || '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness', appRoot) === true)
+  check('进程判据：自己的 Node 执行体不算「客户端在运行」',
+    pf.looksLikeClientProcess(fakeNodeLine, appRoot) === false, fakeNodeLine)
+  check('进程判据：能列出当前客户端进程（数组或 null）',
+    Array.isArray(pf.listClientProcesses(appRoot, process.pid)) || pf.listClientProcesses(appRoot, process.pid) === null)
+  check('pgrep 用的模式里带可执行文件路径（不是光秃秃的进程名）',
+    /Contents.*MacOS|DeepSeek Harness/.test(pf.clientProcessPattern(appRoot)), pf.clientProcessPattern(appRoot))
+
+  // 私钥判据必须两处共用同一份正则（webdav 上传侧 + capture 侧），否则一边加了
+  // id_ed25519、另一边照旧放行 —— 用户把 ~/.ssh 加进额外路径就会漏传私钥。
+  const engineSrc = readFileSync(join(runtimeDir, 'sync-engine.mjs'), 'utf8')
+  const webdavSrc = readFileSync(join(runtimeDir, 'webdav.mjs'), 'utf8')
+  check('私钥判据：webdav.mjs 导出 SSH_KEY_NAME_RE / PRIVATE_KEY_BODY_RE',
+    /export const SSH_KEY_NAME_RE/.test(webdavSrc) && /export const PRIVATE_KEY_BODY_RE/.test(webdavSrc))
+  check('私钥判据：sync-engine 引用同一份正则（不是各写一份）',
+    /SSH_KEY_NAME_RE/.test(engineSrc) && /PRIVATE_KEY_BODY_RE/.test(engineSrc)
+    && /from '\.\/webdav\.mjs'/.test(engineSrc))
+  check('WebDAV 通道自检存在（tools/webdav-selftest.mjs，离线、可被 CI 跑）',
+    existsSync(join(repoRootOfTools, 'tools', 'webdav-selftest.mjs')))
+
+  // POSIX 自更新链路的参数名必须是安装器那套（-TgzFile / -TgzUrls）。
+  // 实测踩过：post-exit.mjs 把自己的 -UpdateTgz 直接转给安装器，安装器不认 → 更新永远
+  // 报「没有可用的下载地址」，而面板显示「正在安装」。
+  const postExitSrc = readFileSync(join(runtimeDir, 'post-exit.mjs'), 'utf8')
+  check('post-exit 传给安装器的是 -TgzFile（不是它自己的 -UpdateTgz）',
+    postExitSrc.includes("'-TgzFile'") && !/-TgzFile'?,\s*updateTgz/.test(''), 'post-exit.mjs')
+  check('安装器同时接受 -TgzFile 与 -TgzUrls',
+    readFileSync(join(runtimeDir, 'install-plugin.mjs'), 'utf8').includes("a.TgzFile")
+    && readFileSync(join(runtimeDir, 'install-plugin.mjs'), 'utf8').includes("a.TgzUrls"))
+  // 执行体优先级：插件自带优先（旧顺序把仓库那份老引擎排前面，新参数会被当未知参数忽略）
+  check('post-exit 优先用插件自带引擎', postExitSrc.indexOf("join(SELF_DIR, 'sync-engine.mjs')") < postExitSrc.indexOf("repoRoot ? join(repoRoot, 'sync-engine.mjs')"))
+
+  // 真跑一次安装器（只在本机能 tar 打包时）：正确 sha256 装成功、错误 sha256 拒绝且不动目标
+  const tarOk = spawnSync('tar', ['--version'], { encoding: 'utf8' }).status === 0
+    || spawnSync('tar', ['-h'], { encoding: 'utf8' }).status === 0
+  if (!IS_WIN && tarOk) {
+    const stage = mkdtempSync(join(tmpdir(), 'cfg-sync-pkg-'))
+    const pkg = join(stage, 'package')
+    mkdirSync(pkg, { recursive: true })
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'dsh-profile-config-sync', version: '9.9.9' }), 'utf8')
+    writeFileSync(join(pkg, 'index.js'), 'export function apply() {}\n', 'utf8')
+    const tgz = join(stage, 'pkg.tgz')
+    const packed = spawnSync('tar', ['-czf', tgz, '-C', stage, 'package'], { encoding: 'utf8' })
+    const target = join(stage, 'plugin')
+    mkdirSync(target, { recursive: true })
+    writeFileSync(join(target, 'old.txt'), 'keep', 'utf8')
+    const home9 = join(stage, 'home')
+    const runInstaller = (extra) => {
+      const r = spawnSync(process.execPath, [
+        join(runtimeDir, 'install-plugin.mjs'), '-PluginDir', target, '-Version', '9.9.9',
+        '-TgzFile', tgz, '-DshHome', home9, ...extra,
+      ], { encoding: 'utf8', timeout: 60000 })
+      const line = String(r.stdout || '').split(/\r?\n/).filter((l) => l.startsWith('RESULT:')).pop()
+      try { return JSON.parse(String(line).slice('RESULT:'.length)) } catch { return { ok: false, error: String(r.stderr || '').slice(0, 200) } }
+    }
+    const good = runInstaller([])
+    check('安装器：不带校验值也能装上（本地包）', good.ok === true, JSON.stringify(good))
+    check('安装器：覆盖后旧文件被清掉（不留旧版本残留）', !existsSync(join(target, 'old.txt')))
+    // 换回一个旧文件，再用错误 sha256 试：必须拒绝且目标目录原样
+    writeFileSync(join(target, 'marker.txt'), 'keep', 'utf8')
+    const bad = runInstaller(['-Sha256', 'deadbeef'])
+    check('安装器：sha256 不匹配时拒绝安装', bad.ok === false && /sha256 不匹配/.test(bad.error || ''), JSON.stringify(bad))
+    check('安装器：拒绝时目标目录没被动过', existsSync(join(target, 'marker.txt')))
+    rmSync(stage, { recursive: true, force: true })
+  } else {
+    console.log('  [SKIP] 安装器真跑夹具 — 这台机器没有可用的 tar（或 Windows）')
+  }
+
+  // 面板/宿主文案里不该再出现 macOS 上跑不通的 .ps1 硬编码
+  const idxSrc2 = readFileSync(join(repoRootOfTools, 'index.js'), 'utf8')
+  check('宿主不再无条件调 powershell 生成执行体（按平台分支）',
+    idxSrc2.includes('postExitScriptName()') && idxSrc2.includes("if (!IS_WIN)"),
+    'index.js 缺少平台分支')
+}
+
+try { restoreOrigin() } catch { /* 还原失败不该改变自检结论 */ }
 process.exit(failures === 0 ? 0 : 1)
 

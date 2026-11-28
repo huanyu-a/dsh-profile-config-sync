@@ -70,6 +70,11 @@ window.__ModuleLoader__.load({
       return true
     }
     const M = (zh, en) => (langIsZh() ? zh : en)
+    // 0.6.49：本机是不是 Windows 形状（status.platform.local.isWindows）。
+    // 面板里凡是「路径示例 / 脚本后缀」都该按它切，别再一律写 D:\ 与 .cmd。
+    const isWindowsLike = (data) => Boolean(
+      data && data.platform && data.platform.local && data.platform.local.isWindows,
+    )
     const localeNow = () => (langIsZh() ? 'zh-CN' : 'en-US')
     const langHeaders = () => ({ 'accept-language': langIsZh() ? 'zh-CN,zh;q=0.9' : 'en-US,en;q=0.9' })
 
@@ -760,14 +765,19 @@ window.__ModuleLoader__.load({
         setGitKey(currentGitKey)
       }, [editing, currentMode, currentWdUrl, currentWdUser, currentWdDir, currentWdUa, currentGitUrl, currentGitKey])
 
-      const activeMode = editing ? mode : currentMode
       const wdConfigured = Boolean(st.configured || st.url)
       const gitConfigured = Boolean(remote.configured || remote.url)
+      // 0.6.49 修复（用户实测）：卡片在「什么云端都还没配」时会**强制**进入编辑态，
+      // 但那时 editing 仍是 false。原来 activeMode 取 `editing ? mode : currentMode`，
+      // 于是选了 WebDAV 之后字段不跟着切 —— 显示的还是 Git 那套（远端地址 / SSH 私钥），
+      // 保存时校验按 webdav 走，报「请填写 WebDAV 地址」，用户根本填不到那个框。
+      // 现在由 isEditing 决定，强制编辑态也跟随下拉框。
+      const isEditing = editing || (!wdConfigured && !gitConfigured && Boolean(props.data))
+      const activeMode = isEditing ? mode : currentMode
       const missing = Boolean(props.data) && (
         activeMode === 'webdav' ? !wdConfigured
           : (activeMode === 'git' ? !gitConfigured : (!wdConfigured && !gitConfigured))
       )
-      const isEditing = editing || (!wdConfigured && !gitConfigured && Boolean(props.data))
 
       const sourceLabel = (s) => s === 'settings' ? M('本机设置', 'Machine settings')
         : (s === 'git' ? M('git 配置', 'git config')
@@ -810,11 +820,17 @@ window.__ModuleLoader__.load({
           }
           await callWebdav({ action: 'save', url: wdUrl, user: wdUser, dir: wdDir, mode, pass: wdPass, userAgent: wdUa })
           let gitSet = false
-          const gitDirty = gitUrl.trim() !== currentGitUrl.trim() || gitKey.trim() !== currentGitKey.trim()
+          // 0.6.49 修复：选了 WebDAV 就不该再动 git 设置。原来这里不看模式，
+          // 用户在「远端地址」里先前填过的 DAV 地址会被当成 git 远端存下去，
+          // 随后 git remote set-url 失败、整套回滚，报一个跟 WebDAV 毫无关系的错。
+          const gitDirty = mode !== 'webdav'
+            && (gitUrl.trim() !== currentGitUrl.trim() || gitKey.trim() !== currentGitKey.trim())
           if (gitDirty && (gitUrl.trim() || currentGitUrl.trim() || gitKey.trim() || currentGitKey.trim())) {
             const r = await callSettings({ remoteUrl: gitUrl, sshKey: gitKey })
             gitSet = Boolean(r && r.gitRemoteSet)
           }
+          // 注意：这里**不清空** Git 那两格的本地 state —— 用户可能只是临时切到 WebDAV，
+          // 清掉会让「再切回 Git」时私钥路径凭空消失（磁盘上的值还在，但看起来像丢了）。
           setEditing(false); setWdPass('')
           setMsg(M(
             `已保存${gitSet ? '，并已更新本机 git origin' : ''}`,
@@ -1138,7 +1154,11 @@ window.__ModuleLoader__.load({
         isEditing
           ? h('input', {
             type: 'text', style: S.input, value: path, spellCheck: false,
-            placeholder: M('D:\\dsh-config（那台机器上装仓库的目录）', 'D:\\dsh-config (directory holding the repo on this machine)'),
+            // 0.6.49：占位符随平台走 —— 原来一律是 D:\dsh-config，
+            // macOS 用户照着填会在本机建出一个叫 `D:\dsh-config` 的目录（实测踩过）。
+            placeholder: isWindowsLike(props.data)
+              ? M('D:\\dsh-config（那台机器上装仓库的目录）', 'D:\\dsh-config (directory holding the repo on this machine)')
+              : M('/Users/你/dsh-config（那台机器上装仓库的目录）', '/Users/you/dsh-config (directory holding the repo on this machine)'),
             onChange: (e) => setPath(e.target.value),
           })
           : h('div', { style: { ...S.kvVal, fontFamily: 'Consolas, ui-monospace, monospace' } }, repo.path || M('（未配置）', '(not set)')),
@@ -1201,8 +1221,8 @@ window.__ModuleLoader__.load({
               ))
           : null,
         h('div', { style: S.footnote }, M(
-          '路径只存本机设置文件（~\\.dsh\\dsh-config-sync.json），不进仓库，各机器各配各的。',
-          'The path lives only in the local settings file (~\\.dsh\\dsh-config-sync.json), never in the repo.',
+          '路径只存本机设置文件（~/.dsh/dsh-config-sync.json），不进仓库，各机器各配各的。',
+          'The path lives only in the local settings file (~/.dsh/dsh-config-sync.json), never in the repo.',
         )),
         forced
           ? h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-error-primary)' } },
@@ -2555,8 +2575,9 @@ window.__ModuleLoader__.load({
           : null,
         !auto.script
           ? h('div', { style: { ...S.hint, color: 'var(--dsw-alias-state-warn-primary)' } },
-            M('找不到 post-exit.ps1：自动同步排不了队，重装插件即可',
-              'post-exit.ps1 is missing from both the plugin and the repo, so auto sync cannot queue — reinstall the plugin (the current package ships runtime/)'))
+            // 0.6.49：执行体名随平台（Windows post-exit.ps1 / macOS、Linux post-exit.mjs）
+            M(`找不到 ${isWindowsLike(data) ? 'post-exit.ps1' : 'post-exit.mjs'}：自动同步排不了队，重装插件即可`,
+              `${isWindowsLike(data) ? 'post-exit.ps1' : 'post-exit.mjs'} is missing from both the plugin and the repo, so auto sync cannot queue — reinstall the plugin (the current package ships runtime/)`))
           : null,
         h('div', { style: S.actions },
           h('button', {

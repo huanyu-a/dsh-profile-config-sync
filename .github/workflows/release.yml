@@ -103,6 +103,12 @@ jobs:
       - name: Check the client bundle
         run: node tools/clientcheck.mjs
 
+      # 0.6.49: the WebDAV channel is a first-class path on macOS/NAS setups.
+      # The check is fully offline (it starts a throwaway DAV server on 127.0.0.1),
+      # so it belongs in the same gate as the other two.
+      - name: Check the WebDAV channel
+        run: node tools/webdav-selftest.mjs
+
       # The published tarball is what users install. Assert it contains the
       # cross-platform runtime, or a green pipeline ships a package that cannot
       # sync on macOS / Linux.
@@ -112,9 +118,13 @@ jobs:
           tgz="$(npm pack --ignore-scripts 2>/dev/null | tail -n1)"
           echo "packed: $tgz"
           tar -tzf "$tgz" > contents.txt
+          # 0.6.49: the POSIX post-exit runner and installer are load-bearing on
+          # macOS / Linux — without them exit-time sync and self-update cannot run
+          # at all (they used to spawn PowerShell). Ship-check them too.
           for f in index.js client.js cordis.patch.yml \
                     runtime/sync-engine.mjs runtime/platform.mjs runtime/machines.mjs \
-                    runtime/contract.mjs runtime/webdav.mjs; do
+                    runtime/contract.mjs runtime/webdav.mjs \
+                    runtime/post-exit.mjs runtime/install-plugin.mjs; do
             if ! grep -qx "package/$f" contents.txt; then
               echo "::error::tarball is missing $f"
               exit 1

@@ -37,10 +37,12 @@ import { setWorkspaceStateLive, setSessionStateLive } from './runtime/tools/work
 // 0.4.0：跨端（Windows / macOS / Linux）。平台差异全部收敛在 runtime/platform.mjs，
 // 这里只消费它的结论 —— 业务代码里不允许再出现 process.platform 分支。
 import {
-  IS_WIN, OS, appRootCandidates, appRootLayout, clientExecutable, clientProcessNames,
-  findGit, findSsh, hostNodeExe,
+  IS_WIN, OS, appRootCandidates, appRootLayout, asarPath, clientExecutable,
+  clientProcessPattern, defaultRepoPath, findGit, findSsh, hostNodeExe,
   hostDshNodeModules as platformHostDshNodeModules,
-  isAppRoot as pfIsAppRoot, isFile as pfIsFile, platformFamily, platformLabel,
+  isAppRoot as pfIsAppRoot, isFile as pfIsFile, normalizeAppRoot, platformFamily, platformLabel,
+  postExitScriptName, readAppVersion as platformReadAppVersion,
+  readElectronVersion as platformReadElectronVersion, repoPathProblem,
   normalizeSyncExtraPaths,
 } from './runtime/platform.mjs'
 // 0.4.0：客户端身份（仓库里 machines/<id>.json）—— 跨端不分叉仓库，只登记「谁推的」
@@ -277,6 +279,12 @@ function resolveAppRoot(explicit) {
   for (const c of candidates) {
     if (pfIsAppRoot(c)) return c
   }
+  // 用户可能把 appRoot 填成 .app 内部路径（/Applications/X.app/Contents/Resources）。
+  // 第二轮把候选归一成「客户端根」再判一次，别让一个多余的后缀把整块功能锁死。
+  for (const c of candidates) {
+    const n = normalizeAppRoot(c)
+    if (n && n !== c && pfIsAppRoot(n)) return n
+  }
   // 一个都认不出就返回空，让上层明确报错；绝不把插件自己所在的那一级当成客户端根。
   return ''
 }
@@ -294,11 +302,14 @@ function readAppMeta(appRoot) {
   const res = layout.resources || join(appRoot, 'resources')
   const plain = readJson(join(res, 'app', 'package.json'))
   if (plain) return plain
-  const asar = join(res, 'app.asar')
-  // Electron 主进程把 asar 当目录挂载：直接按「目录 + 内部路径」读最省事（外面普通 node 读不到就是 null，不用管）。
+  // 打包版：优先交给平台层按 asar 头解析（macOS 的 asar 在 Contents/Resources 下，
+  // 路径由 asarPath 统一算，不再各处硬拼 <root>/resources）
+  const viaPlatform = platformReadAppVersion(appRoot)
+  if (viaPlatform) return { version: viaPlatform }
+  const asar = asarPath(appRoot)
   const viaMount = readJson(join(asar, 'dsh', 'package.json'))
   if (viaMount) return viaMount
-  if (!pfIsFile(asar)) return null
+  if (!asar || !pfIsFile(asar)) return null
   try {
     const fd = openSync(asar, 'r')
     try {
@@ -504,7 +515,12 @@ function resolveRepo(explicit, dshHome) {
   }
 
   const home = homedir()
-  for (const c of ['D:\\dsh-config', 'G:\\dsh-config', 'C:\\dsh-config', join(home, 'dsh-config')]) {
+  // 0.6.49：自动探测的候选随平台走 —— 原来前三个是 Windows 盘符（D:/G:/C:），
+  // macOS 上等于扫了三个永远不存在的位置；现在 Windows 保原样，POSIX 只探自己语义下的路径。
+  const guesses = IS_WIN
+    ? ['D:\\dsh-config', 'G:\\dsh-config', 'C:\\dsh-config', join(home, 'dsh-config')]
+    : [defaultRepoPath(), join(home, 'Documents', 'dsh-config'), join(home, 'dsh-config')]
+  for (const c of guesses) {
     if (isRepoDir(c)) {
       tried.push(`自动探测:${c}`)
       return { repo: c, source: 'auto' }
@@ -734,7 +750,8 @@ function readBundles(profileDir) {
 let asarNamesCache = new Map()
 function asarBundleNames(appRoot) {
   if (!appRoot) return null
-  const asar = join(appRoot, 'resources', 'app.asar')
+  const asar = asarPath(appRoot)
+  if (!asar) return null
   if (asarNamesCache.has(asar)) return asarNamesCache.get(asar)
   let names = null
   try {
@@ -872,7 +889,9 @@ function inspectBackup(dshHome, rootOverride) {
           entryNames = list.slice(0, 6).map((e) => e.name)
         } catch { }
       }
-      all.push({ name, dir, at: st.mtimeMs, files: null, bytes: null, hasProfile, plugins, bundles, kind, entries, entryNames })
+      // at 用整型毫秒：mtimeMs 是浮点，直接进 JSON 会变成 1795845400410.4312 这种小数，
+      // 面板与读结果文件的地方都得再处理一次
+      all.push({ name, dir, at: Math.round(st.mtimeMs), files: null, bytes: null, hasProfile, plugins, bundles, kind, entries, entryNames })
     } catch { }
   }
   all.sort((a, b) => b.at - a.at)
@@ -1113,7 +1132,9 @@ async function inspect(config) {
 
   const localApp = readAppMeta(appRoot)
   const localVersion = typeof localApp?.version === 'string' ? localApp.version : ''
-  const electronVersion = readText(join(appRoot, 'version')).trim()
+  // 0.6.49：Electron 版本统一交给 platform.mjs（macOS 没有 <root>/version 文件，
+  // 原来读出来永远是空串，面板那一格只剩 "app 0.2.2-rc.5 /"）
+  const electronVersion = platformReadElectronVersion(appRoot) || readText(join(appRoot, 'version')).trim()
   const contract = readJson(join(repo, 'profile', 'host-contract.json'))
   const contractVersion = typeof contract?.appVersion === 'string' ? contract.appVersion : ''
 
@@ -1799,13 +1820,15 @@ function shHead(title) {
  * 进程守护：DSH 还在跑就拒绝执行。
  * 用 pgrep -f 匹配客户端可执行文件；找不到 pgrep 时跳过（不假装守护成功）。
  */
-function shProcGuard() {
-  const names = clientProcessNames()
-  const pattern = names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+function shProcGuard(appRoot) {
+  // 0.6.49：用**客户端可执行文件路径**匹配，不用进程名。
+  // 按名字匹配会命中我们自己的 Node 执行体（它的命令行里带着 ".../DeepSeek Harness.app/..."），
+  // 于是一个已经退出的场景也会被判成「还在运行」，脚本永远拒绝执行。
+  const pattern = clientProcessPattern(appRoot)
   return [
     '# 先确认 DSH 已退出：运行中 capture 会读到写了一半的 cordis.patch.yml',
     'if command -v pgrep >/dev/null 2>&1; then',
-    `  if pgrep -f "${pattern}" >/dev/null 2>&1; then`,
+    `  if pgrep -f ${shQuote(pattern)} >/dev/null 2>&1; then`,
     '    echo "[X] DSH 还在运行，请先完全退出（窗口 + 托盘）再重试。"',
     '    exit 1',
     '  fi',
@@ -1858,6 +1881,29 @@ function buildSh(config, action, repo, appRoot, dshHome, state = {}) {
   const note = target === 'push'
     ? String(state.message || '').replace(/["\r\n]/g, ' ').trim().slice(0, 120)
     : ''
+  // 提示与 .cmd 版同语义（面板拿 payload.warnings 提示「本机领先，别点错」）。
+  // 0.6.49 之前 buildSh 直接不返回这两个字段，于是 macOS 面板上永远看不到这些提醒。
+  const warnings = []
+  if (target === 'pull') {
+    const ahead = Number(state.ahead) || 0
+    const dirty = Number(state.dirty) || 0
+    if (ahead > 0) {
+      warnings.push(t(
+        `本机领先远端 ${ahead} 个提交（还没推送），拉取后这些改动在仓库里仍然缺失`,
+        `This machine is ${ahead} commit(s) ahead (not pushed yet); after pulling, those changes are still missing from the repo.`,
+      ))
+    }
+    if (dirty > 0) {
+      warnings.push(t(
+        `工作区有 ${dirty} 项未提交，拉取会用仓库版本覆盖对应的本机文件`,
+        `${dirty} uncommitted change(s): pulling overwrites the matching local files with the repo version.`,
+      ))
+    }
+    warnings.push(t(
+      '拉取 = 拉远端 + apply 到本机：会用仓库里的版本覆盖本机配置',
+      'Pull = fetch the remote and apply it locally: the repo version overwrites the local config.',
+    ))
+  }
 
   const confirmBlock = target === 'pull'
     ? [
@@ -1873,47 +1919,117 @@ function buildSh(config, action, repo, appRoot, dshHome, state = {}) {
     ]
     : []
 
-  const invocation = isRestore
-    ? buildShRestoreInvocation({ engine, nodeExe, common, state })
-    : [
+  // 还原：生成时就挑好快照并写进脚本（与 .cmd 版同语义）。
+  // 0.6.49 之前 POSIX 的还原脚本只是裸调一次 restore —— 既不显示用的是哪份快照、
+  // 也不先 dry-run、更没有确认（.cmd 版三样都有）；响应里也没有 backup 字段，面板拿不到快照信息。
+  let backupInfo = null
+  const body = []
+  if (isRestore) {
+    const settings = readSettings(dshHome)
+    const backup = inspectBackup(dshHome, backupRootOf(dshHome, settings))
+    const picked = String(state.backupDir || '')
+    const pickedSnap = picked ? (backup.snapshots || []).find((sn) => sn.dir === picked) : null
+    const chosen = picked || backup.latest || ''
+    const kind = String(state.snapshotKind || (pickedSnap ? pickedSnap.kind : '') || '')
+    const restoreState = { ...state, backupDir: chosen, snapshotKind: kind }
+    backupInfo = {
+      dir: chosen, root: backup.root,
+      at: pickedSnap ? pickedSnap.at : backup.latestAt,
+      count: backup.count, files: pickedSnap ? pickedSnap.files : backup.latestFiles,
+    }
+    const drySupported = engineSupportsDryRun(engine)
+    const dry = drySupported
+      ? buildShRestoreInvocation({ engine, nodeExe, common, state: restoreState, extra: ['-DryRun'] })
+      : []
+    const real = buildShRestoreInvocation({ engine, nodeExe, common, state: restoreState })
+    body.push(
+      chosen
+        ? `echo ${shQuote(`备份快照：${chosen}`)}`
+        : `echo ${shQuote(`备份快照：${backup.root}（生成脚本时这里还没有快照）`)}`,
+      chosen
+        ? `echo ${shQuote(`快照时间：${new Date(backupInfo.at || Date.now()).toLocaleString('zh-CN', { hour12: false })}　备份根下共 ${backup.count} 份`
+          // files 可能是 null（体积/文件数不递归统计，见 inspectBackup）——别把 null 印成「含 null 个文件」
+          + (typeof backupInfo.files === 'number' && Number.isFinite(backupInfo.files)
+            ? `，这份含 ${backupInfo.files} 个文件` : '（文件数未统计）'))}`
+        : `echo ${shQuote('执行时由 sync-engine.mjs 自动取该目录下最新一份；若那时仍为空，会提示你先跑一次拉取。')}`,
+      '',
+      ...(drySupported
+        ? [`echo ${shQuote('[第一步] 只看不动，先打印还原计划：')}`, ...dry]
+        : [`echo ${shQuote('[!] 这个执行体还不认 -DryRun（仓库里那份偏旧）：跳过计划预览；先推送一次即可刷新它。')}`]),
+      'echo',
+      ...restoreConfirmBlock(),
+      `echo ${shQuote('[第二步] 开始还原（会先把当前 profile 另存一份再覆盖）：')}`,
+      ...real,
+    )
+  } else {
+    body.push(
+      ...confirmBlock,
       `${shQuote(nodeExe)} ${shQuote(engine)} ${target} ${common.join(' ')}` +
-      (note ? ` -Message ${shQuote(note)}` : ''),
-    ]
+        (note ? ` -Message ${shQuote(note)}` : ''),
+    )
+  }
 
+  const headWhat = isRestore
+    ? t('把本机 profile 退回到下面这个快照（先留底、再覆盖、再核对依赖）。',
+      'Roll the local profile back to the snapshot below (copy aside, restore, then verify dependencies).')
+    : `会先确认 DSH 是否已退出，再执行「${label}」。`
   const text = [
-    ...shHead(`会先确认 DSH 是否已退出，再执行「${label}」。`),
-    ...shProcGuard(),
+    ...shHead(headWhat),
+    ...shProcGuard(appRoot),
     ...envLines,
     '',
-    ...confirmBlock,
-    ...invocation,
+    ...body,
     '',
-    'echo "执行结束。若为拉取，确认无误后启动 DSH。"',
+    `echo ${shQuote(isRestore ? '执行结束。确认无误后再启动 DSH。' : '执行结束。若为拉取，确认无误后启动 DSH。')}`,
   ].join('\n')
 
   const fileName = isRestore
-    ? (state.snapshotName ? `同步-还原-${state.snapshotName}.sh` : '同步-还原.sh')
+    ? (pickedName(state))
     : `同步-${target === 'push' ? '推送' : '拉取'}.sh`
   const path = join(repo, fileName)
   writeFileSync(path, text, 'utf8')
   try { chmodSync(path, 0o755) } catch { /* Windows 上没意义，忽略 */ }
-  return {
+  const result = {
     action: isRestore ? 'restore' : target,
     label: isRestore ? t('还原（本机 → 快照）', 'Restore (machine → snapshot)') : label,
     path,
-    command: invocation.join(' '),
+    command: body.filter((l) => /sync-engine\.mjs/.test(l)).pop() || '',
+    warnings,
+    message: note,
     platform: 'posix',
   }
+  if (backupInfo) result.backup = backupInfo
+  return result
+}
+
+/** 还原脚本文件名：面板点某一行的还原时带快照名，多份脚本互不覆盖。 */
+function pickedName(state) {
+  return state.snapshotName ? `同步-还原-${state.snapshotName}.sh` : '同步-还原.sh'
 }
 
 /** 还原脚本的命令拼装（POSIX）。 */
-function buildShRestoreInvocation({ engine, nodeExe, common, state }) {
+function buildShRestoreInvocation({ engine, nodeExe, common, state, extra = [] }) {
   const args = [...common]
   if (state.backupDir) args.push(`-BackupDir ${shQuote(state.backupDir)}`)
   if (state.snapshotKind && state.snapshotKind !== 'profile') {
     args.push(`-SnapshotKind ${shQuote(state.snapshotKind)}`)
   }
+  args.push(...extra)
   return [`${shQuote(nodeExe)} ${shQuote(engine)} restore ${args.join(' ')}`]
+}
+
+/** 还原的确认守卫（POSIX）：--yes 免确认，否则读一行 y。 */
+function restoreConfirmBlock() {
+  return [
+    'if [ "${1:-}" = "--yes" ]; then',
+    '  :',
+    'else',
+    '  printf "按上面的计划执行还原？(y/N) "',
+    '  read -r GO',
+    '  case "$GO" in y|Y) ;; *) echo "没有收到确认（y），已退出：本机什么都没改。"; exit 0 ;; esac',
+    'fi',
+    '',
+  ]
 }
 
 /**
@@ -1922,11 +2038,18 @@ function buildShRestoreInvocation({ engine, nodeExe, common, state }) {
  * 找不到返回空串，调用方据此明确报错，不生成一个必然失败的脚本。
  */
 function pickEngine(repo) {
-  const fromRepo = join(repo, 'sync-engine.mjs')
-  if (isFile(fromRepo)) return fromRepo
+  // 0.6.49：插件自带的执行体优先。旧顺序是仓库优先（理由：随仓库更新），但实测代价太大 ——
+  // 仓库里那份可能是老版本，它不认识新参数（-DryRun 被当成未知参数忽略，还原脚本的
+  // 「第一步只看不动」直接变成真还原）。插件自带的永远是「正在跑的这份代码」，其余从属。
   const fromPlugin = join(pluginRoot(), 'runtime', 'sync-engine.mjs')
   if (isFile(fromPlugin)) return fromPlugin
-  return ''
+  const fromRepo = join(repo, 'sync-engine.mjs')
+  return isFile(fromRepo) ? fromRepo : ''
+}
+
+/** 执行体是否认 -DryRun（老版本的仓库执行体不认，别让「计划」变成真跑）。 */
+function engineSupportsDryRun(engine) {
+  try { return readFileSync(engine, 'utf8').includes('DryRun') } catch { return false }
 }
 
 /* ============================ 自动同步 / 自动推送 ============================
@@ -1963,10 +2086,20 @@ const autoState = {
 }
 
 function autoScript(dshHome, repo) {
-  const fromPlugin = join(pluginRoot(), 'runtime', 'post-exit.ps1')
+  // 0.6.49：执行体随平台走 —— Windows 用 post-exit.ps1，macOS / Linux 用 post-exit.mjs。
+  // 原来这里只找 .ps1，于是非 Windows 上 autoScript() 恒为空，spawnWatcher 直接返回
+  // 「插件与仓库里都没有 post-exit.ps1，无法排队」—— 退出后推送/拉取/还原/更新整条链路都是死的。
+  const name = postExitScriptName()
+  const fromPlugin = join(pluginRoot(), 'runtime', name)
   if (isFile(fromPlugin)) return fromPlugin
-  const fromRepo = join(repo || '', 'post-exit.ps1')
-  return isFile(fromRepo) ? fromRepo : ''
+  const fromRepo = join(repo || '', name)
+  if (isFile(fromRepo)) return fromRepo
+  // 兼容老仓库（里面只有 .ps1）：Windows 上仍能退回它，POSIX 上不能（跑不起来）
+  if (IS_WIN) {
+    const legacy = join(repo || '', 'post-exit.ps1')
+    if (isFile(legacy)) return legacy
+  }
+  return ''
 }
 
 /**
@@ -2047,6 +2180,10 @@ async function checkDrift(repo) {
 
 /** 系统确认框（立在 DSH 窗口前面，不开面板也看得见）。Yes → true。 */
 function askConfirm(title, text) {
+  // 0.6.49：POSIX 上用 osascript 的 display dialog。原来只会 spawn powershell.exe，
+  // macOS 上 'error' 事件直接 resolve(false) —— 自动拉取的确认框永远等于「用户点了取消」，
+  // 更新（apply）流程也永远走不到安装那一步。
+  if (!IS_WIN) return askConfirmPosix(title, text)
   return new Promise((resolve) => {
     // 参数走 spawn 的数组形式，不经过 shell 解析，所以文本里的引号/换行不会被二次解释。
     const safe = (s) => String(s).replace(/'/g, "''")
@@ -2063,6 +2200,35 @@ function askConfirm(title, text) {
     ps.on('close', (code) => resolve(code === 6))
     // 12 分钟没人点就当取消，别把后台挂着
     const timer = setTimeout(() => { try { ps.kill() } catch { } resolve(false) }, 12 * 60 * 1000)
+    try { timer.unref?.() } catch { }
+  })
+}
+
+/**
+ * POSIX 版确认框：AppleScript 的 display dialog。
+ * 两个按钮「取消 / 继续」，默认「继续」；回车=继续，Esc/取消=取消。
+ * 脚本从 stdin 读，免得把中文与引号拼进 -e 参数时被 shell/AppleScript 二次解释。
+ */
+function askConfirmPosix(title, text) {
+  return new Promise((resolve) => {
+    if (!isFile('/usr/bin/osascript')) { resolve(false); return }
+    // AppleScript 字符串就是 "..."：用 JSON.stringify 得到同样语义的转义（\" \\ \n）
+    const asStr = (s) => JSON.stringify(String(s == null ? '' : s))
+    const script = [
+      'try',
+      `  display dialog ${asStr(text)} with title ${asStr(title)} buttons {"取消", "继续"} default button "继续" with icon caution`,
+      '  return "continue"',
+      'on error number -128',
+      '  return "cancel"',
+      'end try',
+    ].join('\n')
+    let out = ''
+    const child = spawn('/usr/bin/osascript', ['-'], { stdio: ['pipe', 'pipe', 'ignore'] })
+    child.on('error', () => resolve(false))
+    child.stdout.on('data', (c) => { out += c })
+    child.on('close', () => resolve(/continue/.test(out)))
+    try { child.stdin.end(script, 'utf8') } catch { resolve(false) }
+    const timer = setTimeout(() => { try { child.kill() } catch { } resolve(false) }, 12 * 60 * 1000)
     try { timer.unref?.() } catch { }
   })
 }
@@ -2123,11 +2289,19 @@ function psWinArg(value) {
  */
 async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs = [], closeRequested = false }) {
   const script = autoScript(dshHome, repo)
-  if (!script) return { ok: false, error: t('插件与仓库里都没有 post-exit.ps1，无法排队', 'post-exit.ps1 is in neither the plugin nor the repo — cannot queue') }
-
+  if (!script) {
+    return { ok: false, error: t(
+      `插件与仓库里都没有 ${postExitScriptName()}，无法排队`,
+      `${postExitScriptName()} is in neither the plugin nor the repo — cannot queue`,
+    ) }
+  }
   // 同一时刻只允许一次同步。实测过的坑：启动首检排了 push、用户在确认框点确认又排了 pull，
   // 两个守护都在等同一个 pid —— DSH 一退出它们**同时开工**，一次推送一次拉取并行跑、各重启一次，
   // 配置可能互相覆盖。锁文件记 pid，进程还活着就拒掉后来者。
+  //
+  // 0.6.49：这段原来只在 Windows 分支里（在 spawnWatcher 后半段），POSIX 走新分支后
+  // 锁就没人写了 —— 面板显示「排队中」而磁盘上没有痕迹，两个动作同时排队也没人挡。
+  // 现在两个平台共用同一套判定，放在分支之前。
   const lockFile = join(dshHome, 'auto-sync.lock')
   try {
     if (isFile(lockFile)) {
@@ -2141,7 +2315,7 @@ async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs =
           // 同一种同步已经在等，直接复用，别再加一个并行的
           if (lockMode === mode) return { ok: true, pid: lockPid, reused: true }
           // 不同的同步正在等（例如首检排了推送、用户在确认框点了拉取）：用户的手动动作优先，
-          // 干掉那个还没开工的等待进程，改排这一次。它此时只可能在等 DSH 退出，没有副作用。
+          // 干掉那个还没开工的等待进程，改排这一次。
           try { process.kill(lockPid) } catch { }
           logLaunch(dshHome, `取消上一个等待中的 ${lockMode || '同步'}（pid ${lockPid}），改排 ${mode}`)
         }
@@ -2149,6 +2323,35 @@ async function spawnWatcher({ mode, repo, appRoot, dshHome, restart, extraArgs =
       try { unlinkSync(lockFile) } catch { }
     }
   } catch { }
+
+  // 0.6.49：POSIX 走 Node 执行体（post-exit.mjs）。它不是「等退出→换可见窗口」两段式，
+  // 自己就盯着 pid，所以这里直接 detached 起它，不必先起一个短命 launcher。
+  if (!IS_WIN) {
+    const nodeExe = hostNodeExe(appRoot) || process.execPath
+    const args = ['-Mode', mode, '-WatchPid', String(process.pid), '-DshHome', dshHome]
+    if (closeRequested) args.push('-CloseWhenIdle')
+    if (repo) args.push('-RepoRoot', repo)
+    if (appRoot) args.push('-AppRoot', appRoot)
+    if (restart) args.push('-Restart')
+    if (Array.isArray(extraArgs) && extraArgs.length) args.push(...extraArgs)
+    try {
+      const child = spawn(nodeExe, [script, ...args], {
+        detached: true, stdio: 'ignore', windowsHide: true,
+      })
+      child.unref()
+    } catch (error) {
+      const msg = String((error && error.message) || error)
+      try { unlinkSync(lockFile) } catch { }
+      logLaunch(dshHome, `启动失败 ${mode} exe=${nodeExe}：${msg}`)
+      return { ok: false, error: t(`拉不起 Node 执行体（${nodeExe}）：${msg}`, `Cannot launch the Node runner (${nodeExe}): ${msg}`) }
+    }
+    autoState.watcherStartedAt = Date.now()
+    try {
+      writeFileSync(lockFile, JSON.stringify({ pid: process.pid, mode, at: Date.now() }), 'utf8')
+    } catch { }
+    logLaunch(dshHome, `已启动 ${mode}（Node 执行体 ${postExitScriptName()}，等 pid ${process.pid} 退出）`)
+    return { ok: true, pid: process.pid, via: 'node' }
+  }
 
   const logsDir = join(dshHome, 'logs')
   try { if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true }) } catch { }
@@ -2244,11 +2447,42 @@ function electronApp() {
  *
  * 现在优先 app.quit()（走 before-quit，配置照常落盘）；拿不到 electron 才退回 taskkill。
  */
-function closeDsh() {
+function closeDsh(appRoot = '') {
+  const el = electronApp()
+  const quitSoft = () => {
+    // Electron 主进程形态下 app.quit 最温和（有 before-quit 落盘）
+    if (el) { try { el.app.quit(); return true } catch { } }
+    return false
+  }
+
+  // 0.6.49：POSIX 上没有 taskkill（原来这里 join(C:\\Windows, System32, taskkill.exe)，
+  // 在 macOS 上 spawn 一个不存在的可执行文件，'error' 事件没人接 —— 关不掉客户端还会掉异常）。
+  if (!IS_WIN) {
+    if (quitSoft()) return true
+    // 交给 AppleScript 走客户端的正常退出流程（等价于用户按 ⌘Q，配置照常落盘）
+    try {
+      spawn('/usr/bin/osascript', ['-e', 'tell application "DeepSeek Harness" to quit'],
+        { stdio: 'ignore', detached: false })
+    } catch { /* 没有 osascript 时退回下面的强杀 */ }
+    // 6 秒后还在就按可执行文件整族结束（用户已经点过「立即同步」，明确授权关闭）
+    const timer = setTimeout(() => {
+      // 按可执行文件路径精确结束：按名字会把「等客户端退出的 post-exit.mjs」一起杀掉，
+      // 于是用户点完「立即拉取」反而什么都没发生。
+      try {
+        spawn('/usr/bin/pkill', ['-f', clientProcessPattern(appRoot || resolveAppRoot(''))], { stdio: 'ignore' })
+      } catch { }
+    }, 6000)
+    try { timer.unref?.() } catch { }
+    return true
+  }
+
   const exe = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe')
   const imageName = 'DeepSeek Harness.exe'
   const run = (args) => {
-    try { spawn(isFile(exe) ? exe : 'taskkill', args, { stdio: 'ignore', windowsHide: true, detached: false }) } catch { }
+    try {
+      const child = spawn(isFile(exe) ? exe : 'taskkill', args, { stdio: 'ignore', windowsHide: true, detached: false })
+      child.on?.('error', () => { })
+    } catch { }
   }
 
   // 先走一次「礼貌关闭」（不带 /F 只对带窗口的进程有效，会让 Electron 走正常关闭流程）。
@@ -2259,9 +2493,7 @@ function closeDsh() {
   const timer = setTimeout(() => { run(['/IM', imageName, '/F']) }, 3500)
   try { timer.unref?.() } catch { }
 
-  // Electron 主进程形态下 app.quit 更温和（有 before-quit 落盘）；拿到了就先用它
-  const el = electronApp()
-  if (el) { try { setTimeout(() => { try { el.app.quit() } catch { } }, 150) } catch { } }
+  quitSoft()
   return true
 }
 
@@ -2717,7 +2949,28 @@ async function handleSettings(req, res, config) {
     let repoPath = before.repoPath
     if (has('repoPath')) {
       repoPath = String(body.repoPath || '').trim().replace(/[\\/]+$/, '')
+      // POSIX 用户习惯写 ~/dsh-config：这里先展开再校验，否则会被「要绝对路径」挡回去，
+      // 而用户会以为插件连自己家目录都不认。
+      if (repoPath === '~' || repoPath.startsWith('~/')) repoPath = join(homedir(), repoPath.slice(1)).replace(/[\\/]+$/, '')
       if (!repoPath) throw new Error(t('仓库路径不能为空', 'Repo path cannot be empty'))
+      // 0.6.49：先按平台校验写法。踩过的坑：macOS 上把 `D:\dsh-config` 当相对路径，
+      // 后续 mkdirSync 会在当前工作目录里真的建出一个叫 `D:\dsh-config` 的目录（本仓库根就留了一个）；
+      // 反过来 Windows 也不该接受 /Users/x/dsh-config。被拒的路径整批报错，绝不静默存成别的意思。
+      const problem = repoPathProblem(repoPath)
+      if (!problem.ok) {
+        throw new Error(t(
+          problem.reason === 'windows-shape'
+            ? `仓库路径要填本机（${platformLabel()}）的绝对路径，不能是 Windows 盘符写法：${repoPath}`
+            : (problem.reason === 'posix-absolute'
+              ? `仓库路径要填绝对路径（以 / 开头，例如 ${defaultRepoPath()}）：${repoPath}`
+              : `仓库路径要填本机（${platformLabel()}）的绝对路径（例如 ${defaultRepoPath()}）：${repoPath}`),
+          problem.reason === 'windows-shape'
+            ? `Repo path must be an absolute ${platformLabel()} path, not a Windows drive path: ${repoPath}`
+            : (problem.reason === 'posix-absolute'
+              ? `Repo path must be absolute (starting with /, e.g. ${defaultRepoPath()}): ${repoPath}`
+              : `Repo path must be an absolute ${platformLabel()} path (e.g. ${defaultRepoPath()}): ${repoPath}`),
+        ))
+      }
       // 新机器上这个目录常常还不存在、或者是个空目录（等着首次拉取去初始化）：都允许存。
       // 只有「已经有别的东西、又明显不是 dsh-config 仓库」才拒，免得住错地方把人家目录写乱。
       // 判据统一交给 repoPhase，跟面板、体检那边保持同一套口径；带 .git\HEAD 的目录
@@ -3458,8 +3711,41 @@ async function downloadPackage({ urls, sha256, integrity = '', sha1 = '', versio
  * 返回 { ok, version, backup, log, error }
  */
 function runInstallPlugin({ version, sha256, integrity = '', sha1 = '', urls, dshHome }) {
-  const script = join(PLUGIN_DIR, 'runtime', 'install-plugin.ps1')
-  if (!isFile(script)) return Promise.resolve({ ok: false, error: t('插件目录里没有 runtime\\install-plugin.ps1', 'runtime\\install-plugin.ps1 is missing from the plugin directory') })
+  // 0.6.49：执行体随平台走。非 Windows 用 install-plugin.mjs（原来只找 .ps1，
+  // 于是 macOS 上 install-live 永远返回「插件目录里没有 runtime\install-plugin.ps1」）。
+  const script = IS_WIN
+    ? join(PLUGIN_DIR, 'runtime', 'install-plugin.ps1')
+    : join(PLUGIN_DIR, 'runtime', 'install-plugin.mjs')
+  if (!isFile(script)) {
+    const name = IS_WIN ? 'install-plugin.ps1' : 'install-plugin.mjs'
+    return Promise.resolve({ ok: false, error: t(`插件目录里没有 runtime\\${name}`, `runtime/${name} is missing from the plugin directory`) })
+  }
+  const parse = (err, stdout, stderr) => {
+    const text = String(stdout || '') + String(stderr || '')
+    // 执行体最后一行固定是 RESULT:{json}；前面是给人看的进度
+    const line = text.split(/\r?\n/).filter((l) => l.startsWith('RESULT:')).pop()
+    if (!line) {
+      return { ok: false, error: t('安装脚本没有返回结果：', 'The installer returned no result: ') + (text.trim().slice(-400) || String((err && err.message) || '无输出')) }
+    }
+    try { return JSON.parse(line.slice('RESULT:'.length)) } catch { return { ok: false, error: t('安装脚本返回的结果不是合法 JSON', 'The installer result is not valid JSON') } }
+  }
+  if (!IS_WIN) {
+    const nodeExe = hostNodeExe(resolveAppRoot('')) || process.execPath
+    const args = [script,
+      '-PluginDir', PLUGIN_DIR,
+      '-Version', String(version || ''),
+      '-Sha256', String(sha256 || ''),
+      ...(integrity ? ['-Integrity', String(integrity)] : []),
+      ...(sha1 ? ['-Sha1', String(sha1)] : []),
+      '-TgzUrls', urls.join('|'),
+      '-DshHome', dshHome,
+    ]
+    return new Promise((resolve) => {
+      execFile(nodeExe, args, { timeout: 6 * 60 * 1000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+        resolve(parse(err, stdout, stderr))
+      })
+    })
+  }
   const sysRoot = process.env.SystemRoot || 'C:\\Windows'
   const ps = join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
   const args = [
@@ -3474,14 +3760,7 @@ function runInstallPlugin({ version, sha256, integrity = '', sha1 = '', urls, ds
   ]
   return new Promise((resolve) => {
     execFile(ps, args, { windowsHide: true, timeout: 6 * 60 * 1000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
-      const text = String(stdout || '') + String(stderr || '')
-      // 脚本最后一行固定是 RESULT:{json}；前面是给人看的进度
-      const line = text.split(/\r?\n/).filter((l) => l.startsWith('RESULT:')).pop()
-      if (!line) {
-        resolve({ ok: false, error: t('安装脚本没有返回结果：', 'The installer returned no result: ') + (text.trim().slice(-400) || String((err && err.message) || '无输出')) })
-        return
-      }
-      try { resolve(JSON.parse(line.slice('RESULT:'.length))) } catch { resolve({ ok: false, error: t('安装脚本返回的结果不是合法 JSON', 'The installer result is not valid JSON') }) }
+      resolve(parse(err, stdout, stderr))
     })
   })
 }

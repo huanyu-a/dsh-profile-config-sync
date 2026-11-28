@@ -46,9 +46,9 @@ Package name **`dsh-profile-config-sync`** (the npm package `dsh-config-sync` is
 |---|---|
 | npm | `npm i dsh-profile-config-sync` — **the same version the panel self-update checks**; the `latest` tag points at it |
 | Plugin market | Search “Config Backup & Sync” in the client's plugin market — `market-index.json` registers `source.type: npm`, so the online registry version is what gets installed |
-| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.46.tgz` |
+| Offline tgz | `pnpm add ./dsh-profile-config-sync-0.6.49.tgz` |
 
-**Release status**: the latest release is [`v0.6.46`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.46) (2026-11-27); the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
+**Release status**: the latest release is [`v0.6.48`](https://github.com/huanyu-a/dsh-profile-config-sync/releases/tag/v0.6.48) (2026-11-28); 0.6.49 (macOS fixes) is verified on a local branch and not published yet; the repository is public and the npm package publishes alongside (`npm i dsh-profile-config-sync`).
 
 ## HTTP route admission
 

@@ -288,6 +288,24 @@ try {
   check('体检数据字段齐全', false, String(e && e.message))
 }
 
+// 0.6.49：云端目标卡的「强制编辑态」回归（用户实测：选 WebDAV 但字段还是 Git 那套，
+// 保存报「请填写 WebDAV 地址」，因为 activeMode 只认 editing、不认强制编辑态）
+{
+  check('云端卡：强制编辑态下字段跟随下拉框（activeMode 由 isEditing 决定）',
+    source.includes('const activeMode = isEditing ? mode : currentMode'),
+    'client.js 里 activeMode 仍按 editing 取，未配过云端时切模式字段不会变')
+  check('云端卡：强制编辑态的判据本身是对的（未配置也进编辑态）',
+    source.includes('const isEditing = editing || (!wdConfigured && !gitConfigured && Boolean(props.data))'))
+  check('云端卡：选了 WebDAV 就不再写 git 设置（否则 DAV 地址会被当 git 远端）',
+    source.includes("mode !== 'webdav'") && source.includes('callSettings({ remoteUrl: gitUrl, sshKey: gitKey })'))
+  // 渲染顺序：WebDAV 块在前、Git 块在后，各自由 showWebdav / showGit 门控（CRLF 无关）
+  const iWd = source.search(/^\s*showWebdav\s*$|^\s*showWebdav\s*\??/m)
+  const iGit = source.search(/^\s*showGit\s*$|^\s*showGit\s*\??/m)
+  check('CloudTargetCard 渲染顺序：WebDAV 块在 Git 块之前',
+    iWd > 0 && iGit > iWd,
+    `showWebdav@${iWd} showGit@${iGit}`)
+}
+
 console.log('')
 console.log(failures === 0 ? '结论：全部通过（真实 UI 仍需重启后目视确认）' : `结论：${failures} 项失败`)
 process.exit(failures === 0 ? 0 : 1)

@@ -550,6 +550,12 @@ const SELF_RUNTIME_FILES = new Set([
   'restore.ps1', 'sync.ps1', 'webdav.mjs', 'sync-engine.mjs',
 ])
 const GH_TOKEN_RE = /gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}/
+// 0.6.49：SSH / 其它私钥。原来只拦 `dsh-ssh-master.key` 这种自家文件名，
+// `ssh-keygen` 的默认产物（id_ed25519 / id_rsa …）是裸名，既没有 .key 后缀也不在名单里，
+// 一旦用户把 ~/.ssh 加进「额外路径」，私钥会被原样传上云端（自检实测抓到的）。
+export const SSH_KEY_NAME_RE = /^(id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?|identity|.*\.ppk)$/i
+// 内容判据兜底：改名/塞进别处的私钥也认得出（PEM 与 PuTTY 两种头）
+export const PRIVATE_KEY_BODY_RE = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----|PuTTY-User-Key-File-[0-9]/
 
 /**
  * 上传前的拦截判定，**带原因**。
@@ -564,6 +570,7 @@ const GH_TOKEN_RE = /gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}/
 export function secretSkipReason(rel, buf) {
   const leaf = String(rel || '').split('/').pop().toLowerCase()
   if (PRIVATE_SECRET_FILES.has(leaf) || leaf.startsWith('.env.') || /\.(pem|key|p12|pfx)$/.test(leaf)) return 'secret'
+  if (SSH_KEY_NAME_RE.test(leaf)) return 'secret'
   // 浏览器剖面 / 凭据库：无论它是怎么进到仓库里的（老版本抓的、手动拷的），都不上传
   if (blockedProfilePath(rel)) return 'profile'
   // 超大文件不上传：NAS 扛不住，且这类体积基本是缓存/数据库（不是安全问题，别冤枉用户的令牌）
@@ -575,6 +582,7 @@ export function secretSkipReason(rel, buf) {
   if (slice.includes(0)) return ''
   const text = slice.toString('utf8')
   if (GH_TOKEN_RE.test(text)) return 'secret'
+  if (PRIVATE_KEY_BODY_RE.test(text)) return 'secret'
   for (const envName of ['DSH_CONFIG_SYNC_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) {
     const val = String(process.env[envName] || '').trim()
     if (val.length >= 12 && text.includes(val)) return 'secret'

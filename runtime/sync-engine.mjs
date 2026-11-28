@@ -24,12 +24,16 @@ import { basename, dirname, extname, join, relative, resolve, sep } from 'node:p
 import { fileURLToPath } from 'node:url'
 
 import {
-  IS_WIN, SEP, appRootCandidates, clientExecutable, dshHome as resolveDshHome,
+  IS_WIN, SEP, appRootCandidates, appRootLayout, clientExecutable, dshHome as resolveDshHome,
   defaultWorkspaceHome, findGit, hostNodeExe, isAppRoot, isDir, isFile, platformFamily,
+  readAppVersion as platformAppVersion, readElectronVersion as platformElectronVersion,
 } from './platform.mjs'
 import { buildContract, checkContract, contractPath, contractText, readContract } from './contract.mjs'
 import { listMachines, localMachineInfo, writeMachineInfo } from './machines.mjs'
-import { downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive } from './webdav.mjs'
+import {
+  downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive,
+  PRIVATE_KEY_BODY_RE, SSH_KEY_NAME_RE,
+} from './webdav.mjs'
 
 /** 占位符：仓库里存这些，落地时展开成本机路径。 */
 export const TOKENS = {
@@ -305,9 +309,14 @@ const GH_TOKEN_RE = /gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}/
 function hasSecretLeak(name, text) {
   const leaf = String(name || '').toLowerCase()
   if (PRIVATE_FILE_NAMES.has(leaf) || leaf.startsWith('.env.') || /\.(pem|key|p12|pfx)$/.test(leaf)) return true
+  // 0.6.49：裸名私钥（ssh-keygen 默认产物 id_ed25519 / id_rsa / *.ppk）原来拦不住 ——
+  // 既没有 .key 后缀也不在名单里。判据与 webdav.mjs 共用同一份正则，避免两边漂移。
+  if (SSH_KEY_NAME_RE.test(leaf)) return true
   if (String(name || '').split('/').some((seg) => BLOCKED_ENGINE_SEGMENTS.has(String(seg).toLowerCase()))) return true
   if (typeof text === 'string' && text) {
     if (GH_TOKEN_RE.test(text)) return true
+    // 改名/塞进别处的私钥：认 PEM / PuTTY 私钥头（与 webdav.mjs 共用）
+    if (PRIVATE_KEY_BODY_RE.test(text)) return true
     for (const envName of ['DSH_CONFIG_SYNC_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) {
       const val = String(process.env[envName] || '').trim()
       if (val.length >= 12 && text.includes(val)) return true
@@ -463,11 +472,10 @@ export function diffTrees(a, b) {
  */
 export function readAppVersion(appRoot) {
   if (!appRoot) return ''
-  const plain = readJsonSafe(join(appRoot, 'resources', 'app', 'package.json'))
-  if (plain && plain.version) return String(plain.version)
-  const asarPkg = readJsonSafe(join(appRoot, 'resources', 'app.asar', 'dsh', 'package.json'))
-  if (asarPkg && asarPkg.version) return String(asarPkg.version)
-  return readAsarPackageVersion(join(appRoot, 'resources', 'app.asar'))
+  // 0.6.49：resources 的位置随平台变（macOS 在 <root>/Contents/Resources），
+  // 统一交给 platform.mjs —— 原来这里写死 <root>/resources，macOS 上恒为空，
+  // 于是契约里的 appVersion 一直空着、版本校验形同虚设。
+  return platformAppVersion(appRoot)
 }
 
 /** 直接从 asar 二进制里取 dsh/package.json 的 version（不依赖 asar 挂载）。 */
@@ -498,13 +506,9 @@ function readAsarPackageVersion(asarPath) {
   }
 }
 
-/** Electron 版本（客户端根下的 version 文件）。 */
+/** Electron 版本（客户端根下的 version 文件；macOS 走 .app 内 Framework 的 Info.plist）。 */
 export function readElectronVersion(appRoot) {
-  if (!appRoot) return ''
-  try {
-    const v = readFileSync(join(appRoot, 'version'), 'utf8').trim()
-    return v || ''
-  } catch { return '' }
+  return platformElectronVersion(appRoot)
 }
 
 function readJsonSafe(path) {
@@ -612,6 +616,14 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
     copy(join(profileDir, 'cordis.patch.yml'), 'profile/cordis.patch.yml')
     copy(join(profileDir, 'package-lock.json'), 'profile/package-lock.json')
     copy(join(profileDir, 'pnpm-lock.yaml'), 'profile/pnpm-lock.yaml')
+  }
+
+  // 1.5) 执行体：把 Node 引擎写进仓库根（Windows 版一直这么干，POSIX 之前漏了）
+  try {
+    const wrote = ensureRepoRunner(repoRoot)
+    for (const name of wrote) changed.push(name)
+  } catch (e) {
+    errors.push(`runner: ${e && e.message ? e.message : e}`)
   }
 
   // 2) 契约：记下本机实测版本 + 平台
@@ -877,6 +889,79 @@ function buildWarnings({ local, contract, repoRoot }) {
   return out
 }
 
+/**
+ * 把 Node 执行体写进仓库根（sync-engine.mjs + 它 import 的几个模块）。
+ *
+ * 为什么必须有：换机拉取的机器要能在**没有插件**的情况下跑 `node sync-engine.mjs`；
+ * 更要紧的是宿主用「仓库根有没有 apply.ps1 / sync-engine.mjs」判断这是不是一个可用仓库。
+ * 0.6.49 之前 POSIX 的 capture 只写内容、不写执行体 —— 第一次推送成功后，
+ * 仓库立刻变成「像仓库但没执行体」，面板报「这个目录里已经有别的东西」并禁掉后续动作，
+ * 用户只能重配一遍。Windows 版一直是连脚本一起写进仓库的，这里补齐同一语义。
+ */
+export function ensureRepoRunner(repoRoot) {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const names = ['sync-engine.mjs', 'platform.mjs', 'contract.mjs', 'machines.mjs', 'webdav.mjs']
+  const written = []
+  for (const name of names) {
+    const src = join(here, name)
+    if (!isFile(src)) continue
+    const dst = join(repoRoot, name)
+    try {
+      let same = false
+      try { same = existsSync(dst) && fileHash(src) === fileHash(dst) } catch { same = false }
+      if (!same) { copyFileSync(src, dst); written.push(name) }
+    } catch { /* 写不进去不阻断同步：仓库里已有旧版执行体也能跑 */ }
+  }
+  return written
+}
+
+/**
+ * 新机器首次拉取：把空仓库 / 还没上游的仓库跟 origin 对齐。
+ *
+ * Windows 版的 sync.ps1 有 Initialize-RepoIfNeeded（init + fetch + checkout）兜这件事；
+ * Node 引擎之前**没有**，于是第一次 `pull` 在全新目录上必然停在
+ * 「快进合并失败：fatal: no such branch: 'main'」，后面 apply 拿空仓库照跑一遍，
+ * 结果「拉取成功、什么都没落地」。macOS 上没有第二条路可退，这个洞必须补。
+ *
+ * 返回 { ok, bootstrapped, branch, error }
+ */
+function bootstrapRepo(repoRoot) {
+  const remotes = gitRun(repoRoot, ['remote'], 60000)
+  if (!remotes.out.split(/\r?\n/).includes('origin')) {
+    return { ok: false, bootstrapped: false, error: '本机仓库没有 origin：先在面板「云端仓库」里填远端地址并保存，再拉取' }
+  }
+  // 远端默认分支：ls-remote --symref origin HEAD → "ref: refs/heads/main\tHEAD"
+  let branch = ''
+  const sym = gitRun(repoRoot, ['ls-remote', '--symref', 'origin', 'HEAD'], 60000)
+  const m = /ref:\s+refs\/heads\/([^\s]+)\s+HEAD/.exec(sym.out || '')
+  if (m) branch = m[1]
+  if (!branch) {
+    // 没有 HEAD 指向（空仓库）或老 git：退回 init.defaultBranch 或 main
+    const guess = gitRun(repoRoot, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], 15000)
+    branch = (guess.out || '').replace(/^origin\//, '') || 'main'
+  }
+  const fetched = gitRun(repoRoot, ['fetch', 'origin', '--prune'], 300000)
+  if (fetched.code !== 0) {
+    return { ok: false, bootstrapped: false, error: `git fetch 失败：${fetched.err || fetched.error}` }
+  }
+  const hasCommit = gitRun(repoRoot, ['rev-parse', '--verify', '--quiet', 'HEAD'], 15000).code === 0
+  const remoteRef = `origin/${branch}`
+  const remoteExists = gitRun(repoRoot, ['rev-parse', '--verify', '--quiet', remoteRef], 15000).code === 0
+  if (!remoteExists) {
+    return { ok: true, bootstrapped: false, branch, error: '' }
+  }
+  if (!hasCommit) {
+    // 全新目录：直接按远端分支建本地分支并 checkout
+    const co = gitRun(repoRoot, ['checkout', '-f', '-B', branch, '--track', remoteRef], 120000)
+    if (co.code !== 0) {
+      const co2 = gitRun(repoRoot, ['checkout', '-f', '-b', branch, remoteRef], 120000)
+      if (co2.code !== 0) return { ok: false, bootstrapped: false, error: `git checkout 失败：${co2.err || co2.error || co.err}` }
+    }
+    return { ok: true, bootstrapped: true, branch, error: '' }
+  }
+  return { ok: true, bootstrapped: false, branch, error: '' }
+}
+
 /** 仓库是否具备同步条件（有 apply.ps1 或 sync-engine 的布局标志）。 */
 export function isRepoRoot(dir) {
   if (!dir) return false
@@ -1061,6 +1146,9 @@ export async function runCli(argv) {
     'ProfileName', 'profileName', 'Message', 'message', 'BackupDir', 'backupDir',
     'SnapshotKind', 'snapshotKind', 'PluginDir', 'pluginDir', 'Force', 'force',
     'AllowVersionDrift', 'allowVersionDrift',
+    // 0.6.49：还原/铺开的「只看不动」开关。面板生成的 POSIX 脚本第一步就调 -DryRun，
+    // 不认这个参数会打一行「未知参数」警告，还把 -DryRun 当多余参数忽略 —— 计划变真跑。
+    'DryRun', 'dryRun',
   ], 'node sync-engine.mjs <status|push|pull|restore> -RepoRoot <dir> -DshHome <dir>')
   const repoRoot = a.RepoRoot || a.repoRoot || process.cwd()
   const dshHome = a.DshHome || a.dshHome || localDshHome()
@@ -1185,21 +1273,31 @@ export async function runCli(argv) {
           console.error('本机仓库没有 origin：先在面板「云端仓库」里填远端地址并保存，再拉取')
           return 1
         }
-        const fetched = gitRun(repoRoot, ['fetch', 'origin', '--prune'])
-        if (fetched.code !== 0) {
-          console.error(`git fetch 失败：${fetched.err || fetched.error}`)
+        const boot = bootstrapRepo(repoRoot)
+        if (!boot.ok) {
+          console.error(boot.error)
           console.error('离线或认证失败时不会用旧仓库覆盖本机，已停下')
           return 1
         }
-        const worktree = gitRun(repoRoot, ['status', '--porcelain'], 60000).out
-        if (worktree) {
-          console.error('[!] 仓库工作区有未提交改动，跳过自动合并（先在仓库里提交或清理，再拉取）')
+        if (boot.bootstrapped) {
+          console.log(`已把云端仓库拉到本机（分支 ${boot.branch}）`)
         } else {
-          const merged = gitRun(repoRoot, ['merge', '--ff-only', '@{upstream}'], 120000)
-          if (merged.code !== 0) {
-            console.error(`[!] 快进合并失败：${merged.err || merged.error}（继续用当前本地仓库内容）`)
+          const worktree = gitRun(repoRoot, ['status', '--porcelain'], 60000).out
+          if (worktree) {
+            console.error('[!] 仓库工作区有未提交改动，跳过自动合并（先在仓库里提交或清理，再拉取）')
           } else {
-            console.log(merged.out || '仓库已是最新')
+            // 本机有提交但还没上游（例如换机后手工 init 过）：先绑上游再快进
+            const hasUpstream = gitRun(repoRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], 60000).code === 0
+            if (!hasUpstream && boot.branch) {
+              const local = gitRun(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'], 15000).out || boot.branch
+              gitRun(repoRoot, ['branch', '--set-upstream-to', `origin/${boot.branch}`, local], 30000)
+            }
+            const merged = gitRun(repoRoot, ['merge', '--ff-only', '@{upstream}'], 120000)
+            if (merged.code !== 0) {
+              console.error(`[!] 快进合并失败：${merged.err || merged.error}（继续用当前本地仓库内容）`)
+            } else {
+              console.log(merged.out || '仓库已是最新')
+            }
           }
         }
       }
@@ -1214,7 +1312,10 @@ export async function runCli(argv) {
       if (verdict.level === 'warn') {
         console.error(`[!] 宿主版本不一致（${verdict.reason}）：继续同步，但会剔除实验性 bundle`)
       }
-      const r = apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName })
+      // -DryRun：只打印「会写哪些项」，一个字节都不落盘。Windows 版的还原脚本
+      // 先跑一遍 -DryRun 再确认，POSIX 的还原脚本同样需要这一步（见 index.js buildSh）。
+      const dryRun = a.DryRun === true || a.dryRun === true
+      const r = apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName, dryRun })
       for (const wItem of r.written) console.log(`  > ${wItem}`)
       for (const s of r.skipped) console.log(`  - 跳过 ${s}`)
       for (const e of r.errors) console.error(`  [!] ${e}`)
@@ -1263,6 +1364,16 @@ export async function runCli(argv) {
       if (!src) {
         console.error(`快照里没有可还原的 profile（没找到 profile/ 或平铺的 package.json 等文件）：${snapDir}`)
         return 2
+      }
+      // -DryRun：只报计划（会覆盖哪些文件、留底到哪），不读不写 ——
+      // 与 PowerShell 版 restore.ps1 -DryRun 同语义，给确认框前面那一步用。
+      if (a.DryRun === true || a.dryRun === true) {
+        const countIn = (dir) => walk(dir).length
+        console.log(`[计划] 快照：${snapDir}（${kind}）`)
+        console.log(`[计划] 目标：${profileDir}`)
+        console.log(`[计划] 将写入 ${countIn(src)} 个文件；当前 profile 有 ${countIn(profileDir)} 个文件会被先留底`)
+        console.log(`[计划] 未做任何改动（-DryRun）`)
+        return 0
       }
       const restoreBackupRoot = join(dshHome, 'backups', `restore-before-${stamp}`)
       mkdirSync(profileDir, { recursive: true })
