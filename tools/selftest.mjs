@@ -2629,6 +2629,8 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     }
     // ① Windows 来的仓库：profile 与 AGENTS.md 都只摊到暂存目录
     const winRepo = mkRepo('win', '{"dependencies":{"@local/x":"link:{{ROOT:userHome}}/AppData/Local/x"}}', 'patch: D:\\c\\x.yml\n')
+    mkdirSync(join(winRepo, 'settings'), { recursive: true })
+    writeFileSync(join(winRepo, 'settings', 'dsh-workspaces.json'), JSON.stringify({ tables: { workspaces: { w1: { title: 'c', path: 'D:\\c' } } } }))
     const winHome = mkHome('winHome')
     const r1 = cxEng.apply({ repoRoot: winRepo, dshHome: winHome, appRoot: '/Applications/DeepSeek Harness.app' })
     check('跨平台护栏：Windows 仓库的 profile 不覆盖本机（摊到 profile-from-cloud）',
@@ -2641,6 +2643,17 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       readFileSync(join(winHome, 'AGENTS.md'), 'utf8').includes('本机全局提示')
       && existsSync(join(winHome, 'prompt-from-cloud', 'AGENTS.md'))
       && r1.skippedByScope.some((x) => x.startsWith('prompt/AGENTS.md:') && x.includes('不覆盖本机')))
+    check('跨平台护栏：云端那份整份工作区登记表也不铺（盘符路径会在面板里变成打不开的工作区）',
+      !existsSync(join(winHome, 'storages', 'workspace.json'))
+      && r1.skippedByScope.some((x) => x.includes('dsh-workspaces.json') && (x.includes('另一套系统') || x.includes('由 workspace 组'))))
+
+    // ①b workspace 组被关掉时，靠跨平台判定拦住那份快照
+    writeFileSync(join(winHome, 'config-sync-scope.json'), JSON.stringify({ groups: { workspace: { enabled: false } } }))
+    const r1b = cxEng.apply({ repoRoot: winRepo, dshHome: winHome, appRoot: '/Applications/DeepSeek Harness.app' })
+    check('跨平台护栏：workspace 组关着时，整份登记表仍被「另一套系统」这条拦住',
+      r1b.ok === true && !existsSync(join(winHome, 'storages', 'workspace.json'))
+      && r1b.skippedByScope.some((x) => x.includes('dsh-workspaces.json') && x.includes('另一套系统')))
+
     // ② 同一套系统（POSIX 路径）来的仓库：照常铺回去，护栏不能误伤
     const posixRepo = mkRepo('posix', '{"dependencies":{"x":"link:/Users/me/local/x"}}', 'patch: /Users/me/x.yml\n')
     const posixHome = mkHome('posixHome')

@@ -1173,6 +1173,8 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   // 用「用户确认过的根」（config-sync-roots.json）：自选目录必须变成 {{ROOT:x}}，
   // 否则会把本机绝对路径原样带进仓库，换机后对方文件指向一个不存在的目录。
   const roots = readSyncRoots(local.dshHome, local)
+  // 跨平台判定要在所有组之前算：settings 组里那份「整份工作区登记表」也要据此决定铺不铺。
+  const foreign = foreignRepoEvidence(repoRoot, local)
   const written = [], skipped = [], errors = [], conflicts = []
   let files = 0, bytes = 0
   applyBackupDir = ''
@@ -1218,7 +1220,6 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
 
   // 跨平台护栏：仓库来自另一套系统时，profile 的这几个文件**不覆盖本机**，
   // 而是摊到 <DshHome>/profile-from-cloud/ 让人自己比对（换过去会让 profile 直接起不来）。
-  const foreign = foreignRepoEvidence(repoRoot, local)
   if (foreign.foreign) {
     const stage = join(local.dshHome, 'profile-from-cloud')
     skippedByScope.push(`profile: 仓库来自另一套系统（${foreign.reasons.join('；')}），改为摊到 ${stage}，不覆盖本机 profile`)
@@ -1364,9 +1365,15 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
     for (const entry of SETTINGS_SOURCES) {
       if (!scopeItemEnabled(scope, 'settings', entry.id)) { skippedByScope.push(`settings/${entry.id}: 未勾选`); continue }
       // 工作区登记表有两份来源：settings 里那份是整份快照，workspace 组的合并版更靠谱。
-      // workspace 组开着时别用快照覆盖（与 apply.ps1 的判断一致）。
+      // ① workspace 组开着时别用快照覆盖（与 apply.ps1 的判断一致）；
+      // ② 仓库来自另一套系统时快照里全是 D:\... 路径，铺进去面板会多出一堆打不开的工作区
+      //    （实测：真机拉了一次，21 个工作区里 19 个是 Windows 盘符，本机 5 个被顶掉）。
       if (entry.id === 'dsh-workspaces.json' && scopeGroupEnabled(scope, 'workspace')) {
         skippedByScope.push('settings/dsh-workspaces.json: 由 workspace 组按合并方式还原，跳过整份快照')
+        continue
+      }
+      if (entry.id === 'dsh-workspaces.json' && foreign.foreign) {
+        skippedByScope.push('settings/dsh-workspaces.json: 云端登记表来自另一套系统（盘符路径），不覆盖本机工作区')
         continue
       }
       pull(`settings/${entry.id}`, settingsSourcePath(local.dshHome, profileDir, entry))
