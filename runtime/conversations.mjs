@@ -352,10 +352,16 @@ export function applyConversations({ repoRoot, dshHome, scope = null, backupRoot
           copyFileSync(dst, bk)
           result.conflicts.push(`conversations/${block.dst}/${relRepo}`)
         }
-        // 会话日志：先问护栏（它可能要求用并集覆盖，或干脆拒绝写坏档）
-        if (isSessionLogFile(rel) && guard && existsSync(dst)) {
+        // 会话日志：先问护栏（它可能要求用并集覆盖，或干脆拒绝写坏档）。
+        // 只对 .zstd 走护栏 —— 老版本的纯 .jsonl 日志不是 zstd 帧流，护栏会判「源无法解析」，
+        // 那种文件本来也不存在 lineage 分叉问题，整文件覆盖即可。
+        if (guard && /\.zstd$/i.test(rel) && existsSync(dst)) {
           const verdict = decideViaGuardCli(guard, abs, dst)
-          if (verdict && verdict.action === 'keep_dst') { result.skipped += 1; continue }
+          if (verdict && verdict.action === 'keep_dst') {
+            if (verdict.ok === false) result.errors.push(`conversations/${block.dst}/${relRepo}: ${verdict.detail || '护栏拒绝写入'}`)
+            result.skipped += 1
+            continue
+          }
           if (verdict && verdict.action === 'corrupt') {
             result.errors.push(`conversations/${block.dst}/${relRepo}: ${verdict.detail || '会话日志 seq 不连续，拒绝写入'}`)
             continue

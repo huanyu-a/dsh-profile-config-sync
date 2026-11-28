@@ -2535,6 +2535,19 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     check('会话铺回：按本机工作区路径重新编码目录名',
       app.ok === true && existsSync(join(homeB, 'sessions', conv.sessionDirName(wsB), 's1', 'session.v4.jsonl')),
       JSON.stringify(app.errors))
+    // 护栏是 CLI 调用的（与 PowerShell 侧同一条路）：位置要能找到，坏档要返回 corrupt 而不是抛异常
+    check('会话护栏：能在 runtime/tools 找到（发布包里那份）',
+      guardScript.endsWith(join('runtime', 'tools', 'session-log-guard.mjs')))
+    {
+      const junkA = join(stage, 'junk-a.jsonl'), junkB = join(stage, 'junk-b.jsonl')
+      writeFileSync(junkA, '{"seq":1}\n')
+      writeFileSync(junkB, '{"seq":9}\n')
+      const verdict = conv.decideViaGuardCli(guardScript, junkA, junkB)
+      // 非 zstd 的源会被判「无法解析」→ keep_dst（不许覆盖），这正是我们要的保守行为
+      check('会话护栏：读不懂的源判 keep_dst（不覆盖），且不抛异常',
+        verdict && verdict.action === 'keep_dst' && verdict.ok === false,
+        String(verdict && verdict.detail).slice(0, 80))
+    }
     check('会话铺回：内容字节一致 + 附件一起回来',
       readFileSync(join(homeB, 'sessions', conv.sessionDirName(wsB), 's1', 'session.v4.jsonl'), 'utf8')
         === readFileSync(join(homeA, 'sessions', conv.sessionDirName(wsA), 's1', 'session.v4.jsonl'), 'utf8')
