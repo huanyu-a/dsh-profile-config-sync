@@ -65,7 +65,7 @@ DSH 的配置散在 `~/.dsh` 的十几处：profile、全局提示、Skills、Ag
 | 插件市场 | 客户端「插件市场 → 发现」搜「配置备份与同步」（`market-index.json` 登记的 `source.type` 是 `npm`，装的就是 registry 上的在线版） |
 | 离线 tgz | `pnpm add ./dsh-profile-config-sync-0.6.49.tgz`（内网机器用这个） |
 
-**发布状态**：`v0.6.49`（macOS 全面可用 + 平台分区）已在本机验证并打 tag；npm 上的同名包同步发布（`npm i dsh-profile-config-sync`）。多端测试安装：`pnpm add ./dsh-profile-config-sync-0.6.49.tgz` 或从 npm 安装。
+**发布状态**：`v0.7.1`（修 Windows 自更新必失败）与 `v0.7.0`（macOS 全面可用 + 平台分区）均已发布；npm 同名包同步（`npm i dsh-profile-config-sync`）。多端测试安装：`pnpm add dsh-profile-config-sync@0.7.1`。
 
 要正式发布时（需要有权限的账号，我不会擅自 push）：
 
