@@ -2606,6 +2606,20 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       === '{"reloadCount": 0, "catalogSyncedAt": 0, "keep": 7}')
   }
 
+  // ── 仓库自带执行体：另一台机器没有插件副本时也能跑 apply ──
+  {
+    const rr = mkdtempSync(join(tmpdir(), 'cfg-sync-runner-'))
+    const engR = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'sync-engine.mjs')).href)
+    const wrote = engR.ensureRepoRunner(rr)
+    const need = ['sync-engine.mjs', 'platform.mjs', 'contract.mjs', 'machines.mjs', 'webdav.mjs', 'conversations.mjs',
+      'zip.mjs', 'extra-rules.mjs', 'settings-sources.mjs', 'porting.mjs', 'tools/session-log-guard.mjs', 'tools/session-log-lib.mjs']
+    const missing = need.filter((n) => !existsSync(join(rr, n)))
+    check('仓库自带执行体齐全（引擎 import 的模块 + 会话护栏都在，新机器不用插件副本也能跑）',
+      wrote.length === need.length && missing.length === 0, `missing=${missing.join(',')}`)
+    const again = engR.ensureRepoRunner(rr)
+    check('执行体幂等：内容没变不重写', again.length === 0, again.join(','))
+  }
+
   // ── 跨平台移植（runtime/porting.mjs）：能翻的翻，翻不出来的丢掉 ──
   {
     const port = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'porting.mjs')).href)

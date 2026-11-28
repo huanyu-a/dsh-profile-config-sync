@@ -1798,16 +1798,25 @@ function buildWarnings({ local, contract, repoRoot }) {
 export function ensureRepoRunner(repoRoot) {
   const here = dirname(fileURLToPath(import.meta.url))
   // 会话记录组的实现也是随仓库走的（另一台机器没有插件副本时靠仓库这份跑 apply）
-  const names = ['sync-engine.mjs', 'platform.mjs', 'contract.mjs', 'machines.mjs', 'webdav.mjs', 'conversations.mjs']
+  // 这几个是引擎自己 import 的模块，缺一个就 `ERR_MODULE_NOT_FOUND`：
+  // 另一台机器没有插件副本时，全靠仓库这份跑 apply（0.6.49 新增的组都依赖它们）。
+  const names = [
+    'sync-engine.mjs', 'platform.mjs', 'contract.mjs', 'machines.mjs', 'webdav.mjs', 'conversations.mjs',
+    'zip.mjs', 'extra-rules.mjs', 'settings-sources.mjs', 'porting.mjs',
+  ]
+  // 会话日志护栏（apply 还原会话时按 CLI 调它做 seq 比对），仓库里也要有一份，
+  // 否则新机器上只会静默降级成「不比对」。
+  const tools = ['session-log-guard.mjs', 'session-log-lib.mjs']
+  const pairs = names.map((n) => [join(here, n), join(repoRoot, n)])
+  for (const t of tools) pairs.push([join(here, 'tools', t), join(repoRoot, 'tools', t)])
   const written = []
-  for (const name of names) {
-    const src = join(here, name)
+  for (const [src, dst] of pairs) {
     if (!isFile(src)) continue
-    const dst = join(repoRoot, name)
     try {
+      mkdirSync(dirname(dst), { recursive: true })
       let same = false
       try { same = existsSync(dst) && fileHash(src) === fileHash(dst) } catch { same = false }
-      if (!same) { copyFileSync(src, dst); written.push(name) }
+      if (!same) { copyFileSync(src, dst); written.push(relative(repoRoot, dst).split(sep).join('/')) }
     } catch { /* 写不进去不阻断同步：仓库里已有旧版执行体也能跑 */ }
   }
   return written
