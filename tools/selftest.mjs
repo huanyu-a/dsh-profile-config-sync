@@ -2606,6 +2606,47 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       === '{"reloadCount": 0, "catalogSyncedAt": 0, "keep": 7}')
   }
 
+  // ── 工作区登记表（workspace 组，0.6.49 起 registry-only：只登记表，不搬文件树）──
+  {
+    const wsStage = mkdtempSync(join(tmpdir(), 'cfg-sync-ws-'))
+    const wsA = join(wsStage, 'A'), wsB = join(wsStage, 'B'), wsRepo = join(wsStage, 'repo'), proj = join(wsStage, 'projA')
+    mkdirSync(join(wsA, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(wsA, 'profiles', 'desktop', 'package.json'), '{"name":"dsh-profile-desktop"}')
+    mkdirSync(join(wsA, 'storages'), { recursive: true })
+    mkdirSync(proj, { recursive: true })
+    writeFileSync(join(proj, 'heavy.bin'), Buffer.alloc(2048, 1))
+    writeFileSync(join(wsA, 'storages', 'workspace.json'), JSON.stringify({
+      tables: { workspaces: {
+        'ws-1': { title: '我的项目', path: proj, sessionIds: ['s1'], pinnedSessionIds: ['s1'], createdAt: 'c', updatedAt: 'u' },
+        'ws-2': { title: 'a/b:c', path: join(wsStage, 'other'), sessionIds: [] },
+      } },
+      global: { defaultWorkspaceId: 'ws-1', archivedSessionIds: ['s9'] },
+    }))
+    const wsEng = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'sync-engine.mjs')).href)
+    const cap = wsEng.capture({ repoRoot: wsRepo, dshHome: wsA, appRoot: '/Applications/DeepSeek Harness.app', workspaceHome: wsStage })
+    const reg = JSON.parse(readFileSync(join(wsRepo, 'workspace', 'workspace-registry.json'), 'utf8'))
+    check('工作区组只写登记表：mode=registry-only，且仓库里没有工作区文件树',
+      cap.ok === true && reg.mode === 'registry-only' && !existsSync(join(wsRepo, 'workspace', reg.workspaces[0].slot)),
+      reg.mode)
+    check('工作区登记表：槽名去非法字符、路径占位符化、会话 id 与钉住保留',
+      reg.workspaces.some((w) => w.slot === 'a_b_c')
+      && reg.workspaces.some((w) => String(w.path).startsWith('{{WORKSPACE_HOME}}'))
+      && reg.workspaces.find((w) => w.id === 'ws-1').pinnedSessionIds.join(',') === 's1'
+      && reg.global.defaultWorkspaceId === 'ws-1')
+    const cap2 = wsEng.capture({ repoRoot: wsRepo, dshHome: wsA, appRoot: '/Applications/DeepSeek Harness.app', workspaceHome: wsStage })
+    check('工作区登记表幂等', cap2.changed.filter((x) => x.startsWith('workspace')).length === 0, String(cap2.changed))
+    mkdirSync(join(wsB, 'profiles', 'desktop'), { recursive: true })
+    writeFileSync(join(wsB, 'profiles', 'desktop', 'package.json'), '{"name":"dsh-profile-desktop"}')
+    mkdirSync(join(wsB, 'storages'), { recursive: true })
+    writeFileSync(join(wsB, 'storages', 'workspace.json'), JSON.stringify({ version: 1, tables: { workspaces: { 'ws-local': { title: '本机独有', path: join(wsStage, 'local'), sessionIds: ['ls1'] } } }, global: {} }))
+    const app = wsEng.apply({ repoRoot: wsRepo, dshHome: wsB, appRoot: '/Applications/DeepSeek Harness.app', workspaceHome: wsStage })
+    const merged = JSON.parse(readFileSync(join(wsB, 'storages', 'workspace.json'), 'utf8'))
+    check('工作区合并还原：本机独有的保留、云端缺的补入（路径展开）、settings 快照跳过',
+      app.ok === true && merged.tables.workspaces['ws-local'].title === '本机独有'
+      && merged.tables.workspaces['ws-1'].path === proj
+      && app.skippedByScope.some((x) => x.includes('dsh-workspaces.json') && x.includes('跳过')))
+  }
+
   // ── 本地源码插件（local-plugins）+ 最小 zip 读写（0.6.49 起 Node 引擎也做）──
   {
     const zip = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'zip.mjs')).href)

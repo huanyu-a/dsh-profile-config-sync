@@ -4076,7 +4076,7 @@ function countEntries(dir) {
  * profile（4 个文件）/ prompt / skills / presets —— 别的组在那台机器上根本不会被同步。
  * null 表示「全部组」，非 Windows 时是白名单。
  */
-const ENGINE_SYNCED_GROUPS = IS_WIN ? null : new Set(['profile', 'prompt', 'skills', 'presets', 'storages-record', 'settings', 'mnemon', 'local-plugins', 'plugin-data', 'extra', 'conversations'])
+const ENGINE_SYNCED_GROUPS = IS_WIN ? null : new Set(['profile', 'prompt', 'skills', 'presets', 'storages-record', 'settings', 'mnemon', 'local-plugins', 'plugin-data', 'extra', 'workspace', 'conversations'])
 
 /** profile 目录：优先 desktop，其次 profiles 下唯一的那一个 */
 function resolveProfileDir(dshHome) {

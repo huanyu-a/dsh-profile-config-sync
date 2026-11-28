@@ -784,6 +784,102 @@ function captureLocalPlugins({ repoRoot, profileDir, dshHome, scope }) {
   return result
 }
 
+/** 工作区槽名：标题去掉 Windows 非法字符（与 capture.ps1 的 Get-SlotName 一致）。 */
+function workspaceSlotName(title, id) {
+  let s = String(title || '').trim() || String(id || '')
+  s = s.replace(/[\\/:*?<>|]/g, '_').trim().replace(/\.+$/, '')
+  return s || String(id || '')
+}
+
+/**
+ * 工作区登记表（0.6.49 起 macOS/Linux 也同步）。
+ *
+ * **只同步登记表，不搬工作区里的文件树** —— 实测这台机器 5 个登记工作区里 `~/projects` 就 1.9 GB，
+ * 全搬进 git 仓库等于把 NAS 当网盘用，且推送一次要很久。登记表本身才是跨机要看的东西：
+ * 有哪些工作区、各自在哪、挂哪些会话、哪个是默认。
+ * 本机 DSH 自己会维护 `storages/workspace.json`，所以 apply 侧**不覆盖**它，只写一份旁路文件供参考。
+ */
+function captureWorkspaceRegistry({ repoRoot, dshHome, scope, roots }) {
+  const result = { files: 0, bytes: 0, changed: [], errors: [], notes: [] }
+  let reg = null
+  try { reg = JSON.parse(readFileSync(join(dshHome, 'storages', 'workspace.json'), 'utf8')) } catch { reg = null }
+  const table = reg && reg.tables && reg.tables.workspaces
+  if (!table || typeof table !== 'object') {
+    result.notes.push('本机没有工作区登记表（storages/workspace.json），跳过')
+    return result
+  }
+  const list = []
+  const usedSlots = new Map()
+  for (const [id, w] of Object.entries(table)) {
+    if (!w || typeof w !== 'object') continue
+    if (!scopeItemEnabled(scope, 'workspace', id)) { result.notes.push(`工作区 ${id}: 未勾选`); continue }
+    const title = typeof w.title === 'string' && w.title ? w.title : id
+    let slot = workspaceSlotName(title, id)
+    if (usedSlots.has(slot)) slot = workspaceSlotName(id, id)
+    let n = 1
+    while (usedSlots.has(slot)) { slot = `${workspaceSlotName(title, id)}-${n}`; n += 1 }
+    usedSlots.set(slot, true)
+    const ids = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x) : [])
+    list.push({
+      id,
+      title,
+      slot,
+      path: typeof w.path === 'string' ? toTokenText(w.path, roots) : '',
+      sessionIds: ids(w.sessionIds),
+      archivedSessionIds: ids(w.archivedSessionIds),
+      pinnedSessionIds: ids(w.pinnedSessionIds),
+      createdAt: typeof w.createdAt === 'string' ? w.createdAt : '',
+      updatedAt: typeof w.updatedAt === 'string' ? w.updatedAt : '',
+      // 本机这条工作区占多少地方 —— 面板据此提醒「这组只同步登记表，不搬文件」
+      localFiles: countFilesQuick(w.path),
+    })
+  }
+  list.sort((a, b) => a.id.localeCompare(b.id))
+  const g = reg.global || {}
+  const manifest = {
+    unit: { name: 'dsh-workspace-sync', version: 1 },
+    mode: 'registry-only',
+    workspaces: list,
+    global: {
+      initialized: true,
+      defaultWorkspaceId: typeof g.defaultWorkspaceId === 'string' ? g.defaultWorkspaceId : '',
+      workspaceIds: list.map((x) => x.id),
+      archivedSessionIds: Array.isArray(g.archivedSessionIds) ? g.archivedSessionIds.filter((x) => typeof x === 'string' && x) : [],
+      pinnedSessionIds: Array.isArray(g.pinnedSessionIds) ? g.pinnedSessionIds.filter((x) => typeof x === 'string' && x) : [],
+    },
+  }
+  const text = JSON.stringify(manifest, null, 2) + '\n'
+  const dst = join(repoRoot, 'workspace', 'workspace-registry.json')
+  let before = ''
+  try { before = readFileSync(dst, 'utf8') } catch { /* 新文件 */ }
+  if (before !== text) {
+    mkdirSync(dirname(dst), { recursive: true })
+    writeFileSync(dst, text, 'utf8')
+    result.changed.push('workspace/workspace-registry.json')
+    result.files += 1
+    result.bytes += Buffer.byteLength(text, 'utf8')
+  }
+  result.notes.push(`工作区登记表：${list.length} 个工作区（只同步登记表，不搬工作区文件）`)
+  return result
+}
+
+/** 数一个目录里有多少文件（深度 3、上限 5000，只用来给面板显示体量，不做同步判断）。 */
+function countFilesQuick(dir) {
+  if (!dir || !existsSync(dir)) return 0
+  let n = 0
+  const visit = (d, depth) => {
+    if (depth > 3 || n >= 5000) return
+    let entries = []
+    try { entries = readdirSync(d, { withFileTypes: true }) } catch { return }
+    for (const e of entries) {
+      if (n >= 5000) return
+      if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) visit(join(d, e.name), depth + 1) } else if (e.isFile()) n += 1
+    }
+  }
+  visit(dir, 0)
+  return n
+}
+
 export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName = 'desktop' } = {}) {
   const local = probeLocal({ dshHome, appRoot, workspaceHome })
   // 用「用户确认过的根」（config-sync-roots.json）：自选目录必须变成 {{ROOT:x}}，
@@ -974,6 +1070,21 @@ export function capture({ repoRoot, dshHome, appRoot, workspaceHome, profileName
     }
   }
 
+  // 3.5) 工作区登记表（只登记表，不搬文件树）
+  if (gated('workspace')) skipScopedGroup(scope, repoRoot, 'workspace', skippedByScope)
+  else {
+    try {
+      const r = captureWorkspaceRegistry({ repoRoot, dshHome: local.dshHome, scope, roots })
+      files += r.files
+      bytes += r.bytes
+      changed.push(...r.changed)
+      errors.push(...r.errors)
+      for (const n of r.notes) skippedByScope.push(`workspace: ${n}`)
+    } catch (e) {
+      errors.push(`workspace: ${(e && e.message) || e}`)
+    }
+  }
+
   // 3.6) 插件数据 / 额外路径（规则与面板、PowerShell 共用 runtime/extra-rules.mjs）
   try {
     const extraCfg = readExtraConfig(local.dshHome)
@@ -1133,6 +1244,75 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
     }
   } else skippedByScope.push('local-plugins: 未勾选同步')
 
+  // 工作区登记表：只写一份旁路文件（不覆盖 DSH 自己的 storages/workspace.json）
+  if (scopeGroupEnabled(scope, 'workspace')) {
+    const regFile = join(repoRoot, 'workspace', 'workspace-registry.json')
+    if (existsSync(regFile) && !dryRun) {
+      try {
+        const cloud = JSON.parse(readFileSync(regFile, 'utf8'))
+        const cloudList = Array.isArray(cloud.workspaces) ? cloud.workspaces : []
+        const localIds = new Set()
+        try {
+          const localReg = JSON.parse(readFileSync(join(local.dshHome, 'storages', 'workspace.json'), 'utf8'))
+          for (const id of Object.keys((localReg.tables && localReg.tables.workspaces) || {})) localIds.add(id)
+        } catch { /* 本机还没有登记表 */ }
+        const missing = cloudList.filter((w) => w && w.id && !localIds.has(w.id))
+        // 合并还原：本机已有的工作区一律不动，只补「本机没有的」；
+        // 写入前留底（与其它组同一套 apply-<时间戳> 备份）。
+        try {
+          const regPath = join(local.dshHome, 'storages', 'workspace.json')
+          let localReg = null
+          try { localReg = JSON.parse(readFileSync(regPath, 'utf8')) } catch { localReg = null }
+          const base = localReg && typeof localReg === 'object' ? localReg : { version: 1, tables: { workspaces: {} }, global: {} }
+          base.tables = base.tables && typeof base.tables === 'object' ? base.tables : {}
+          base.tables.workspaces = base.tables.workspaces && typeof base.tables.workspaces === 'object' ? base.tables.workspaces : {}
+          const added = []
+          for (const w of missing) {
+            base.tables.workspaces[w.id] = {
+              title: w.title || w.id,
+              path: expandTokenText(String(w.path || ''), roots),
+              sessionIds: Array.isArray(w.sessionIds) ? w.sessionIds : [],
+              archivedSessionIds: Array.isArray(w.archivedSessionIds) ? w.archivedSessionIds : [],
+              pinnedSessionIds: Array.isArray(w.pinnedSessionIds) ? w.pinnedSessionIds : [],
+              createdAt: w.createdAt || '',
+              updatedAt: w.updatedAt || '',
+            }
+            added.push(w.id)
+          }
+          if (added.length) {
+            base.global = base.global && typeof base.global === 'object' ? base.global : {}
+            if (!base.global.defaultWorkspaceId && cloud.global && cloud.global.defaultWorkspaceId && added.includes(cloud.global.defaultWorkspaceId)) {
+              base.global.defaultWorkspaceId = cloud.global.defaultWorkspaceId
+            }
+            const merged = JSON.stringify(base, null, 2) + '\n'
+            let before = ''
+            try { before = readFileSync(regPath, 'utf8') } catch { before = '' }
+            if (before !== merged) {
+              backupBeforeWrite(regPath, regPath, local.dshHome, errors)
+              mkdirSync(dirname(regPath), { recursive: true })
+              writeFileSync(regPath, merged, 'utf8')
+              conflicts.push(`storages/workspace.json（补入 ${added.length} 个工作区）`)
+            }
+          }
+        } catch (e) {
+          errors.push(`workspace: 合并本机登记表失败：${(e && e.message) || e}`)
+        }
+
+        const sidecar = join(local.dshHome, 'workspace-from-cloud.json')
+        if (cloudList.length) {
+          writeFileSync(sidecar, JSON.stringify({
+            note: '云端仓库里的工作区登记表（只读参考；不会覆盖本机 storages/workspace.json）',
+            from: 'workspace/workspace-registry.json',
+            workspaces: cloudList.map((w) => ({ ...w, path: expandTokenText(String(w.path || ''), roots) })),
+          }, null, 2) + '\n', 'utf8')
+        }
+        skippedByScope.push(`workspace: 云端登记表 ${cloudList.length} 个工作区，本机缺 ${missing.length} 个（清单写到 ${sidecar}）`)
+      } catch (e) {
+        errors.push(`workspace: 读云端登记表失败：${(e && e.message) || e}`)
+      }
+    } else skippedByScope.push('workspace: 仓库里没有工作区登记表')
+  } else skippedByScope.push('workspace: 未勾选同步')
+
   // 技能市场台账 / 记忆数据
   if (scopeGroupEnabled(scope, 'storages-record')) {
     const dataDir = join(local.dshHome, 'storages', '@montersy123', 'dsh-skill-market', 'data')
@@ -1156,6 +1336,12 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   if (scopeGroupEnabled(scope, 'settings')) {
     for (const entry of SETTINGS_SOURCES) {
       if (!scopeItemEnabled(scope, 'settings', entry.id)) { skippedByScope.push(`settings/${entry.id}: 未勾选`); continue }
+      // 工作区登记表有两份来源：settings 里那份是整份快照，workspace 组的合并版更靠谱。
+      // workspace 组开着时别用快照覆盖（与 apply.ps1 的判断一致）。
+      if (entry.id === 'dsh-workspaces.json' && scopeGroupEnabled(scope, 'workspace')) {
+        skippedByScope.push('settings/dsh-workspaces.json: 由 workspace 组按合并方式还原，跳过整份快照')
+        continue
+      }
       pull(`settings/${entry.id}`, settingsSourcePath(local.dshHome, profileDir, entry))
     }
   } else skippedByScope.push('settings: 未勾选同步')
