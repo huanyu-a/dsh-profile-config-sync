@@ -1216,10 +1216,31 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
     return { ok: false, errors: [`profile 目录不存在：${profileDir}（本机还没跑过这个 profile？）`], written, skipped, files, bytes, local }
   }
 
-  pull('profile/package.json', join(profileDir, 'package.json'))
-  pull('profile/cordis.patch.yml', join(profileDir, 'cordis.patch.yml'))
-  pull('profile/cordis.yml', join(profileDir, 'cordis.yml'))
-  pull('profile/pnpm-workspace.yaml', join(profileDir, 'pnpm-workspace.yaml'))
+  // 跨平台护栏：仓库来自另一套系统时，profile 的这几个文件**不覆盖本机**，
+  // 而是摊到 <DshHome>/profile-from-cloud/ 让人自己比对（换过去会让 profile 直接起不来）。
+  const foreign = foreignRepoEvidence(repoRoot, local)
+  if (foreign.foreign) {
+    const stage = join(local.dshHome, 'profile-from-cloud')
+    skippedByScope.push(`profile: 仓库来自另一套系统（${foreign.reasons.join('；')}），改为摊到 ${stage}，不覆盖本机 profile`)
+    for (const leaf of ['package.json', 'cordis.patch.yml', 'cordis.yml', 'pnpm-workspace.yaml', 'pnpm-lock.yaml']) {
+      const srcRel = `profile/${leaf}`
+      if (!existsSync(join(repoRoot, srcRel))) continue
+      if (dryRun) { written.push(`${srcRel} → profile-from-cloud/${leaf}`); continue }
+      try {
+        mkdirSync(stage, { recursive: true })
+        const text = readFileSync(join(repoRoot, srcRel), 'utf8')
+        writeFileSync(join(stage, leaf), expandTokenText(text, roots).replace(/\r\n/g, '\n'), 'utf8')
+        written.push(`profile-from-cloud/${leaf}`)
+      } catch (e) {
+        errors.push(`profile-from-cloud/${leaf}: ${(e && e.message) || e}`)
+      }
+    }
+  } else {
+    pull('profile/package.json', join(profileDir, 'package.json'))
+    pull('profile/cordis.patch.yml', join(profileDir, 'cordis.patch.yml'))
+    pull('profile/cordis.yml', join(profileDir, 'cordis.yml'))
+    pull('profile/pnpm-workspace.yaml', join(profileDir, 'pnpm-workspace.yaml'))
+  }
 
   // 本地源码插件：解到 <DshHome>/local-plugins-restore/<名字>/，再由用户决定 link 到 profile
   // （不硬写进客户端包：macOS 上是签名过的 .app，写进去会破坏签名，而且 DSH 也不从那里加载插件）
@@ -1268,9 +1289,15 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
           base.tables.workspaces = base.tables.workspaces && typeof base.tables.workspaces === 'object' ? base.tables.workspaces : {}
           const added = []
           for (const w of missing) {
+            const p = expandTokenText(String(w.path || ''), roots)
+            const usable = IS_WIN ? /^[A-Za-z]:[\\/]/.test(p) : p.startsWith('/')
+            if (!usable) {
+              skippedByScope.push(`workspace ${w.id}: 云端路径 ${w.path} 在本机不可用，未写入登记表`)
+              continue
+            }
             base.tables.workspaces[w.id] = {
               title: w.title || w.id,
-              path: expandTokenText(String(w.path || ''), roots),
+              path: p,
               sessionIds: Array.isArray(w.sessionIds) ? w.sessionIds : [],
               archivedSessionIds: Array.isArray(w.archivedSessionIds) ? w.archivedSessionIds : [],
               pinnedSessionIds: Array.isArray(w.pinnedSessionIds) ? w.pinnedSessionIds : [],
@@ -1347,7 +1374,23 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   } else skippedByScope.push('settings: 未勾选同步')
   if (!scopeGroupEnabled(scope, 'prompt')) skippedByScope.push('prompt: 未勾选同步')
   else {
-    if (scopeItemEnabled(scope, 'prompt', 'AGENTS.md')) pull('prompt/AGENTS.md', join(local.dshHome, 'AGENTS.md'))
+    const agentsRepo = join(repoRoot, 'prompt', 'AGENTS.md')
+    // 全局提示属于「这台机器的策略」，跨平台拉取时一律摊到暂存目录：
+    // 直接覆盖会把另一套系统的路径与命令（例如 DSH 自带的 PowerShell 运行时位置）搬到本机。
+    const agentsForeign = Boolean(foreign.foreign) && existsSync(agentsRepo)
+    if (scopeItemEnabled(scope, 'prompt', 'AGENTS.md')) {
+      if (agentsForeign) {
+        const dst = join(local.dshHome, 'prompt-from-cloud', 'AGENTS.md')
+        if (!dryRun) {
+          try {
+            mkdirSync(dirname(dst), { recursive: true })
+            writeFileSync(dst, readFileSync(agentsRepo, 'utf8'), 'utf8')
+            written.push('prompt-from-cloud/AGENTS.md')
+          } catch (e) { errors.push(`prompt-from-cloud/AGENTS.md: ${(e && e.message) || e}`) }
+        }
+        skippedByScope.push(`prompt/AGENTS.md: 来自另一套系统（含 Windows 路径），改为摊到 ${dst}，不覆盖本机全局提示`)
+      } else pull('prompt/AGENTS.md', join(local.dshHome, 'AGENTS.md'))
+    }
     else skippedByScope.push('prompt/AGENTS.md: 未勾选')
     if (scopeItemEnabled(scope, 'prompt', 'prompt-inject.md')) pull('prompt/prompt-inject.md', join(local.dshHome, 'prompt-inject.md'))
     else skippedByScope.push('prompt/prompt-inject.md: 未勾选')
@@ -1423,6 +1466,41 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
  * 只读体检（面板 status 路由用）。
  * 不做任何写操作，可以安全地在客户端运行时调用。
  */
+/**
+ * 判断「这个仓库是另一套操作系统上传的吗」。
+ *
+ * 为什么要判：Windows 上推上来的 `profile/package.json` 里有
+ * `"@local/xxx": "link:{{ROOT:userHome}}/AppData/Local/xxx"` 这类依赖，`cordis.patch.yml`
+ * 里写死了 `D:\c\...` 路径。铺到 macOS 上，pnpm 解不出这个 link 依赖 → profile 起不来，
+ * 客户端下次启动直接报错。跨平台同步是 0.6.49 才有的能力，这条护栏必须自己带。
+ *
+ * 只看证据，不看平台自报（老版本的 host-contract.json 连 os 字段都没有）：
+ *   ① 契约里的 platformFamily 与本机不同；
+ *   ② `profile/package.json` 里出现盘符 / AppData（Windows 特征）；
+ *   ③ `profile/cordis.patch.yml` 里出现 `X:\` 路径。
+ */
+function foreignRepoEvidence(repoRoot, local) {
+  const reasons = []
+  const mine = platformFamily()
+  const contract = repoRoot ? readContract(repoRoot) : null
+  if (contract && contract.platformFamily && String(contract.platformFamily).toLowerCase() !== String(mine).toLowerCase()) {
+    reasons.push(`仓库契约记录的平台是 ${contract.platformFamily}，本机是 ${mine}`)
+  }
+  const pkgPath = join(repoRoot, 'profile', 'package.json')
+  if (existsSync(pkgPath) && !IS_WIN) {
+    let text = ''
+    try { text = readFileSync(pkgPath, 'utf8') } catch { text = '' }
+    if (/AppData|[A-Za-z]:\\\\/.test(text)) reasons.push('profile/package.json 里有 Windows 路径（盘符 / AppData）')
+  }
+  const patchPath = join(repoRoot, 'profile', 'cordis.patch.yml')
+  if (existsSync(patchPath) && !IS_WIN) {
+    let text = ''
+    try { text = readFileSync(patchPath, 'utf8') } catch { text = '' }
+    if (/[A-Za-z]:\\\\/.test(text)) reasons.push('profile/cordis.patch.yml 里有 Windows 盘符路径')
+  }
+  return { foreign: reasons.length > 0, reasons }
+}
+
 /**
  * 会话还原 + seq 护栏脚本定位。
  * 顺序：插件自带的 tools/ → 插件上一级的 tools/（仓库工作副本就是这种布局）→

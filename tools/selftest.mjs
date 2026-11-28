@@ -2606,6 +2606,52 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       === '{"reloadCount": 0, "catalogSyncedAt": 0, "keep": 7}')
   }
 
+  // ── 跨平台护栏：仓库来自另一套系统时，profile / 全局提示不许覆盖本机 ──
+  {
+    const cxStage = mkdtempSync(join(tmpdir(), 'cfg-sync-cx-'))
+    const cxEng = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'sync-engine.mjs')).href)
+    const mkHome = (name) => {
+      const h = join(cxStage, name)
+      mkdirSync(join(h, 'profiles', 'desktop'), { recursive: true })
+      writeFileSync(join(h, 'profiles', 'desktop', 'package.json'), '{"name":"dsh-profile-desktop","dependencies":{"keep-me":"1.0.0"}}')
+      writeFileSync(join(h, 'profiles', 'desktop', 'cordis.patch.yml'), '# mine\n')
+      writeFileSync(join(h, 'AGENTS.md'), '# 本机全局提示\n')
+      return h
+    }
+    const mkRepo = (name, pkgText, patchText) => {
+      const r = join(cxStage, name)
+      mkdirSync(join(r, 'profile'), { recursive: true })
+      mkdirSync(join(r, 'prompt'), { recursive: true })
+      writeFileSync(join(r, 'profile', 'package.json'), pkgText)
+      writeFileSync(join(r, 'profile', 'cordis.patch.yml'), patchText)
+      writeFileSync(join(r, 'prompt', 'AGENTS.md'), '# 云端全局提示\n')
+      return r
+    }
+    // ① Windows 来的仓库：profile 与 AGENTS.md 都只摊到暂存目录
+    const winRepo = mkRepo('win', '{"dependencies":{"@local/x":"link:{{ROOT:userHome}}/AppData/Local/x"}}', 'patch: D:\\c\\x.yml\n')
+    const winHome = mkHome('winHome')
+    const r1 = cxEng.apply({ repoRoot: winRepo, dshHome: winHome, appRoot: '/Applications/DeepSeek Harness.app' })
+    check('跨平台护栏：Windows 仓库的 profile 不覆盖本机（摊到 profile-from-cloud）',
+      r1.ok === true
+      && readFileSync(join(winHome, 'profiles', 'desktop', 'package.json'), 'utf8').includes('keep-me')
+      && readFileSync(join(winHome, 'profiles', 'desktop', 'cordis.patch.yml'), 'utf8').includes('mine')
+      && existsSync(join(winHome, 'profile-from-cloud', 'package.json'))
+      && r1.skippedByScope.some((x) => x.startsWith('profile:') && x.includes('另一套系统')))
+    check('跨平台护栏：全局提示也不覆盖本机（摊到 prompt-from-cloud）',
+      readFileSync(join(winHome, 'AGENTS.md'), 'utf8').includes('本机全局提示')
+      && existsSync(join(winHome, 'prompt-from-cloud', 'AGENTS.md'))
+      && r1.skippedByScope.some((x) => x.startsWith('prompt/AGENTS.md:') && x.includes('不覆盖本机')))
+    // ② 同一套系统（POSIX 路径）来的仓库：照常铺回去，护栏不能误伤
+    const posixRepo = mkRepo('posix', '{"dependencies":{"x":"link:/Users/me/local/x"}}', 'patch: /Users/me/x.yml\n')
+    const posixHome = mkHome('posixHome')
+    const r2 = cxEng.apply({ repoRoot: posixRepo, dshHome: posixHome, appRoot: '/Applications/DeepSeek Harness.app' })
+    check('跨平台护栏不误伤：本平台仓库照常覆盖 profile 与全局提示',
+      r2.ok === true
+      && readFileSync(join(posixHome, 'profiles', 'desktop', 'package.json'), 'utf8').includes('/Users/me/local/x')
+      && readFileSync(join(posixHome, 'AGENTS.md'), 'utf8').includes('云端全局提示')
+      && !existsSync(join(posixHome, 'profile-from-cloud')))
+  }
+
   // ── 工作区登记表（workspace 组，0.6.49 起 registry-only：只登记表，不搬文件树）──
   {
     const wsStage = mkdtempSync(join(tmpdir(), 'cfg-sync-ws-'))
