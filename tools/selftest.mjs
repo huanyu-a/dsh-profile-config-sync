@@ -2606,6 +2606,84 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
       === '{"reloadCount": 0, "catalogSyncedAt": 0, "keep": 7}')
   }
 
+  // ── 跨平台移植（runtime/porting.mjs）：能翻的翻，翻不出来的丢掉 ──
+  {
+    const port = await import(pathToFileURL(join(repoRootOfTools, 'runtime', 'porting.mjs')).href)
+    const pStage = mkdtempSync(join(tmpdir(), 'cfg-sync-port-'))
+    const home = join(pStage, 'home')
+    mkdirSync(join(home, 'projects', 'FavsHub_web'), { recursive: true })
+    mkdirSync(join(home, 'Documents', 'notes'), { recursive: true })
+    writeFileSync(join(home, 'projects', 'FavsHub_web', 'package.json'), '{"name":"fh"}')
+    writeFileSync(join(home, 'Documents', 'notes', 'package.json'), '{"name":"plug"}')
+    const ctx = port.portContext({
+      userHome: home,
+      roots: { userHome: home },
+      localWorkspaces: [{ title: 'FavsHub_web', path: join(home, 'projects', 'FavsHub_web') }],
+      portConfig: { paths: [{ from: 'E:\\data', to: '{{ROOT:userHome}}/Documents' }] },
+      expand: (t) => String(t).replace(/\{\{ROOT:userHome\}\}/g, home),
+    })
+    const cases = [
+      ['D:\\project\\wwwroot\\FavsHub_web', join(home, 'projects', 'FavsHub_web'), '同名工作区'],
+      ['C:\\Users\\bob\\Documents\\notes', join(home, 'Documents', 'notes'), 'C:\\Users'],
+      ['/mnt/c/Users/bob/Documents/notes', join(home, 'Documents', 'notes'), 'WSL'],
+      ['E:\\data\\x.md', join(home, 'Documents', 'x.md'), '映射表'],
+    ]
+    let okAll = true
+    const detail = []
+    for (const [from, want, howLike] of cases) {
+      const t = port.translateWinPath(from, ctx)
+      const pass = t && t.to === want && String(t.how).includes(howLike)
+      if (!pass) { okAll = false; detail.push(`${from} → ${t ? t.to + ' / ' + t.how : 'null'}`) }
+    }
+    check('移植：盘符 / C:\\Users / WSL / 映射表 四类路径都能翻到本机对应目录', okAll, detail.join(' | '))
+    check('移植：翻不出来的路径返回 null（不硬造一个不存在的路径）',
+      port.translateWinPath('D:\\project\\nope\\ghost', ctx) === null
+      && port.translateWinPath('C:\\Windows\\System32', ctx) === null)
+
+    const txt = port.translatePortableText('A: D:\\project\\wwwroot\\FavsHub_web 和 D:\\nowhere\\x', ctx)
+    check('移植：文本里的路径按需替换，命不中的原样保留并计入 misses',
+      txt.text.includes(join(home, 'projects', 'FavsHub_web')) && txt.text.includes('D:\\nowhere\\x')
+      && txt.hits.length === 1 && txt.misses.length === 1)
+
+    const localPkg = { name: 'dsh-profile-desktop', dependencies: { dshmarket: '^1.70.2' }, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dshmarket'] } } }
+    const cloudPkg = {
+      name: 'dsh-profile-desktop',
+      dependencies: {
+        dshmarket: '1.84.2',
+        '@local/plug': 'link:C:\\Users\\bob\\Documents\\notes',
+        'gone': 'link:D:\\nowhere\\x',
+        'tgz': 'file:./x-1.0.0.tgz',
+        'new-plugin': '1.2.3',
+      },
+      dsh: { profile: { bundles: ['dshmarket', '@local/plug', 'gone', 'new-plugin', 'dsh-ssh-hub'] } },
+    }
+    const merged = port.portPackageJson({ localPkg, cloudPkg, ctx })
+    check('移植 package.json：本机版本优先、link 改写、不可装的丢弃、bundle 同步收敛',
+      merged.pkg.dependencies.dshmarket === '^1.70.2'
+      && merged.pkg.dependencies['@local/plug'] === 'link:' + join(home, 'Documents', 'notes')
+      && merged.pkg.dependencies['new-plugin'] === '1.2.3'
+      && !('gone' in merged.pkg.dependencies) && !('tgz' in merged.pkg.dependencies)
+      && merged.pkg.dsh.profile.bundles.includes('new-plugin')
+      && merged.pkg.dsh.profile.bundles.includes('@local/plug')
+      && !merged.pkg.dsh.profile.bundles.includes('gone')
+      && merged.pkg.dsh.profile.bundles.includes('dsh-ssh-hub') === false
+      && merged.dropped.length === 4,
+      JSON.stringify(merged.pkg.dependencies))
+
+    const cloudReg = { version: 1, tables: { workspaces: {
+      dup: { title: 'FavsHub_web', path: 'D:\\project\\wwwroot\\FavsHub_web' },
+      ghost: { title: 'ghost', path: 'D:\\project\\ghost' },
+      home2: { title: 'WIN11', path: '{{ROOT:userHome}}' },
+    } }, global: {} }
+    const localReg = { version: 1, tables: { workspaces: { keep: { title: 'FavsHub_web', path: join(home, 'projects', 'FavsHub_web') } } }, global: {} }
+    const reg = port.portWorkspaceRegistry({ localReg, cloudReg, ctx })
+    check('移植工作区登记表：同名去重、翻不出来的跳过、家目录本身不当工作区',
+      Object.keys(reg.registry.tables.workspaces).length === 1
+      && reg.skipped.some((x) => x.includes('已有同名工作区'))
+      && reg.skipped.some((x) => x.includes('对不上号') || x.includes('找不到对应目录'))
+      && reg.skipped.some((x) => x.includes('只对应到本机家目录')))
+  }
+
   // ── 跨平台护栏：仓库来自另一套系统时，profile / 全局提示不许覆盖本机 ──
   {
     const cxStage = mkdtempSync(join(tmpdir(), 'cfg-sync-cx-'))
@@ -2642,17 +2720,17 @@ check('反馈请求体上限放宽到 160MB（否则附件必被 64KB 拦掉）'
     check('跨平台护栏：全局提示也不覆盖本机（摊到 prompt-from-cloud）',
       readFileSync(join(winHome, 'AGENTS.md'), 'utf8').includes('本机全局提示')
       && existsSync(join(winHome, 'prompt-from-cloud', 'AGENTS.md'))
-      && r1.skippedByScope.some((x) => x.startsWith('prompt/AGENTS.md:') && x.includes('不覆盖本机')))
-    check('跨平台护栏：云端那份整份工作区登记表也不铺（盘符路径会在面板里变成打不开的工作区）',
+      && r1.skippedByScope.some((x) => x.startsWith('prompt/AGENTS.md:') && x.includes('移植版只暂存')))
+    check('跨平台护栏：云端整份工作区登记表不会把盘符路径带进来（翻不出来的不登记）',
       !existsSync(join(winHome, 'storages', 'workspace.json'))
-      && r1.skippedByScope.some((x) => x.includes('dsh-workspaces.json') && (x.includes('另一套系统') || x.includes('由 workspace 组'))))
+      && r1.skippedByScope.some((x) => x.includes('dsh-workspaces.json')))
 
     // ①b workspace 组被关掉时，靠跨平台判定拦住那份快照
     writeFileSync(join(winHome, 'config-sync-scope.json'), JSON.stringify({ groups: { workspace: { enabled: false } } }))
     const r1b = cxEng.apply({ repoRoot: winRepo, dshHome: winHome, appRoot: '/Applications/DeepSeek Harness.app' })
-    check('跨平台护栏：workspace 组关着时，整份登记表仍被「另一套系统」这条拦住',
+    check('跨平台护栏：workspace 组关着时，整份登记表仍走移植而不是原样铺',
       r1b.ok === true && !existsSync(join(winHome, 'storages', 'workspace.json'))
-      && r1b.skippedByScope.some((x) => x.includes('dsh-workspaces.json') && x.includes('另一套系统')))
+      && r1b.skippedByScope.some((x) => x.includes('dsh-workspaces.json') && (x.includes('对不上号') || x.includes('另一套系统'))))
 
     // ② 同一套系统（POSIX 路径）来的仓库：照常铺回去，护栏不能误伤
     const posixRepo = mkRepo('posix', '{"dependencies":{"x":"link:/Users/me/local/x"}}', 'patch: /Users/me/x.yml\n')

@@ -31,13 +31,14 @@ import {
 import { buildContract, checkContract, contractPath, contractText, readContract } from './contract.mjs'
 import { listMachines, localMachineInfo, writeMachineInfo } from './machines.mjs'
 import {
-  downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive,
+  downloadRepo, isSecureUrl, normalizeWebdav, testConnection, uploadRepo, webdavActive, purgeForbiddenFromCloud,
   PRIVATE_KEY_BODY_RE, SSH_KEY_NAME_RE,
 } from './webdav.mjs'
 import { applyConversations, captureConversations, conversationPendingRoots, resolveGuardScript } from './conversations.mjs'
 import { extraSkipReason, listPluginDataSlots, looksSecretFile, readExtraConfig } from './extra-rules.mjs'
 import { SETTINGS_SOURCES, settingsSourcePath, zeroVolatileFields } from './settings-sources.mjs'
 import { zipBuild, zipExtract } from './zip.mjs'
+import { portPackageJson, portWorkspaceRegistry, portAgentsMd, translatePortableText, translateWinPath, readPortConfig, portContext } from './porting.mjs'
 
 /** 占位符：仓库里存这些，落地时展开成本机路径。 */
 export const TOKENS = {
@@ -1173,8 +1174,25 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
   // 用「用户确认过的根」（config-sync-roots.json）：自选目录必须变成 {{ROOT:x}}，
   // 否则会把本机绝对路径原样带进仓库，换机后对方文件指向一个不存在的目录。
   const roots = readSyncRoots(local.dshHome, local)
-  // 跨平台判定要在所有组之前算：settings 组里那份「整份工作区登记表」也要据此决定铺不铺。
+  // 跨平台判定要在所有组之前算：settings 组里那份「整份工作区登记表」也要据此决定怎么处理。
   const foreign = foreignRepoEvidence(repoRoot, local)
+  // 移植上下文：家目录 / 根占位符 / 本机工作区清单 / 用户映射表（config-sync-port.json）
+  let portCtx = null
+  if (foreign.foreign) {
+    let reg0 = null
+    try { reg0 = JSON.parse(readFileSync(join(local.dshHome, 'storages', 'workspace.json'), 'utf8')) } catch { reg0 = null }
+    const ws0 = []
+    for (const [id, w] of Object.entries((reg0 && reg0.tables && reg0.tables.workspaces) || {})) {
+      if (w && w.path) ws0.push({ id, title: w.title || basename(String(w.path)), path: w.path })
+    }
+    portCtx = portContext({
+      userHome: typeof roots.userHome === 'string' && roots.userHome ? roots.userHome : homedir(),
+      roots,
+      localWorkspaces: ws0,
+      portConfig: readPortConfig(local.dshHome),
+      expand: (t) => expandTokenText(String(t || ''), roots),
+    })
+  }
   const written = [], skipped = [], errors = [], conflicts = []
   let files = 0, bytes = 0
   applyBackupDir = ''
@@ -1218,19 +1236,86 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
     return { ok: false, errors: [`profile 目录不存在：${profileDir}（本机还没跑过这个 profile？）`], written, skipped, files, bytes, local }
   }
 
-  // 跨平台护栏：仓库来自另一套系统时，profile 的这几个文件**不覆盖本机**，
-  // 而是摊到 <DshHome>/profile-from-cloud/ 让人自己比对（换过去会让 profile 直接起不来）。
+  // 跨平台移植：仓库来自另一套系统时，能翻的翻、翻不出来的丢掉并说明，
+  // 绝不把 D:\... / pwsh7.cmd 这类东西原样铺进本机 profile。
   if (foreign.foreign) {
     const stage = join(local.dshHome, 'profile-from-cloud')
-    skippedByScope.push(`profile: 仓库来自另一套系统（${foreign.reasons.join('；')}），改为摊到 ${stage}，不覆盖本机 profile`)
+    const rawStage = join(stage, 'raw')
+    skippedByScope.push(`profile: 仓库来自另一套系统（${foreign.reasons.join('；')}），按本机情况移植`)
+
+    // 原始文件留一份，供人工比对
     for (const leaf of ['package.json', 'cordis.patch.yml', 'cordis.yml', 'pnpm-workspace.yaml', 'pnpm-lock.yaml']) {
-      const srcRel = `profile/${leaf}`
-      if (!existsSync(join(repoRoot, srcRel))) continue
-      if (dryRun) { written.push(`${srcRel} → profile-from-cloud/${leaf}`); continue }
+      const src = join(repoRoot, 'profile', leaf)
+      if (!existsSync(src)) continue
+      if (dryRun) continue
+      try {
+        mkdirSync(rawStage, { recursive: true })
+        writeFileSync(join(rawStage, leaf), expandTokenText(readFileSync(src, 'utf8'), roots).replace(/\r\n/g, '\n'), 'utf8')
+      } catch (e) {
+        errors.push(`profile-from-cloud/raw/${leaf}: ${(e && e.message) || e}`)
+      }
+    }
+
+    // 移植上下文：家目录 + 根占位符 + 本机工作区清单 + 用户映射表
+    let localReg = null
+    try { localReg = JSON.parse(readFileSync(join(local.dshHome, 'storages', 'workspace.json'), 'utf8')) } catch { localReg = null }
+    const wsList = []
+    const wsTable = (localReg && localReg.tables && localReg.tables.workspaces) || {}
+    for (const [id, w] of Object.entries(wsTable)) if (w && w.path) wsList.push({ id, title: w.title || basename(String(w.path)), path: w.path })
+    const pctx = portCtx || portContext({ userHome: homedir(), roots })
+
+    // ① package.json：合并（本机优先）+ link 路径改写 + 不可用的丢弃
+    const livePkgPath = join(profileDir, 'package.json')
+    let livePkg = null
+    try { livePkg = JSON.parse(readFileSync(livePkgPath, 'utf8')) } catch { livePkg = null }
+    let cloudPkg = null
+    try { cloudPkg = JSON.parse(readFileSync(join(repoRoot, 'profile', 'package.json'), 'utf8')) } catch { cloudPkg = null }
+    const ported = portPackageJson({ localPkg: livePkg, cloudPkg, ctx: pctx })
+    for (const n of ported.notes) skippedByScope.push(`profile/package.json: ${n}`)
+    for (const d of ported.dropped) skippedByScope.push(`profile/package.json 丢弃 ${d}`)
+    if (ported.pkg) {
+      const text = JSON.stringify(ported.pkg, null, 2) + '\n'
+      if (dryRun) written.push('profile/package.json（移植后）')
+      else {
+        try {
+          backupBeforeWrite(livePkgPath, livePkgPath, local.dshHome, errors)
+          writeFileSync(livePkgPath, text, 'utf8')
+          written.push('profile/package.json（移植后）')
+          conflicts.push('profiles/desktop/package.json（已按本机路径改写依赖）')
+          mkdirSync(stage, { recursive: true })
+          writeFileSync(join(stage, 'package.json'), text, 'utf8')
+        } catch (e) {
+          errors.push(`profile/package.json: ${(e && e.message) || e}`)
+        }
+      }
+    }
+
+    // ② cordis.patch.yml：翻译路径后放暂存目录。**不铺**：里面是 pwsh / wsl 的 shell 路由，
+    //    macOS 上没有这些可执行文件，硬合并会让工具调用直接失败（逐条清单在面板说明里）。
+    const patchSrc = join(repoRoot, 'profile', 'cordis.patch.yml')
+    if (existsSync(patchSrc)) {
+      const translated = translatePortableText(expandTokenText(readFileSync(patchSrc, 'utf8'), roots), pctx)
+      if (!dryRun) {
+        try {
+          mkdirSync(stage, { recursive: true })
+          writeFileSync(join(stage, 'cordis.patch.yml'), translated.text.replace(/\r\n/g, '\n'), 'utf8')
+          written.push('profile-from-cloud/cordis.patch.yml（路径已翻译）')
+        } catch (e) {
+          errors.push(`profile-from-cloud/cordis.patch.yml: ${(e && e.message) || e}`)
+        }
+      }
+      skippedByScope.push(`profile/cordis.patch.yml: 已翻译 ${translated.hits.length} 处路径、${translated.misses.length} 处找不到对应物；` +
+        `内容是本机没有的 shell 路由（pwsh / wsl），不覆盖本机 patch，翻译版见 ${join(stage, 'cordis.patch.yml')}`)
+    }
+
+    // ③ pnpm-workspace.yaml / cordis.yml：本机已有等价文件，只在翻译版里留一份
+    for (const leaf of ['pnpm-workspace.yaml', 'cordis.yml']) {
+      const src = join(repoRoot, 'profile', leaf)
+      if (!existsSync(src) || dryRun) continue
       try {
         mkdirSync(stage, { recursive: true })
-        const text = readFileSync(join(repoRoot, srcRel), 'utf8')
-        writeFileSync(join(stage, leaf), expandTokenText(text, roots).replace(/\r\n/g, '\n'), 'utf8')
+        const t = translatePortableText(expandTokenText(readFileSync(src, 'utf8'), roots), pctx)
+        writeFileSync(join(stage, leaf), t.text.replace(/\r\n/g, '\n'), 'utf8')
         written.push(`profile-from-cloud/${leaf}`)
       } catch (e) {
         errors.push(`profile-from-cloud/${leaf}: ${(e && e.message) || e}`)
@@ -1289,12 +1374,32 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
           base.tables = base.tables && typeof base.tables === 'object' ? base.tables : {}
           base.tables.workspaces = base.tables.workspaces && typeof base.tables.workspaces === 'object' ? base.tables.workspaces : {}
           const added = []
+          // 跨平台时先把云端路径翻成本机的（按同名工作区 / ~/projects/<leaf> 等找对应物）
+          let wsCtx = null
+          if (foreign.foreign) {
+            const cfg = readPortConfig(local.dshHome)
+            wsCtx = portContext({
+              userHome: typeof roots.userHome === 'string' && roots.userHome ? roots.userHome : homedir(),
+              roots, localWorkspaces: [],
+              portConfig: cfg,
+            })
+          }
           for (const w of missing) {
-            const p = expandTokenText(String(w.path || ''), roots)
-            const usable = IS_WIN ? /^[A-Za-z]:[\\/]/.test(p) : p.startsWith('/')
-            if (!usable) {
-              skippedByScope.push(`workspace ${w.id}: 云端路径 ${w.path} 在本机不可用，未写入登记表`)
-              continue
+            let p = expandTokenText(String(w.path || ''), roots)
+            if (wsCtx) {
+              const t = translateWinPath(String(w.path || ''), wsCtx)
+              if (!t) {
+                skippedByScope.push(`workspace ${w.id}: 云端路径 ${w.path} 在本机找不到对应目录，未写入登记表`)
+                continue
+              }
+              p = t.to
+              skippedByScope.push(`workspace ${w.id}: ${w.path} → ${p}（${t.how}）`)
+            } else {
+              const usable = IS_WIN ? /^[A-Za-z]:[\\/]/.test(p) : p.startsWith('/')
+              if (!usable) {
+                skippedByScope.push(`workspace ${w.id}: 云端路径 ${w.path} 在本机不可用，未写入登记表`)
+                continue
+              }
             }
             base.tables.workspaces[w.id] = {
               title: w.title || w.id,
@@ -1368,12 +1473,41 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
       // ① workspace 组开着时别用快照覆盖（与 apply.ps1 的判断一致）；
       // ② 仓库来自另一套系统时快照里全是 D:\... 路径，铺进去面板会多出一堆打不开的工作区
       //    （实测：真机拉了一次，21 个工作区里 19 个是 Windows 盘符，本机 5 个被顶掉）。
-      if (entry.id === 'dsh-workspaces.json' && scopeGroupEnabled(scope, 'workspace')) {
-        skippedByScope.push('settings/dsh-workspaces.json: 由 workspace 组按合并方式还原，跳过整份快照')
+      // 跨平台这条必须先判：云端可能根本没上传 workspace/ 那份登记表，只剩 settings 里这份快照，
+      // 走「翻译 + 合并」才能把能对上号的工作区救回来。
+      if (entry.id === 'dsh-workspaces.json' && foreign.foreign) {
+        // 跨平台：翻译路径后按「本机优先」合并，能对上号的工作区保留、对不上的跳过。
+        const src = join(repoRoot, 'settings', entry.id)
+        if (!existsSync(src)) { skippedByScope.push(`settings/${entry.id}: 仓库里没有`); continue }
+        try {
+          const cloudReg = JSON.parse(readFileSync(src, 'utf8'))
+          const dstPath = settingsSourcePath(local.dshHome, profileDir, entry)
+          let localReg = null
+          try { localReg = JSON.parse(readFileSync(dstPath, 'utf8')) } catch { localReg = null }
+          const ported = portWorkspaceRegistry({ localReg, cloudReg, ctx: portCtx })
+          for (const n of ported.notes) skippedByScope.push(`settings/${entry.id}: ${n}`)
+          for (const n of ported.skipped) skippedByScope.push(`settings/${entry.id}: ${n}`)
+          const merged = JSON.stringify(ported.registry, null, 2) + '\n'
+          let before = ''
+          try { before = readFileSync(dstPath, 'utf8') } catch { before = '' }
+          // 一条都没并进来就别写：否则会把「空的骨架文件」铺到本机（原本没有这份登记表的情况下）
+          if (!ported.notes.length) {
+            skippedByScope.push(`settings/${entry.id}: 没有可并到本机的工作区（云端路径在本机都对不上号）`)
+            continue
+          }
+          if (before !== merged && !dryRun) {
+            backupBeforeWrite(dstPath, dstPath, local.dshHome, errors)
+            mkdirSync(dirname(dstPath), { recursive: true })
+            writeFileSync(dstPath, merged, 'utf8')
+            written.push(`settings/${entry.id}（移植后合并）`)
+          } else if (before !== merged) written.push(`settings/${entry.id}（移植后合并，dryRun）`)
+        } catch (e) {
+          errors.push(`settings/${entry.id}: 移植失败 ${(e && e.message) || e}`)
+        }
         continue
       }
-      if (entry.id === 'dsh-workspaces.json' && foreign.foreign) {
-        skippedByScope.push('settings/dsh-workspaces.json: 云端登记表来自另一套系统（盘符路径），不覆盖本机工作区')
+      if (entry.id === 'dsh-workspaces.json' && scopeGroupEnabled(scope, 'workspace')) {
+        skippedByScope.push('settings/dsh-workspaces.json: 由 workspace 组按合并方式还原，跳过整份快照')
         continue
       }
       pull(`settings/${entry.id}`, settingsSourcePath(local.dshHome, profileDir, entry))
@@ -1388,14 +1522,33 @@ export function apply({ repoRoot, dshHome, appRoot, workspaceHome, profileName =
     if (scopeItemEnabled(scope, 'prompt', 'AGENTS.md')) {
       if (agentsForeign) {
         const dst = join(local.dshHome, 'prompt-from-cloud', 'AGENTS.md')
+        const live = join(local.dshHome, 'AGENTS.md')
+        let liveText = ''
+        try { liveText = readFileSync(live, 'utf8') } catch { liveText = '' }
+        const cfg = readPortConfig(local.dshHome)
+        const actx = portContext({
+          userHome: typeof roots.userHome === 'string' && roots.userHome ? roots.userHome : homedir(),
+          roots, localWorkspaces: [], portConfig: cfg,
+        })
+        const ported = portAgentsMd(expandTokenText(readFileSync(agentsRepo, 'utf8'), roots), actx)
         if (!dryRun) {
           try {
             mkdirSync(dirname(dst), { recursive: true })
-            writeFileSync(dst, readFileSync(agentsRepo, 'utf8'), 'utf8')
-            written.push('prompt-from-cloud/AGENTS.md')
+            writeFileSync(dst, ported.text, 'utf8')
+            written.push('prompt-from-cloud/AGENTS.md（路径已翻译）')
+            // 本机没有全局提示、或者本机那份就是上一次移植的产物 → 直接落地；
+            // 本机有自己写的那份就只暂存，避免把 macOS 专属的环境事实覆盖掉。
+            const ours = /本文件由 dsh-profile-config-sync 从另一套系统移植/.test(liveText)
+            if (!liveText.trim() || ours) {
+              backupBeforeWrite(live, live, local.dshHome, errors)
+              writeFileSync(live, ported.text, 'utf8')
+              written.push('AGENTS.md（移植后）')
+            } else {
+              skippedByScope.push(`prompt/AGENTS.md: 本机已有自己的全局提示，移植版只暂存到 ${dst}（翻译 ${ported.hits.length} 处路径、${ported.misses.length} 处未命中）`)
+            }
           } catch (e) { errors.push(`prompt-from-cloud/AGENTS.md: ${(e && e.message) || e}`) }
         }
-        skippedByScope.push(`prompt/AGENTS.md: 来自另一套系统（含 Windows 路径），改为摊到 ${dst}，不覆盖本机全局提示`)
+        skippedByScope.push(`prompt/AGENTS.md: 来自另一套系统，已按本机路径翻译（${ported.hits.length} 处）`)
       } else pull('prompt/AGENTS.md', join(local.dshHome, 'AGENTS.md'))
     }
     else skippedByScope.push('prompt/AGENTS.md: 未勾选')
@@ -1988,6 +2141,10 @@ export async function runCli(argv) {
         const up = await uploadRepo(w, repoRoot)
         for (const e of up.errors) console.error(`  [!] ${e}`)
         console.log(`WebDAV 上传：上传 ${up.uploaded.length} · 跳过 ${up.skipped.length} · 错误 ${up.errors.length}`)
+        // 顺手清掉老版本推上去的浏览器剖面（Login Data / Cookies 不该待在云端）
+        const purge = await purgeForbiddenFromCloud(w)
+        if (purge.deleted.length) console.log(`云端清理：删除 ${purge.deleted.length} 个历史文件（浏览器剖面）`)
+        for (const e of purge.errors) console.error(`  [!] ${e}`)
         return up.ok ? 0 : 1
       }
       return 0

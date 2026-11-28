@@ -58,6 +58,7 @@ import { checkContract, readContract } from './runtime/contract.mjs'
 // 0.4.0：WebDAV 通道（第二种同步方式，与 git 共用同一份仓库格式）
 import {
   downloadRepo, isSecureUrl, normalizeWebdav, sanitizeUserAgent, testConnection, uploadRepo, webdavActive,
+  purgeForbiddenFromCloud,
 } from './runtime/webdav.mjs'
 
 const pluginRequire = createRequire(import.meta.url)
@@ -5657,7 +5658,15 @@ async function handleWebdav(req, res, config) {
 
   if (action === 'upload') {
     const r = await uploadRepo(w, repo)
-    sendJson(res, 200, { ok: r.ok, uploaded: r.uploaded.length, skipped: r.skipped.length, errors: r.errors.slice(0, 20) })
+    // 顺手清掉老版本推上去的浏览器剖面（Login Data / Cookies 不该待在云端）
+    const purge = await purgeForbiddenFromCloud(w)
+    sendJson(res, 200, {
+      ok: r.ok,
+      uploaded: r.uploaded.length,
+      skipped: r.skipped.length,
+      purged: purge.deleted.length,
+      errors: r.errors.slice(0, 20),
+    })
     return
   }
   if (action === 'download') {

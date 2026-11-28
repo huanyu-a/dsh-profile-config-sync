@@ -232,6 +232,22 @@ try {
   check('内容没变 → 全部跳过、一个 PUT 都不发',
     up2.uploaded.length === 0 && dav.stats.put === before, `uploaded=${up2.uploaded.length} putDelta=${dav.stats.put - before}`)
 
+  // 4b) 推送后清理：老版本推上去的浏览器剖面必须被删掉，仓库里的其它文件不许动
+  {
+    const { purgeForbiddenFromCloud } = await import('../runtime/webdav.mjs')
+    const profDir = join(davRoot, 'dsh-config-sync', 'plugin-data', 'browser-profiles', 'edge-cdp', 'Default')
+    mkdirSync(profDir, { recursive: true })
+    writeFileSync(join(profDir, 'Login Data'), 'not-really-a-db')
+    writeFileSync(join(profDir, 'Cookies'), 'not-really-cookies')
+    const pr = await purgeForbiddenFromCloud(w)
+    // 夹具服务器的 DELETE 只删文件不删空目录，所以判「目录里再没有文件」而不是「目录不存在」
+    const profLeft = existsSync(profDir) ? readdirSync(profDir, { recursive: true }).length : 0
+    check('推送后清理云端浏览器剖面（Login Data / Cookies 不再留在网盘）',
+      pr.deleted.length === 2 && profLeft === 0
+      && existsSync(join(davRoot, 'dsh-config-sync', 'profile', 'package.json')),
+      `deleted=${JSON.stringify(pr.deleted)} left=${profLeft} errors=${JSON.stringify(pr.errors)}`)
+  }
+
   // 5) 同长度不同内容也必须重传（etag 是 size+mtime 拼的，不信它）
   put(repoA, 'prompt/AGENTS.md', '# agents v2\n') // 与 v1 等长
   const up3 = await uploadRepo(w, repoA)
