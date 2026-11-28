@@ -737,13 +737,13 @@ if ($Mode -eq 'update') {
     }
     $gotB64 = ''
     try {
-      $fs = [System.IO.File]::OpenRead($tmp)
-      try {
-        $ms = New-Object System.IO.MemoryStream
-        $sha.TransformBlock($fs, 0, $fs.Length, $null, 0) | Out-Null
-        $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null
-        $gotB64 = [Convert]::ToBase64String($sha.Hash)
-      } finally { $fs.Dispose() }
+      $bytes = [System.IO.File]::ReadAllBytes($tmp)
+      # 0.7.1 修复：旧写法把 FileStream 传给 TransformBlock(byte[], int, int, byte[], int)。
+      # .NET 的签名第一参是 byte[]，PowerShell 7 找不到重载 → catch → 报「无法计算 sha512」，
+      # 更新在 0.6.47 就死在这（实测 Windows 报 Get-FileHash 不可用）。正确做法是先读成 byte[]。
+      $sha.TransformBlock($bytes, 0, $bytes.Length, $bytes, 0) | Out-Null
+      $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null
+      $gotB64 = [Convert]::ToBase64String($sha.Hash)
     } catch {
       $msg = '插件更新失败：本机 PowerShell 无法计算安装包 ' + $algo + '（Get-FileHash 不可用且 .NET 回退也失败）'
       Log $msg

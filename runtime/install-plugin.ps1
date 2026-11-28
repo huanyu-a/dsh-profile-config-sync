@@ -224,12 +224,11 @@ if ($Integrity) {
   }
   $gotB64 = ''
   try {
-    $fs = [System.IO.File]::OpenRead($pkgPath)
-    try {
-      $sha.TransformBlock($fs, 0, $fs.Length, $null, 0) | Out-Null
-      $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null
-      $gotB64 = [Convert]::ToBase64String($sha.Hash)
-    } finally { $fs.Dispose() }
+    $bytes = [System.IO.File]::ReadAllBytes($pkgPath)
+    # 0.7.1 修复：TransformBlock 第一参要 byte[]，旧写法传 FileStream 在 PowerShell 7 直接异常。
+    $sha.TransformBlock($bytes, 0, $bytes.Length, $bytes, 0) | Out-Null
+    $sha.TransformFinalBlock([byte[]]::new(0), 0, 0) | Out-Null
+    $gotB64 = [Convert]::ToBase64String($sha.Hash)
   } catch {
     EmitResult $false ('本机 PowerShell 无法计算安装包 ' + $algo) ''
   }
